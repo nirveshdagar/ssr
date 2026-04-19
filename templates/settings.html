@@ -735,9 +735,15 @@ document.querySelectorAll(".notify-test-btn").forEach(btn => {
     };
     btn.addEventListener("click", async () => {
         btn.disabled = true;
-        out.innerHTML = '<span class="text-muted">Testing…</span>';
+        out.innerHTML = '<span class="text-muted">Testing (using the values currently in the fields — no Save needed)…</span>';
         try {
-            const r = await fetch("/api/settings/test-do-keys", { method: "POST" });
+            // Pull current field values so user can test before clicking Save.
+            const form = new FormData();
+            const primaryEl = document.querySelector('input[name="do_api_token"]');
+            const backupEl  = document.querySelector('input[name="do_api_token_backup"]');
+            if (primaryEl && primaryEl.value) form.append("do_api_token", primaryEl.value);
+            if (backupEl && backupEl.value)   form.append("do_api_token_backup", backupEl.value);
+            const r = await fetch("/api/settings/test-do-keys", { method: "POST", body: form });
             const j = await r.json();
             out.innerHTML = `<div>${fmt("primary", j.primary)}</div><div>${fmt("backup", j.backup)}</div>`;
         } catch (e) {

@@ -683,11 +683,41 @@ def api_test_notification():
 @app.route("/api/settings/test-do-keys", methods=["POST"])
 @login_required
 def api_test_do_keys():
-    """Ping /account with BOTH primary and backup DO tokens. Returns JSON
-    describing which work, including account email + droplet_limit for each.
+    """Ping /account with both DO tokens. If form provides `do_api_token` /
+    `do_api_token_backup`, test THOSE (current form values) — so users can
+    verify a pasted token without clicking Save first. Falls back to stored
+    DB values when no form data is provided (e.g., from a cURL probe).
     """
-    from modules.digitalocean import test_tokens
-    return jsonify(test_tokens())
+    from modules import digitalocean as do
+    import requests as _rq
+
+    # Prefer form-provided values; fall back to stored settings
+    primary = (request.form.get("do_api_token") or "").strip() \
+              or (get_setting("do_api_token") or "").strip()
+    backup  = (request.form.get("do_api_token_backup") or "").strip() \
+              or (get_setting("do_api_token_backup") or "").strip()
+
+    def probe(tok: str) -> dict:
+        if not tok:
+            return {"configured": False, "ok": False,
+                    "email": "", "error": "not provided"}
+        try:
+            r = _rq.get("https://api.digitalocean.com/v2/account",
+                        headers={"Authorization": f"Bearer {tok}"}, timeout=15)
+            if r.ok:
+                d = r.json().get("account", {})
+                return {"configured": True, "ok": True,
+                        "email": d.get("email", "?"),
+                        "status": d.get("status", "?"),
+                        "droplet_limit": d.get("droplet_limit"),
+                        "error": ""}
+            return {"configured": True, "ok": False,
+                    "email": "", "error": f"HTTP {r.status_code}: {r.text[:140]}"}
+        except Exception as e:
+            return {"configured": True, "ok": False,
+                    "email": "", "error": f"{type(e).__name__}: {e}"}
+
+    return jsonify({"primary": probe(primary), "backup": probe(backup)})
 
 
 @app.route("/api/settings/test-llm-key", methods=["POST"])
