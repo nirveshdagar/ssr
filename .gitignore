@@ -2,7 +2,9 @@
 data/
 .ssr_secret_fernet
 .env
-.env.*
+.env.local
+.env.production
+!.env.example
 *.key
 *.pem
 
