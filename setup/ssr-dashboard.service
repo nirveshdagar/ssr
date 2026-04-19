@@ -9,6 +9,14 @@ User=ssr
 Group=ssr
 WorkingDirectory=/opt/ssr
 EnvironmentFile=/etc/ssr.env
+
+# Ensure the app's data directory exists + is writable BEFORE ProtectSystem
+# locks the namespace. The leading `+` runs ExecStartPre as root (required
+# to mkdir under /opt which is root-owned), then chowns to the ssr user so
+# the main ExecStart (running as ssr) can write to it.
+ExecStartPre=+/bin/mkdir -p /opt/ssr/data /opt/ssr/data/site_archives
+ExecStartPre=+/bin/chown -R ssr:ssr /opt/ssr/data
+
 ExecStart=/opt/ssr/venv/bin/python /opt/ssr/app.py 8000
 
 # Restart on crash with a small backoff (don't thrash if misconfigured)
