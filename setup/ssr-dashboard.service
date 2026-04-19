@@ -1,0 +1,34 @@
+[Unit]
+Description=SSR Dashboard (Site Server Rotation)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ssr
+Group=ssr
+WorkingDirectory=/opt/ssr
+EnvironmentFile=/etc/ssr.env
+ExecStart=/opt/ssr/venv/bin/python /opt/ssr/app.py 8000
+
+# Restart on crash with a small backoff (don't thrash if misconfigured)
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# stdout/stderr go to journalctl
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ssr-dashboard
+
+# Hardening — limits what a compromised process can do
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# Only these paths are writable
+ReadWritePaths=/opt/ssr/data
+
+[Install]
+WantedBy=multi-user.target

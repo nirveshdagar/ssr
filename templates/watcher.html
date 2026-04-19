@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+{% block title %}Watcher{% endblock %}
+{% block content %}
+
+{# ACTION REQUIRED banner — shown when a domain needs manual Turnstile click #}
+<div id="actionBanner" style="display:none;" class="mb-4 p-3 rounded d-flex align-items-center gap-3"
+     style="background:#fff3cd;border:2px solid #ffc107;">
+    <span style="font-size:1.6rem;">⚡</span>
+    <div class="flex-grow-1">
+        <strong style="color:#856404;">Action Required</strong>
+        <div id="actionBannerMsg" style="color:#533f03;font-size:.9rem;"></div>
+    </div>
+    <button onclick="document.getElementById('actionBanner').style.display='none'"
+            class="btn btn-sm" style="background:#ffc107;color:#000;border:none;">Dismiss</button>
+</div>
+
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <div class="section-title"><i class="bi bi-eye-fill"></i> Step Watcher</div>
+    <div><span class="badge-s badge-pending" id="activeCount">{{ summary|length }} tracked</span><small class="text-muted ms-2">Live 2s</small></div>
+</div>
+<div id="watcherContainer">
+{% if summary %}
+{% for domain, steps in summary.items() %}
+<div class="card-s card-s-static p-4 mb-3 watcher-card" data-domain="{{ domain }}">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+        <h5 class="mb-0 fw-bold"><i class="bi bi-globe2 me-2" style="color:var(--primary);"></i>{{ domain }}</h5>
+        <div class="d-flex align-items-center gap-2">
+            {# Per-domain live heartbeat — polled every 1s by JS below. Hidden
+               when no heartbeat has ever been written (e.g. before pipeline starts). #}
+            <span class="heartbeat-indicator small" data-hb-domain="{{ domain }}"
+                  style="display:none;min-width:110px;text-align:right;">
+                <i class="bi bi-heart-pulse-fill me-1"></i><span class="hb-text">—</span>
+            </span>
+            {% set ns = namespace(completed=0, running=false, failed=false) %}
+            {% for s in steps %}{% if s.status in ('completed','skipped') %}{% set ns.completed = ns.completed + 1 %}{% endif %}{% if s.status == 'running' %}{% set ns.running = true %}{% endif %}{% if s.status == 'failed' %}{% set ns.failed = true %}{% endif %}{% endfor %}
+            {% if ns.failed %}<span class="badge-s badge-failed">FAILED</span>{% elif ns.running %}<span class="badge-s badge-running pulse">RUNNING</span>{% elif ns.completed == (steps|length) %}<span class="badge-s badge-live">COMPLETE</span>{% else %}<span class="badge-s badge-pending">{{ ns.completed }}/{{ steps|length }}</span>{% endif %}
+        </div>
+    </div>
+    {% set ns2 = namespace(pct=0) %}{% for s in steps %}{% if s.status in ('completed','skipped') %}{% set ns2.pct = ns2.pct + 14.28 %}{% elif s.status == 'running' %}{% set ns2.pct = ns2.pct + 7 %}{% endif %}{% endfor %}
+    <div class="progress mb-3" style="height:5px;"><div class="progress-bar" style="width:{{ ns2.pct }}%;background:{% if ns2.pct >= 100 %}var(--accent-teal){% else %}var(--primary){% endif %};"></div></div>
+    <div class="row g-2">
+    {% for s in steps %}
+    <div class="col-12">
+        <div class="d-flex align-items-center p-2 rounded" style="background:{% if s.status=='running' %}var(--accent-blue-bg){% elif s.status=='completed' %}var(--accent-teal-bg){% elif s.status=='failed' %}var(--accent-coral-bg){% elif s.status=='warning' %}var(--accent-amber-bg){% else %}#FAFAFD{% endif %};border:1px solid {% if s.status=='running' %}rgba(9,132,227,.15){% elif s.status=='failed' %}rgba(255,107,107,.15){% else %}var(--border){% endif %};">
+            <div class="me-3 text-center" style="min-width:40px;">
+                {% if s.status=='completed' %}<i class="bi bi-check-circle-fill" style="color:var(--accent-teal);font-size:1.25rem;"></i>
+                {% elif s.status=='running' %}<div class="spinner-border spinner-border-sm" style="color:var(--accent-blue);"></div>
+                {% elif s.status=='failed' %}<i class="bi bi-x-circle-fill" style="color:var(--accent-coral);font-size:1.25rem;"></i>
+                {% elif s.status=='warning' %}<i class="bi bi-exclamation-triangle-fill" style="color:#E17055;font-size:1.25rem;"></i>
+                {% elif s.status=='skipped' %}<i class="bi bi-skip-forward-fill" style="color:var(--text-muted);font-size:1.25rem;"></i>
+                {% else %}<i class="bi bi-circle" style="color:#DFE6E9;font-size:1.25rem;"></i>{% endif %}
+            </div>
+            <div class="flex-grow-1">
+                <div class="d-flex justify-content-between">
+                    <strong style="font-size:.88rem;color:{% if s.status=='running' %}var(--accent-blue){% elif s.status=='failed' %}var(--accent-coral){% elif s.status=='completed' %}var(--accent-teal){% else %}var(--text-secondary){% endif %};">Step {{ s.step_num }}: {{ s.step_name }}</strong>
+                    {% if s.started_at %}<small class="text-muted">{{ s.started_at }}{% if s.finished_at %} → {{ s.finished_at }}{% endif %}</small>{% endif %}
+                </div>
+                {% if s.message %}<small style="color:{% if s.status=='failed' %}var(--accent-coral){% elif s.status=='warning' %}#E17055{% elif s.status=='running' %}var(--accent-blue){% else %}var(--text-muted){% endif %};"><i class="bi bi-chevron-right me-1"></i>{{ s.message }}</small>{% endif %}
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+    </div>
+</div>
+{% endfor %}
+{% else %}
+<div class="card-s p-5 empty-state"><i class="bi bi-eye"></i><p>No pipeline runs yet. Start from <a href="/domains">Domains</a>.</p></div>
+{% endif %}
+</div>
+{% endblock %}
+{% block extra_js %}
+setInterval(() => {
+  fetch('/api/watcher').then(r => r.json()).then(d => {
+    // Update count badge
+    document.getElementById('activeCount').textContent =
+      Object.keys(d.watchers).length + ' tracked' +
+      ((d.active_domains || []).length ? ' / ' + d.active_domains.length + ' running' : '');
+
+    // Reload if domain list changed
+    if (Object.keys(d.watchers).length !== document.querySelectorAll('.watcher-card').length)
+      return location.reload();
+
+    // Check for ACTION REQUIRED steps across all domains
+    let actionMsgs = [];
+    for (const [domain, steps] of Object.entries(d.watchers || {})) {
+      for (const step of (steps || [])) {
+        if (step.status === 'running' && step.message && step.message.includes('ACTION REQUIRED')) {
+          actionMsgs.push(domain + ': ' + step.message);
+        }
+      }
+    }
+    const banner = document.getElementById('actionBanner');
+    const bannerMsg = document.getElementById('actionBannerMsg');
+    if (actionMsgs.length > 0) {
+      bannerMsg.textContent = actionMsgs.join(' | ');
+      banner.style.display = 'flex';
+      banner.style.background = '#fff3cd';
+      banner.style.border = '2px solid #ffc107';
+    }
+
+    // Update individual step rows in-place without full reload
+    for (const [domain, steps] of Object.entries(d.watchers || {})) {
+      const card = document.querySelector('.watcher-card[data-domain="' + domain + '"]');
+      if (!card) continue;
+      for (const step of (steps || [])) {
+        const rows = card.querySelectorAll('.col-12');
+        const row = rows[step.step_num - 1];
+        if (!row) continue;
+        const msgEl = row.querySelector('small');
+        if (msgEl && step.message) msgEl.textContent = '\u276F ' + step.message;
+      }
+    }
+  }).catch(() => {});
+}, 2000);
+
+// ===== Heartbeat tick (every 1s) — proves the pipeline worker is alive =====
+// Server writes last_heartbeat_at on every tick of its background ticker
+// thread. We compare against now and show the delta. Green = alive (<5s),
+// amber = slow (<30s), red = stalled/dead (>=30s).
+(function () {
+  function colorFor(ago) {
+    if (ago === null || ago === undefined) return "#9ca3af";   // grey — no beat yet
+    if (ago < 5)   return "#16a34a";                            // green — alive
+    if (ago < 30)  return "#f59e0b";                            // amber — slow
+    return "#dc3545";                                           // red — stalled
+  }
+  async function tick() {
+    const nodes = document.querySelectorAll("[data-hb-domain]");
+    for (const n of nodes) {
+      const domain = n.dataset.hbDomain;
+      try {
+        const r = await fetch("/api/heartbeat/" + encodeURIComponent(domain));
+        const j = await r.json();
+        const span = n.querySelector(".hb-text");
+        if (j.seconds_ago === null) {
+          // Never beat — stay hidden
+          n.style.display = "none";
+          continue;
+        }
+        n.style.display = "inline-block";
+        n.style.color = colorFor(j.seconds_ago);
+        span.textContent = j.seconds_ago + "s ago";
+      } catch (e) { /* ignore */ }
+    }
+  }
+  setInterval(tick, 1000);
+  tick();   // fire once immediately so the widget shows up without waiting
+})();
+{% endblock %}

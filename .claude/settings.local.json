@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(PYTHONIOENCODING=utf-8 venv/Scripts/python.exe tests/test_turnstile_solver.py)",
+      "Bash(PYTHONIOENCODING=utf-8 venv/Scripts/python.exe tests/diagnose_tier2.py)",
+      "Bash(venv/Scripts/python.exe -c \"from database import set_setting; set_setting\\('capsolver_api_key', 'CAP-CE969F371A4E03B044F6E6B2CCFB1A619199A49D0AF6C74DBF1D8F777567C9A7'\\); print\\('stored'\\)\")",
+      "Bash(venv/Scripts/python.exe -c \"from database import get_setting; v=get_setting\\('capsolver_api_key'\\); print\\(v[:10]+'...'+v[-4:] if v else 'MISSING'\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 venv/Scripts/python.exe tests/test_tier3_cf_signup.py)",
+      "Bash(PYTHONIOENCODING=utf-8 venv/Scripts/python.exe tests/inspect_cf_signup.py)",
+      "Bash(PYTHONIOENCODING=utf-8 venv/Scripts/python.exe tests/solve_interstitial.py)",
+      "Bash(venv/Scripts/python.exe -c ' *)",
+      "WebFetch(domain:docs.capsolver.com)",
+      "WebSearch",
+      "Bash(PYTHONIOENCODING=utf-8 venv/Scripts/python.exe tests/test_cf_challenge_routing.py)",
+      "Bash(PYTHONIOENCODING=utf-8 venv/Scripts/python.exe tests/solve_cf_challenge_real.py)",
+      "Bash(PYTHONIOENCODING=utf-8 venv/Scripts/python.exe tests/check_email_registered.py)",
+      "Bash(PYTHONIOENCODING=utf-8 venv/Scripts/python.exe tests/check_login.py)",
+      "Bash(PYTHONIOENCODING=utf-8 venv/Scripts/python.exe tests/inspect_login_turnstile.py)"
+    ]
+  }
+}

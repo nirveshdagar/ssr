@@ -1,0 +1,30 @@
+# Web + core
+flask==3.1.0
+flask-socketio==5.4.1
+requests==2.32.3
+python-dotenv==1.0.1
+apscheduler==3.10.4
+jinja2==3.1.4
+
+# SSH / deployment
+paramiko==3.5.0
+
+# LLM (website generation)
+anthropic==0.42.0
+
+# Browser automation — patchright is the drop-in Playwright fork with stealth
+# built in; it's what the new CF signup uses. DrissionPage kept as legacy fallback.
+patchright>=1.49.0
+playwright==1.49.1
+DrissionPage>=4.0.0
+
+# -----------------------------------------------------------------------------
+# The following were only used by the old FREE captcha solver (audio-based
+# reCAPTCHA, OCR image captchas). The new CF signup uses CapSolver/2Captcha
+# APIs instead, which are more reliable. You can safely REMOVE these lines
+# unless you still want the legacy captcha_solver.py module to work.
+# -----------------------------------------------------------------------------
+# SpeechRecognition==3.14.1
+# pydub==0.25.1
+# Pillow==11.1.0
+# pytesseract==0.3.13

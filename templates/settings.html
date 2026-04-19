@@ -1,0 +1,749 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block content %}
+<div class="section-title mb-1"><i class="bi bi-gear-fill"></i> Settings & API Keys</div>
+<p class="text-muted mb-4" style="font-size:.85rem;">Configure all service credentials. Stored locally in your database.</p>
+
+<form method="POST" action="/settings">
+    <div class="row g-3">
+        <div class="col-md-6">
+            <div class="card-s card-s-static p-4">
+                <div class="d-flex align-items-center gap-2 mb-3">
+                    <div class="stat-icon" style="width:36px;height:36px;border-radius:10px;font-size:1rem;background:var(--primary-bg);color:var(--primary);display:flex;align-items:center;justify-content:center;"><i class="bi bi-rocket-takeoff"></i></div>
+                    <div><h6 class="mb-0 fw-bold">Spaceship</h6><small class="text-muted">Domain Registrar</small></div>
+                </div>
+                <div class="mb-3"><label class="form-label">API Key</label><div class="password-field"><input type="password" class="form-control" name="spaceship_api_key" value="{{ settings.get('spaceship_api_key','') }}" placeholder="X-Api-Key"><button type="button" class="toggle-vis"><i class="bi bi-eye"></i></button></div></div>
+                <div class="mb-3"><label class="form-label">API Secret</label><div class="password-field"><input type="password" class="form-control" name="spaceship_api_secret" value="{{ settings.get('spaceship_api_secret','') }}" placeholder="X-Api-Secret"><button type="button" class="toggle-vis"><i class="bi bi-eye"></i></button></div></div>
+                <hr style="border-color:var(--border);"><small class="text-muted d-block mb-2">Registrant Info (for domain purchase)</small>
+                <div class="row g-2">
+                    <div class="col-6"><label class="form-label">First Name</label><input type="text" class="form-control" name="registrant_first_name" value="{{ settings.get('registrant_first_name','') }}" placeholder="John"></div>
+                    <div class="col-6"><label class="form-label">Last Name</label><input type="text" class="form-control" name="registrant_last_name" value="{{ settings.get('registrant_last_name','') }}" placeholder="Doe"></div>
+                    <div class="col-6"><label class="form-label">Email</label><input type="email" class="form-control" name="registrant_email" value="{{ settings.get('registrant_email','') }}" placeholder="you@email.com"></div>
+                    <div class="col-6"><label class="form-label">Phone</label><input type="text" class="form-control" name="registrant_phone" value="{{ settings.get('registrant_phone','') }}" placeholder="+1.5551234567"></div>
+                    <div class="col-12"><label class="form-label">Address</label><input type="text" class="form-control" name="registrant_address" value="{{ settings.get('registrant_address','') }}" placeholder="123 Main St"></div>
+                    <div class="col-4"><label class="form-label">City</label><input type="text" class="form-control" name="registrant_city" value="{{ settings.get('registrant_city','') }}" placeholder="New York"></div>
+                    <div class="col-3"><label class="form-label">State</label><input type="text" class="form-control" name="registrant_state" value="{{ settings.get('registrant_state','') }}" placeholder="NY"></div>
+                    <div class="col-2"><label class="form-label">ZIP</label><input type="text" class="form-control" name="registrant_zip" value="{{ settings.get('registrant_zip','') }}" placeholder="10001"></div>
+                    <div class="col-3"><label class="form-label">Country</label><input type="text" class="form-control" name="registrant_country" value="{{ settings.get('registrant_country','US') }}" placeholder="US"></div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-6">
+            <div class="card-s card-s-static p-4">
+                <div class="d-flex align-items-center gap-2 mb-3">
+                    <div class="stat-icon" style="width:36px;height:36px;border-radius:10px;font-size:1rem;background:var(--accent-blue-bg);color:var(--accent-blue);display:flex;align-items:center;justify-content:center;"><i class="bi bi-water"></i></div>
+                    <div>
+                        <h6 class="mb-0 fw-bold">DigitalOcean</h6>
+                        <small class="text-muted">
+                            Server hosting — with backup-token failover
+                            {% set lwt = settings.get('do_last_working_token') %}
+                            {% if lwt %} · last worked: <strong>{{ lwt }}</strong>{% endif %}
+                        </small>
+                    </div>
+                </div>
+                <div class="mb-2">
+                    <label class="form-label">Primary API Token</label>
+                    <div class="password-field">
+                        <input type="password" class="form-control" name="do_api_token"
+                               value="{{ settings.get('do_api_token','') }}"
+                               placeholder="Personal Access Token">
+                        <button type="button" class="toggle-vis"><i class="bi bi-eye"></i></button>
+                    </div>
+                </div>
+                <div class="mb-2">
+                    <label class="form-label small d-flex align-items-center gap-2">
+                        Backup API Token
+                        <span class="badge bg-warning text-dark" style="font-size:0.65rem;">failover</span>
+                    </label>
+                    <div class="password-field">
+                        <input type="password" class="form-control" name="do_api_token_backup"
+                               value="{{ settings.get('do_api_token_backup','') }}"
+                               placeholder="Fallback PAT (second DO account recommended)">
+                        <button type="button" class="toggle-vis"><i class="bi bi-eye"></i></button>
+                    </div>
+                    <small class="text-muted">
+                        Used automatically on 401/403/5xx/timeout from the primary.
+                        Put a PAT from a DIFFERENT DO account here for account-level DR.
+                    </small>
+                </div>
+                <div class="form-check form-switch mb-2">
+                    <input class="form-check-input" type="checkbox"
+                           name="do_use_backup_first" id="do_use_backup_first" value="1"
+                           {% if settings.get('do_use_backup_first','0') == '1' %}checked{% endif %}>
+                    <label class="form-check-label small" for="do_use_backup_first">
+                        Use backup FIRST (skip primary — flip this when you know primary is broken)
+                    </label>
+                </div>
+                <div class="d-flex gap-2">
+                    <button type="button" class="btn btn-soft btn-sm" id="testDoBtn">
+                        <i class="bi bi-shield-check me-1"></i>Test both tokens
+                    </button>
+                    <div id="doTestResult" class="small" style="flex:1;"></div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-6">
+            <div class="card-s card-s-static p-4">
+                <div class="d-flex align-items-center gap-2 mb-3">
+                    <div class="stat-icon" style="width:36px;height:36px;border-radius:10px;font-size:1rem;background:var(--accent-teal-bg);color:var(--accent-teal);display:flex;align-items:center;justify-content:center;"><i class="bi bi-server"></i></div>
+                    <div><h6 class="mb-0 fw-bold">ServerAvatar</h6><small class="text-muted">Panel Management</small></div>
+                </div>
+                <div class="mb-3"><label class="form-label">API Key (Bearer)</label><div class="password-field"><input type="password" class="form-control" name="serveravatar_api_key" value="{{ settings.get('serveravatar_api_key','') }}" placeholder="Bearer token"><button type="button" class="toggle-vis"><i class="bi bi-eye"></i></button></div></div>
+                <div class="mb-3"><label class="form-label">Organization ID</label><input type="text" class="form-control" name="serveravatar_org_id" value="{{ settings.get('serveravatar_org_id','') }}" placeholder="Org ID"></div>
+
+                {# Dashboard login creds — used by the UI-automation fallback
+                   for Custom SSL install when SA's /ssl API returns 500. #}
+                <hr class="my-3" style="opacity:.3;">
+                <small class="text-muted d-block mb-2">
+                    <i class="bi bi-info-circle me-1"></i>Dashboard login — only needed for
+                    the UI-automated SSL install fallback (when SA's /ssl API fails).
+                </small>
+                <div class="mb-2">
+                    <label class="form-label">Dashboard Email</label>
+                    <input type="email" class="form-control" name="sa_dashboard_email"
+                           value="{{ settings.get('sa_dashboard_email','') }}"
+                           placeholder="you@example.com" autocomplete="off">
+                </div>
+                <div>
+                    <label class="form-label">Dashboard Password</label>
+                    <div class="password-field">
+                        <input type="password" class="form-control" name="sa_dashboard_password"
+                               value="{{ settings.get('sa_dashboard_password','') }}"
+                               placeholder="dashboard password" autocomplete="new-password">
+                        <button type="button" class="toggle-vis"><i class="bi bi-eye"></i></button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-6">
+            <div class="card-s card-s-static p-4">
+                <div class="d-flex align-items-center gap-2 mb-3">
+                    <div class="stat-icon" style="width:36px;height:36px;border-radius:10px;font-size:1rem;background:var(--accent-mint-bg,#dff7ea);color:var(--accent-mint,#2da77b);display:flex;align-items:center;justify-content:center;"><i class="bi bi-stars"></i></div>
+                    <div><h6 class="mb-0 fw-bold">LLM</h6><small class="text-muted">Website Generator (Claude Haiku 4.5)</small></div>
+                </div>
+                <div class="row g-2 mb-3">
+                    <div class="col-md-6">
+                        <label class="form-label">Active Provider</label>
+                        <select class="form-select" name="llm_provider" id="llm_provider_select">
+                            <option value="anthropic"  {% if settings.get('llm_provider')=='anthropic' %}selected{% endif %}>Anthropic (Claude)</option>
+                            <option value="openai"     {% if settings.get('llm_provider')=='openai' %}selected{% endif %}>OpenAI (GPT)</option>
+                            <option value="gemini"     {% if settings.get('llm_provider')=='gemini' %}selected{% endif %}>Google Gemini</option>
+                            <option value="openrouter" {% if settings.get('llm_provider')=='openrouter' %}selected{% endif %}>OpenRouter</option>
+                        </select>
+                    </div>
+                    <div class="col-md-6">
+                        <label class="form-label">Model</label>
+                        <input type="text" class="form-control" name="llm_model"
+                               value="{{ settings.get('llm_model','') }}"
+                               placeholder="auto (provider default)">
+                        <small class="text-muted">Anthropic: <code>claude-haiku-4-5-20251001</code> · OpenAI: <code>gpt-5.4-mini</code> · Gemini: <code>gemini-2.5-flash</code> · OpenRouter: <code>google/gemini-2.5-flash</code></small>
+                    </div>
+                </div>
+
+                {# Per-provider keys — each field gets its own test button and its own link #}
+                {% set provider_info = {
+                    'anthropic':  {'label': 'Anthropic key',  'prefix': 'sk-ant-api03-…',  'url': 'https://console.anthropic.com/settings/keys', 'title': 'Anthropic Console'},
+                    'openai':     {'label': 'OpenAI key',     'prefix': 'sk-proj-… or sk-…', 'url': 'https://platform.openai.com/api-keys',          'title': 'OpenAI Platform'},
+                    'gemini':     {'label': 'Gemini key',     'prefix': 'AIza…',            'url': 'https://aistudio.google.com/apikey',             'title': 'Google AI Studio'},
+                    'openrouter': {'label': 'OpenRouter key', 'prefix': 'sk-or-v1-…',       'url': 'https://openrouter.ai/keys',                      'title': 'OpenRouter'},
+                } %}
+                {% for pid, info in provider_info.items() %}
+                <div class="mb-2">
+                    <label class="form-label d-flex justify-content-between align-items-center">
+                        <span>{{ info.label }}</span>
+                        <a href="{{ info.url }}" target="_blank" rel="noopener"
+                           class="small text-decoration-none" style="color:var(--accent-mint,#2da77b);">
+                            <i class="bi bi-box-arrow-up-right me-1"></i>{{ info.title }}
+                        </a>
+                    </label>
+                    <div class="d-flex gap-2 align-items-start">
+                        <div class="password-field flex-grow-1">
+                            <input type="password" class="form-control"
+                                   name="llm_api_key_{{ pid }}"
+                                   id="llm_key_input_{{ pid }}"
+                                   value="{{ settings.get('llm_api_key_' ~ pid, '') }}"
+                                   placeholder="{{ info.prefix }}">
+                            <button type="button" class="toggle-vis"><i class="bi bi-eye"></i></button>
+                        </div>
+                        <button type="button" class="btn btn-soft btn-soft-info btn-sm llm-test-btn"
+                                data-provider="{{ pid }}">
+                            <i class="bi bi-check-circle me-1"></i>Test
+                        </button>
+                    </div>
+                    <small id="llm_test_result_{{ pid }}" class="text-muted d-block mt-1"></small>
+                </div>
+                {% endfor %}
+
+                {# Legacy single-key fallback field (kept for backward compat; rarely needed) #}
+                <details class="mt-2">
+                    <summary class="small text-muted" style="cursor:pointer;">Legacy single-key fallback</summary>
+                    <div class="mt-2">
+                        <div class="password-field">
+                            <input type="password" class="form-control" name="llm_api_key"
+                                   id="llm_api_key_input"
+                                   value="{{ settings.get('llm_api_key','') }}"
+                                   placeholder="(optional — only used if the per-provider key above is empty)">
+                            <button type="button" class="toggle-vis"><i class="bi bi-eye"></i></button>
+                        </div>
+                    </div>
+                </details>
+            </div>
+        </div>
+
+        <!-- =================== Cloudflare API Keys Pool =================== -->
+        <div class="col-12">
+            <div class="card-s card-s-static p-4">
+                <div class="d-flex align-items-center gap-2 mb-3">
+                    <div class="stat-icon" style="width:36px;height:36px;border-radius:10px;font-size:1rem;background:#e6f4ff;color:#0a6ed1;display:flex;align-items:center;justify-content:center;"><i class="bi bi-cloud-fill"></i></div>
+                    <div>
+                        <h6 class="mb-0 fw-bold">Cloudflare API Keys Pool</h6>
+                        <small class="text-muted">One key handles {{ settings.get('cf_domains_per_key','20') }} domains; pipeline rotates to the next when full.</small>
+                    </div>
+                </div>
+
+                {% if cf_keys %}
+                <div class="d-flex justify-content-end mb-2">
+                    <form action="/api/cf-keys/refresh-accounts" method="POST" class="d-inline">
+                        <button class="btn btn-soft btn-soft-info btn-sm" type="submit"
+                                title="Re-fetch Account ID from Cloudflare /accounts for every key">
+                            <i class="bi bi-arrow-clockwise me-1"></i>Verify Account IDs
+                        </button>
+                    </form>
+                </div>
+                <div class="table-responsive mb-3">
+                    <table class="table table-s mb-0">
+                        <thead>
+                            <tr>
+                                <th>#</th><th>Alias</th><th>Email</th>
+                                <th>Used / Max</th><th>Status</th><th>Last Used</th><th style="width:110px;">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                        {% for k in cf_keys %}
+                            <tr>
+                                <td><code>{{ k.id }}</code></td>
+                                <td><span class="badge bg-primary-subtle text-primary-emphasis">{{ k.alias or '—' }}</span></td>
+                                <td><small class="text-muted">{{ k.email }}</small></td>
+                                <td>
+                                    {% set pct = (k.domains_used * 100 / (k.max_domains or 1)) | round(0) %}
+                                    <div class="d-flex align-items-center gap-2">
+                                        <span>{{ k.domains_used }} / {{ k.max_domains }}</span>
+                                        <div style="flex:0 0 60px;height:6px;background:#e9ecef;border-radius:3px;overflow:hidden;">
+                                            <div style="height:100%;width:{{ pct }}%;background:{% if pct >= 100 %}#dc3545{% elif pct >= 80 %}#f59e0b{% else %}#16a34a{% endif %};"></div>
+                                        </div>
+                                    </div>
+                                </td>
+                                <td>
+                                    {% if k.is_active %}
+                                        <span class="badge bg-success-subtle text-success-emphasis">active</span>
+                                    {% else %}
+                                        <span class="badge bg-secondary-subtle text-secondary-emphasis">paused</span>
+                                    {% endif %}
+                                </td>
+                                <td><small class="text-muted">{{ k.last_used_at or '—' }}</small></td>
+                                <td>
+                                    <div class="d-flex gap-1">
+                                        <form action="/api/cf-keys/{{ k.id }}/toggle" method="POST" class="d-inline">
+                                            <button class="btn btn-soft btn-soft-warning btn-sm" title="Toggle active/paused">
+                                                <i class="bi bi-{% if k.is_active %}pause-fill{% else %}play-fill{% endif %}"></i>
+                                            </button>
+                                        </form>
+                                        <form action="/api/cf-keys/{{ k.id }}/delete" method="POST" class="d-inline cf-key-del-form">
+                                            <button class="btn btn-soft btn-soft-danger btn-sm" title="Remove from pool">
+                                                <i class="bi bi-trash"></i>
+                                            </button>
+                                        </form>
+                                    </div>
+                                </td>
+                            </tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% else %}
+                    <div class="p-3 rounded mb-3" style="background:#f8f9fa;border:1px dashed #dee2e6;">
+                        <small class="text-muted">No CF keys in pool yet. Add one below — each handles 20 domains before auto-rotating.</small>
+                    </div>
+                {% endif %}
+
+                <form action="/api/cf-keys/add" method="POST" class="row g-2 align-items-end">
+                    <div class="col-md-2">
+                        <label class="form-label small">Alias</label>
+                        <input type="text" class="form-control form-control-sm" name="alias" placeholder="CF2" maxlength="32">
+                    </div>
+                    <div class="col-md-3">
+                        <label class="form-label small">Email</label>
+                        <input type="email" class="form-control form-control-sm" name="email" placeholder="cf2@emailboox.com" required>
+                    </div>
+                    <div class="col-md-5">
+                        <label class="form-label small d-flex justify-content-between">
+                            <span>Global API Key</span>
+                            <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener"
+                               class="text-decoration-none" style="color:#0a6ed1;">
+                                <i class="bi bi-box-arrow-up-right me-1"></i>CF dashboard
+                            </a>
+                        </label>
+                        <div class="password-field">
+                            <input type="password" class="form-control form-control-sm" name="api_key" placeholder="cfk_…" required>
+                            <button type="button" class="toggle-vis"><i class="bi bi-eye"></i></button>
+                        </div>
+                    </div>
+                    <div class="col-md-2">
+                        <button type="submit" class="btn btn-soft btn-soft-info btn-sm w-100">
+                            <i class="bi bi-plus-lg me-1"></i>Add to Pool
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+        <div class="col-md-6">
+            <div class="card-s card-s-static p-4">
+                <div class="d-flex align-items-center gap-2 mb-3">
+                    <div class="stat-icon" style="width:36px;height:36px;border-radius:10px;font-size:1rem;background:#F0F2F8;color:var(--text-secondary);display:flex;align-items:center;justify-content:center;"><i class="bi bi-terminal"></i></div>
+                    <div><h6 class="mb-0 fw-bold">Server SSH</h6><small class="text-muted">Deploy access</small></div>
+                </div>
+                <div><label class="form-label">Root Password</label><div class="password-field"><input type="password" class="form-control" name="server_root_password" value="{{ settings.get('server_root_password','') }}" placeholder="SSH root password"><button type="button" class="toggle-vis"><i class="bi bi-eye"></i></button></div></div>
+            </div>
+        </div>
+
+        <div class="col-12">
+            <div class="card-s card-s-static p-4">
+                <div class="d-flex align-items-center gap-2 mb-3">
+                    <div class="stat-icon" style="width:36px;height:36px;border-radius:10px;font-size:1rem;background:var(--accent-amber-bg);color:#E17055;display:flex;align-items:center;justify-content:center;"><i class="bi bi-megaphone"></i></div>
+                    <div>
+                        <h6 class="mb-0 fw-bold">Alerts &amp; Notifications</h6>
+                        <small class="text-muted">Fan-out to all configured channels on server-dead / migration / DO-failover events.</small>
+                    </div>
+                </div>
+                <div class="form-check form-switch mb-3">
+                    <input class="form-check-input" type="checkbox" name="notifications_enabled" id="notifications_enabled" value="1"
+                           {% if settings.get('notifications_enabled','0') == '1' %}checked{% endif %}>
+                    <label class="form-check-label fw-bold" for="notifications_enabled">Master switch — enable alert fan-out</label>
+                </div>
+
+                <div class="row g-3">
+                    <!-- Email -->
+                    <div class="col-md-6">
+                        <div class="p-3 rounded" style="background:rgba(231,76,60,0.04);border:1px solid rgba(231,76,60,0.15);">
+                            <div class="d-flex align-items-center justify-content-between mb-2">
+                                <div class="fw-bold"><i class="bi bi-envelope me-1"></i>Email (SMTP)</div>
+                                <div class="form-check form-switch m-0">
+                                    <input class="form-check-input" type="checkbox" name="email_enabled" id="email_enabled" value="1"
+                                           {% if settings.get('email_enabled','0') == '1' %}checked{% endif %}>
+                                </div>
+                            </div>
+                            <div class="row g-2">
+                                <div class="col-8"><label class="form-label small mb-1">SMTP host</label><input type="text" class="form-control form-control-sm" name="smtp_server" value="{{ settings.get('smtp_server','') }}" placeholder="smtp.example.com"></div>
+                                <div class="col-4"><label class="form-label small mb-1">Port</label><input type="number" class="form-control form-control-sm" name="smtp_port" value="{{ settings.get('smtp_port','587') }}"></div>
+                                <div class="col-6"><label class="form-label small mb-1">From (login)</label><input type="text" class="form-control form-control-sm" name="smtp_email" value="{{ settings.get('smtp_email','') }}" placeholder="alerts@example.com"></div>
+                                <div class="col-6"><label class="form-label small mb-1">Password</label><div class="password-field"><input type="password" class="form-control form-control-sm" name="smtp_password" value="{{ settings.get('smtp_password','') }}"><button type="button" class="toggle-vis"><i class="bi bi-eye"></i></button></div></div>
+                                <div class="col-12"><label class="form-label small mb-1">Send alerts to</label><input type="email" class="form-control form-control-sm" name="notify_email" value="{{ settings.get('notify_email','') }}" placeholder="you@example.com"></div>
+                            </div>
+                            <div class="d-flex gap-2 mt-2 align-items-center">
+                                <button type="button" class="btn btn-soft btn-sm notify-test-btn" data-channel="email"><i class="bi bi-send me-1"></i>Send test email</button>
+                                <span class="small notify-test-out" data-channel="email"></span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Telegram -->
+                    <div class="col-md-6">
+                        <div class="p-3 rounded" style="background:rgba(37,150,190,0.05);border:1px solid rgba(37,150,190,0.15);">
+                            <div class="d-flex align-items-center justify-content-between mb-2">
+                                <div class="fw-bold"><i class="bi bi-send me-1"></i>Telegram Bot</div>
+                                <div class="form-check form-switch m-0">
+                                    <input class="form-check-input" type="checkbox" name="telegram_enabled" id="telegram_enabled" value="1"
+                                           {% if settings.get('telegram_enabled','0') == '1' %}checked{% endif %}>
+                                </div>
+                            </div>
+                            <div class="row g-2">
+                                <div class="col-12"><label class="form-label small mb-1">Bot token</label><div class="password-field"><input type="password" class="form-control form-control-sm" name="telegram_bot_token" id="tg_bot_token" value="{{ settings.get('telegram_bot_token','') }}" placeholder="123456:ABC-DEF…"><button type="button" class="toggle-vis"><i class="bi bi-eye"></i></button></div></div>
+                                <div class="col-12"><label class="form-label small mb-1">Chat ID</label><input type="text" class="form-control form-control-sm" name="telegram_chat_id" id="tg_chat_id" value="{{ settings.get('telegram_chat_id','') }}" placeholder="e.g. 987654321 or -100…"></div>
+                            </div>
+                            <small class="text-muted d-block mt-1">
+                                1. <code>@BotFather</code> → <code>/newbot</code> → copy token.
+                                2. Open your bot in Telegram and send it any message.
+                                3. Paste token above → click Detect chat ID → pick your chat.
+                            </small>
+                            <div class="d-flex gap-2 mt-2 align-items-center flex-wrap">
+                                <button type="button" class="btn btn-soft btn-sm" id="tg_detect_btn">
+                                    <i class="bi bi-search me-1"></i>Detect chat ID
+                                </button>
+                                <button type="button" class="btn btn-soft btn-sm notify-test-btn" data-channel="telegram"><i class="bi bi-send me-1"></i>Send test Telegram</button>
+                                <span class="small notify-test-out" data-channel="telegram"></span>
+                            </div>
+                            <div id="tg_detect_out" class="small mt-2"></div>
+                        </div>
+                    </div>
+
+                    <!-- WhatsApp -->
+                    <div class="col-md-6">
+                        <div class="p-3 rounded" style="background:rgba(37,211,102,0.06);border:1px solid rgba(37,211,102,0.18);">
+                            <div class="d-flex align-items-center justify-content-between mb-2">
+                                <div class="fw-bold"><i class="bi bi-whatsapp me-1"></i>WhatsApp</div>
+                                <div class="form-check form-switch m-0">
+                                    <input class="form-check-input" type="checkbox" name="whatsapp_enabled" id="whatsapp_enabled" value="1"
+                                           {% if settings.get('whatsapp_enabled','0') == '1' %}checked{% endif %}>
+                                </div>
+                            </div>
+                            <div class="mb-2">
+                                <label class="form-label small mb-1">Provider</label>
+                                <select class="form-select form-select-sm" name="whatsapp_provider" id="whatsapp_provider">
+                                    <option value="callmebot" {% if (settings.get('whatsapp_provider','callmebot')) == 'callmebot' %}selected{% endif %}>CallMeBot (free · slow)</option>
+                                    <option value="greenapi"  {% if (settings.get('whatsapp_provider','')) == 'greenapi' %}selected{% endif %}>Green-API (free tier · reliable)</option>
+                                </select>
+                            </div>
+                            <div class="mb-2">
+                                <label class="form-label small mb-1">Recipient phone (no +)</label>
+                                <input type="text" class="form-control form-control-sm" name="whatsapp_phone" value="{{ settings.get('whatsapp_phone','') }}" placeholder="15551234567">
+                            </div>
+
+                            <!-- CallMeBot fields -->
+                            <div class="wa-provider-fields" data-provider="callmebot">
+                                <label class="form-label small mb-1">CallMeBot apikey</label>
+                                <div class="password-field"><input type="password" class="form-control form-control-sm" name="whatsapp_apikey" value="{{ settings.get('whatsapp_apikey','') }}"><button type="button" class="toggle-vis"><i class="bi bi-eye"></i></button></div>
+                                <small class="text-muted d-block mt-1">
+                                    One-time pairing: WhatsApp <code>I allow callmebot to send me messages</code> to
+                                    <code>+34 644 99 26 98</code>. Reply can take up to 2 hours.
+                                </small>
+                            </div>
+
+                            <!-- Green-API fields -->
+                            <div class="wa-provider-fields" data-provider="greenapi">
+                                <div class="row g-2">
+                                    <div class="col-12">
+                                        <label class="form-label small mb-1">Instance ID (idInstance)</label>
+                                        <input type="text" class="form-control form-control-sm" name="greenapi_instance_id" value="{{ settings.get('greenapi_instance_id','') }}" placeholder="1101000001">
+                                    </div>
+                                    <div class="col-12">
+                                        <label class="form-label small mb-1">API token (apiTokenInstance)</label>
+                                        <div class="password-field"><input type="password" class="form-control form-control-sm" name="greenapi_api_token" value="{{ settings.get('greenapi_api_token','') }}"><button type="button" class="toggle-vis"><i class="bi bi-eye"></i></button></div>
+                                    </div>
+                                    <div class="col-12">
+                                        <label class="form-label small mb-1">API host <span class="text-muted">(optional)</span></label>
+                                        <input type="text" class="form-control form-control-sm" name="greenapi_host" value="{{ settings.get('greenapi_host','') }}" placeholder="leave blank for auto-detect">
+                                        <small class="text-muted">If Green-API shows a specific host for your instance (e.g. <code>https://7105.api.greenapi.com</code>), paste it here.</small>
+                                    </div>
+                                </div>
+                                <small class="text-muted d-block mt-1">
+                                    Setup: create a free account at <code>green-api.com</code>, create an Instance, scan the QR
+                                    with your WhatsApp (the one hosting the sender, NOT the recipient), then copy idInstance + apiTokenInstance from the instance details page.
+                                    Free tier = 200 messages/day — plenty for alerts.
+                                </small>
+                            </div>
+
+                            <div class="d-flex gap-2 mt-2 align-items-center">
+                                <button type="button" class="btn btn-soft btn-sm notify-test-btn" data-channel="whatsapp"><i class="bi bi-send me-1"></i>Send test WhatsApp</button>
+                                <span class="small notify-test-out" data-channel="whatsapp"></span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- SMS / Twilio -->
+                    <div class="col-md-6">
+                        <div class="p-3 rounded" style="background:rgba(220,53,69,0.04);border:1px solid rgba(220,53,69,0.15);">
+                            <div class="d-flex align-items-center justify-content-between mb-2">
+                                <div class="fw-bold"><i class="bi bi-phone me-1"></i>SMS (Twilio)</div>
+                                <div class="form-check form-switch m-0">
+                                    <input class="form-check-input" type="checkbox" name="sms_enabled" id="sms_enabled" value="1"
+                                           {% if settings.get('sms_enabled','0') == '1' %}checked{% endif %}>
+                                </div>
+                            </div>
+                            <div class="row g-2">
+                                <div class="col-6"><label class="form-label small mb-1">Account SID</label><div class="password-field"><input type="password" class="form-control form-control-sm" name="twilio_account_sid" value="{{ settings.get('twilio_account_sid','') }}"><button type="button" class="toggle-vis"><i class="bi bi-eye"></i></button></div></div>
+                                <div class="col-6"><label class="form-label small mb-1">Auth token</label><div class="password-field"><input type="password" class="form-control form-control-sm" name="twilio_auth_token" value="{{ settings.get('twilio_auth_token','') }}"><button type="button" class="toggle-vis"><i class="bi bi-eye"></i></button></div></div>
+                                <div class="col-6"><label class="form-label small mb-1">Twilio FROM number</label><input type="text" class="form-control form-control-sm" name="twilio_from_number" value="{{ settings.get('twilio_from_number','') }}" placeholder="+15551234567"></div>
+                                <div class="col-6"><label class="form-label small mb-1">Your phone</label><input type="text" class="form-control form-control-sm" name="sms_to_number" value="{{ settings.get('sms_to_number','') }}" placeholder="+15551234567"></div>
+                            </div>
+                            <small class="text-muted d-block mt-1">
+                                ~$0.0075 per SMS. Both numbers must be in E.164 format (<code>+1…</code>).
+                            </small>
+                            <div class="d-flex gap-2 mt-2 align-items-center">
+                                <button type="button" class="btn btn-soft btn-sm notify-test-btn" data-channel="sms"><i class="bi bi-send me-1"></i>Send test SMS</button>
+                                <span class="small notify-test-out" data-channel="sms"></span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="mt-3 pt-3 border-top d-flex gap-2 align-items-center">
+                    <button type="button" class="btn btn-primary-s btn-sm notify-test-btn" data-channel="all">
+                        <i class="bi bi-broadcast me-1"></i>Test ALL channels at once
+                    </button>
+                    <small class="text-muted">
+                        Fires to every channel that's enabled + has creds. Bypasses the master switch (always runs).
+                    </small>
+                </div>
+                <small class="text-muted d-block mt-2">
+                    Triggers: server marked dead · auto-migration start/complete/fail · all DO tokens rejected · (Phase-4: pipeline failures &amp; LLM blocks).
+                </small>
+            </div>
+        </div>
+
+        <div class="col-md-6">
+            <div class="card-s card-s-static p-4">
+                <div class="d-flex align-items-center gap-2 mb-3">
+                    <div class="stat-icon" style="width:36px;height:36px;border-radius:10px;font-size:1rem;background:var(--accent-coral-bg);color:var(--accent-coral);display:flex;align-items:center;justify-content:center;"><i class="bi bi-shield-lock"></i></div>
+                    <div><h6 class="mb-0 fw-bold">Dashboard Security</h6><small class="text-muted">Protect access with password</small></div>
+                </div>
+                <div>
+                    <label class="form-label">Dashboard Password</label>
+                    <div class="password-field">
+                        <input type="password" class="form-control" name="dashboard_password"
+                               value=""
+                               placeholder="{% if settings.get('dashboard_password_hash') or settings.get('dashboard_password') %}(already set — leave blank to keep, type new to change){% else %}(not set — type a password to enable login){% endif %}"
+                               autocomplete="new-password">
+                        <button type="button" class="toggle-vis"><i class="bi bi-eye"></i></button>
+                    </div>
+                    <small class="text-muted d-block mt-1">
+                        Password is stored as a PBKDF2 hash — never kept in plaintext. Blank input = no change.
+                        Type a single <code>-</code> (minus) to DISABLE auth.
+                    </small>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-6">
+            <div class="card-s card-s-static p-4">
+                <div class="d-flex align-items-center gap-2 mb-3">
+                    <div class="stat-icon" style="width:36px;height:36px;border-radius:10px;font-size:1rem;background:rgba(13,110,253,0.08);color:#0d6efd;display:flex;align-items:center;justify-content:center;"><i class="bi bi-arrow-left-right"></i></div>
+                    <div><h6 class="mb-0 fw-bold">Auto-Migrate Dead Servers</h6><small class="text-muted">Move domains when a server stops responding</small></div>
+                </div>
+                <div class="form-check form-switch mb-2">
+                    <input class="form-check-input" type="checkbox" name="auto_migrate_enabled"
+                           id="auto_migrate_enabled" value="1"
+                           {% if settings.get('auto_migrate_enabled','0') == '1' %}checked{% endif %}>
+                    <label class="form-check-label" for="auto_migrate_enabled">
+                        Enable automatic migration when a server is detected dead
+                    </label>
+                </div>
+                <div class="row g-2 align-items-end">
+                    <div class="col-4">
+                        <label class="form-label small mb-1">Dead threshold (ticks)</label>
+                        <input type="number" class="form-control" name="dead_server_threshold_ticks"
+                               value="{{ settings.get('dead_server_threshold_ticks','10') }}"
+                               min="3" max="120">
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label small mb-1">Tick interval (seconds)</label>
+                        <input type="number" class="form-control" name="live_check_interval_s"
+                               value="{{ settings.get('live_check_interval_s','60') }}"
+                               min="10" max="600">
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label small mb-1">Max droplets/hour <span class="badge bg-danger text-white" style="font-size:0.65rem;">cost cap</span></label>
+                        <input type="number" class="form-control" name="max_droplets_per_hour"
+                               value="{{ settings.get('max_droplets_per_hour','3') }}"
+                               min="1" max="50">
+                    </div>
+                </div>
+                <small class="text-muted d-block mt-2">
+                    Server is marked <code>dead</code> when <strong>all</strong> its domains fail HTTPS
+                    for N consecutive ticks. Dead-flip happens either way; auto-migrate only runs if the toggle is ON.
+                </small>
+                <div class="mt-3 pt-3 border-top">
+                    <form action="/api/domains/backfill-origin-certs" method="POST" onsubmit="return confirm('Re-issue Origin SSL certs for every domain missing a cached copy? This calls Cloudflare once per domain (~1s each). Safe — the existing cert on the server keeps working.');">
+                        <button type="submit" class="btn btn-soft btn-sm">
+                            <i class="bi bi-shield-plus me-1"></i>Backfill Origin certs for pre-Phase-1 domains
+                        </button>
+                        <small class="d-block text-muted mt-1">
+                            Caches CF Origin CA certs in DB so future migrations can skip the ~30s re-issue step.
+                        </small>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="mt-4">
+        <button type="submit" class="btn btn-primary-s px-5 py-2"><i class="bi bi-check-lg me-2"></i>Save All Settings</button>
+        {% if settings.get('dashboard_password_hash') or settings.get('dashboard_password') %}<a href="/logout" class="btn btn-soft btn-soft-danger ms-3"><i class="bi bi-box-arrow-right me-1"></i>Logout</a>{% endif %}
+    </div>
+</form>
+
+<script>
+// --- Per-provider "Test" buttons (validates against the right endpoint) ---
+document.querySelectorAll(".llm-test-btn").forEach(btn => {
+    btn.addEventListener("click", async () => {
+        const provider = btn.dataset.provider;
+        const inp = document.getElementById("llm_key_input_" + provider);
+        const out = document.getElementById("llm_test_result_" + provider);
+        if (!inp || !out) return;
+        const key = (inp.value || "").trim();
+        if (!key) {
+            out.innerHTML = '<span class="text-warning">Paste a key above first</span>';
+            return;
+        }
+        btn.disabled = true;
+        out.innerHTML = '<span class="text-muted">Testing…</span>';
+        try {
+            const form = new FormData();
+            form.append("provider", provider);
+            form.append("llm_api_key", key);
+            const r = await fetch("/api/settings/test-llm-key", { method: "POST", body: form });
+            const j = await r.json();
+            if (j.ok) {
+                let detail = "";
+                if (j.usage) detail = `in=${j.usage.input_tokens || "?"}, out=${j.usage.output_tokens || "?"}`;
+                else if (j.info) detail = j.info;
+                else if (j.label) detail = `label=${j.label}`;
+                out.innerHTML = `<span class="text-success"><i class="bi bi-check-circle-fill me-1"></i>Valid · ${detail || "ok"}</span>`;
+            } else {
+                const errText = (j.error || "").slice(0, 140);
+                out.innerHTML = `<span class="text-danger"><i class="bi bi-x-circle-fill me-1"></i>${errText || "Rejected"}</span>`;
+            }
+        } catch (e) {
+            out.innerHTML = `<span class="text-danger"><i class="bi bi-x-circle-fill me-1"></i>Network error</span>`;
+        } finally { btn.disabled = false; }
+    });
+});
+
+// --- CF key delete confirmation ------------------------------------------
+document.querySelectorAll(".cf-key-del-form").forEach(f => {
+    f.addEventListener("submit", e => {
+        if (!confirm("Remove this CF key from the pool?\n\nOnly works if no domain is using it.")) e.preventDefault();
+    });
+});
+
+// --- Telegram chat-ID detector: fetch getUpdates via backend proxy ------
+(function () {
+    const btn = document.getElementById("tg_detect_btn");
+    if (!btn) return;
+    const out = document.getElementById("tg_detect_out");
+    const tokInput = document.getElementById("tg_bot_token");
+    const cidInput = document.getElementById("tg_chat_id");
+    btn.addEventListener("click", async () => {
+        const tok = (tokInput.value || "").trim();
+        if (!tok) {
+            out.innerHTML = '<span class="text-warning">Paste the bot token first.</span>';
+            return;
+        }
+        btn.disabled = true;
+        out.innerHTML = '<span class="text-muted">Calling getUpdates…</span>';
+        try {
+            const form = new FormData();
+            form.append("telegram_bot_token", tok);
+            const r = await fetch("/api/settings/telegram-detect-chat", {
+                method: "POST", body: form,
+            });
+            const j = await r.json();
+            if (!j.ok) {
+                out.innerHTML = `<span class="text-danger"><i class="bi bi-x-circle-fill me-1"></i>${j.error || "error"}</span>`;
+                return;
+            }
+            const who = j.bot && j.bot.username
+                ? `Bot: <code>@${j.bot.username}</code>${j.bot.name ? " ("+j.bot.name+")" : ""}`
+                : "";
+            if (!j.chats || j.chats.length === 0) {
+                out.innerHTML =
+                    `<div>${who}</div>` +
+                    `<div class="text-warning mt-1"><i class="bi bi-exclamation-triangle me-1"></i>No chats yet. Open your bot in Telegram and send it any message, then click Detect again.</div>`;
+                return;
+            }
+            const rows = j.chats.map(c => {
+                const label = c.type === "private"
+                    ? `${c.first_name || ""}${c.last_name ? " "+c.last_name : ""}${c.username ? " (@"+c.username+")" : ""} — private DM`
+                    : `${c.title || c.username || "?"} — ${c.type}`;
+                return `<button type="button" class="btn btn-soft btn-sm d-block mb-1 text-start w-100"
+                               data-cid="${c.id}">
+                    <code>${c.id}</code> · ${label}
+                </button>`;
+            }).join("");
+            out.innerHTML = `<div>${who}</div>
+                             <div class="text-muted mt-1 mb-1">Click a chat to auto-fill:</div>${rows}`;
+            out.querySelectorAll("button[data-cid]").forEach(b => {
+                b.addEventListener("click", () => {
+                    cidInput.value = b.dataset.cid;
+                    b.classList.add("btn-primary-s");
+                    out.insertAdjacentHTML("beforeend",
+                        `<div class="text-success mt-1"><i class="bi bi-check-circle-fill me-1"></i>Chat ID filled in. Remember to <strong>Save All Settings</strong>, then hit Send test Telegram.</div>`);
+                });
+            });
+        } catch (e) {
+            out.innerHTML = '<span class="text-danger">Network error</span>';
+        } finally { btn.disabled = false; }
+    });
+})();
+
+// --- WhatsApp provider picker: show fields for the selected provider ----
+(function () {
+    const sel = document.getElementById("whatsapp_provider");
+    if (!sel) return;
+    const apply = () => {
+        document.querySelectorAll(".wa-provider-fields").forEach(div => {
+            div.style.display = (div.dataset.provider === sel.value) ? "" : "none";
+        });
+    };
+    sel.addEventListener("change", apply);
+    apply();
+})();
+
+// --- Notification test buttons: per-channel + all-at-once ----------------
+document.querySelectorAll(".notify-test-btn").forEach(btn => {
+    btn.addEventListener("click", async () => {
+        const ch = btn.dataset.channel;
+        const out = btn.parentElement.querySelector(`.notify-test-out[data-channel="${ch}"]`)
+                 || document.querySelector(`.notify-test-out[data-channel="${ch}"]`);
+        btn.disabled = true;
+        if (out) out.innerHTML = '<span class="text-muted">Sending…</span>';
+        try {
+            const form = new FormData();
+            form.append("channel", ch);
+            const r = await fetch("/api/settings/test-notification", { method: "POST", body: form });
+            const j = await r.json();
+            if (!j.ok) {
+                if (out) out.innerHTML = `<span class="text-danger">${(j.error||"error")}</span>`;
+            } else if (ch === "all") {
+                // Summarise all channels
+                const rows = Object.entries(j.result.results || {}).map(
+                    ([k, v]) => `${v[0] ? '<span class="text-success">✓</span>' : '<span class="text-danger">✗</span>'} ${k}: ${String(v[1]).slice(0,80)}`
+                ).join("<br>");
+                const skipped = (j.result.channels || []).length === 0
+                    ? '<div class="text-warning">No channels enabled — flip a switch first.</div>' : "";
+                // Put the summary inline under the button
+                const box = btn.closest(".card-s").querySelector(".notify-test-summary") || (() => {
+                    const d = document.createElement("div");
+                    d.className = "notify-test-summary small mt-2";
+                    btn.parentElement.appendChild(d);
+                    return d;
+                })();
+                box.innerHTML = skipped + rows;
+            } else {
+                const r2 = (j.result.results || {})[ch] || [false, "no result"];
+                if (r2[0]) {
+                    if (out) out.innerHTML = `<span class="text-success"><i class="bi bi-check-circle-fill me-1"></i>${String(r2[1]).slice(0,80)}</span>`;
+                } else {
+                    if (out) out.innerHTML = `<span class="text-danger"><i class="bi bi-x-circle-fill me-1"></i>${String(r2[1]).slice(0,100)}</span>`;
+                }
+            }
+        } catch (e) {
+            if (out) out.innerHTML = '<span class="text-danger">Network error</span>';
+        } finally { btn.disabled = false; }
+    });
+});
+
+// --- DO token test: hit /account with both tokens in parallel ------------
+(function () {
+    const btn = document.getElementById("testDoBtn");
+    const out = document.getElementById("doTestResult");
+    if (!btn || !out) return;
+    const fmt = (label, r) => {
+        if (!r.configured) return `<span class="text-muted">${label}: not set</span>`;
+        if (r.ok) {
+            const lim = r.droplet_limit != null ? ` · limit ${r.droplet_limit}` : "";
+            return `<span class="text-success"><i class="bi bi-check-circle-fill me-1"></i>${label}: ${r.email} (${r.status})${lim}</span>`;
+        }
+        return `<span class="text-danger"><i class="bi bi-x-circle-fill me-1"></i>${label}: ${(r.error||"rejected").slice(0,80)}</span>`;
+    };
+    btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        out.innerHTML = '<span class="text-muted">Testing…</span>';
+        try {
+            const r = await fetch("/api/settings/test-do-keys", { method: "POST" });
+            const j = await r.json();
+            out.innerHTML = `<div>${fmt("primary", j.primary)}</div><div>${fmt("backup", j.backup)}</div>`;
+        } catch (e) {
+            out.innerHTML = '<span class="text-danger">Network error</span>';
+        } finally { btn.disabled = false; }
+    });
+})();
+</script>
+{% endblock %}

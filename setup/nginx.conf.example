@@ -1,0 +1,70 @@
+# /etc/nginx/sites-available/ssr-dashboard
+#
+# HTTPS reverse proxy in front of the Flask dashboard running on 127.0.0.1:8000.
+# Assumes:
+#   - app bound locally via SSR_BIND_ALL unset (safer default)
+#   - SSR_BEHIND_PROXY=1 so ProxyFix trusts X-Forwarded-* from THIS nginx
+#   - certbot (or similar) provides the TLS cert
+#
+# One-shot to enable:
+#   sudo ln -s /etc/nginx/sites-available/ssr-dashboard /etc/nginx/sites-enabled/
+#   sudo nginx -t && sudo systemctl reload nginx
+
+# Rate-limit zones — one for the login endpoint, one for everything else.
+limit_req_zone $binary_remote_addr zone=ssr_login:10m rate=5r/m;
+limit_req_zone $binary_remote_addr zone=ssr_global:10m rate=120r/m;
+
+# Redirect HTTP -> HTTPS
+server {
+    listen 80;
+    listen [::]:80;
+    server_name DASHBOARD_FQDN;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name DASHBOARD_FQDN;
+
+    # TLS (certbot path — adjust if using a different issuer)
+    ssl_certificate     /etc/letsencrypt/live/DASHBOARD_FQDN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/DASHBOARD_FQDN/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # HSTS — remove this line until you've confirmed TLS is working reliably
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    # Size limit — the app doesn't accept large uploads, so cap at 1MB
+    client_max_body_size 1m;
+
+    # Uptime probe — no rate limit, no auth
+    location = /healthz {
+        proxy_pass http://127.0.0.1:8000/healthz;
+        access_log off;
+    }
+
+    # Login — strict rate limit (5/min) because brute-force target
+    location = /login {
+        limit_req zone=ssr_login burst=3 nodelay;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Everything else — generous rate limit, proxy to Flask
+    location / {
+        limit_req zone=ssr_global burst=30 nodelay;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 90s;
+    }
+}

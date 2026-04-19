@@ -1,0 +1,33 @@
+# Secrets + state — NEVER commit
+data/
+.ssr_secret_fernet
+.env
+.env.*
+*.key
+*.pem
+
+# Python bytecode / venv
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+.venv/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs / debug artifacts
+*.log
+logs/
+
+# Build / distribution
+DEPLOY.zip
+dist/
+build/
+*.egg-info/
