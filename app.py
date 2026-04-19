@@ -1241,56 +1241,110 @@ def api_import_from_do():
     return redirect(url_for("servers_page"))
 
 
-@app.route("/api/domains/import-from-spaceship", methods=["POST"])
+@app.route("/api/domains/import-from-sa", methods=["POST"])
 @login_required
-def api_import_from_spaceship():
-    """Pull every domain Spaceship lists and add DB rows for anything not
-    already tracked. Imported domains get status='detected' — user runs
-    Pipeline (with Skip Purchase) to continue the hosting flow.
-    """
-    from modules import spaceship
+def api_import_from_sa():
+    """Import only the domains that are actually hosted on your ServerAvatar
+    servers — NOT all 1600+ Spaceship-registered domains.
 
+    Flow:
+      1. list every SA server in the org
+      2. for each, list its applications
+      3. for each app's primary_domain, add a row linked to THIS dashboard's
+         server_id (matched by sa_server_id) with status='hosted'
+
+    Also ensures each SA server has a row in our `servers` table, so linking
+    works cleanly even if the server wasn't imported via `/api/servers/import-from-do`
+    first.
+    """
+    from modules import serveravatar
+
+    # 1. SA servers
     try:
-        # Paginate — Spaceship API hard-caps at take=25
-        all_domains = []
-        skip = 0
-        while True:
-            resp = spaceship.list_domains(take=25, skip=skip)
-            items = resp.get("items") or resp.get("data") or []
-            if not items:
-                break
-            all_domains.extend(items)
-            skip += len(items)
-            if len(items) < 25:
-                break
+        sa_servers = serveravatar.list_servers()
     except Exception as e:
-        flash(f"Spaceship API error: {e}", "danger")
+        flash(f"ServerAvatar API error listing servers: {e}", "danger")
         return redirect(url_for("domains_page"))
 
+    # Build an {sa_server_id: our_dashboard_server_id} map, creating rows for
+    # any SA server we don't already track.
+    from database import get_db as _get_db
+    existing = {str(s["sa_server_id"]): s["id"] for s in get_servers()
+                if s.get("sa_server_id")}
+    sa_to_our = {}
+    new_servers = 0
+    for sa in sa_servers:
+        sa_id = str(sa.get("id", ""))
+        if not sa_id:
+            continue
+        if sa_id in existing:
+            sa_to_our[sa_id] = existing[sa_id]
+            continue
+        # Add a DB row so imported apps can link to it
+        name = sa.get("name") or f"sa-srv-{sa_id}"
+        ip = sa.get("ip") or ""
+        our_id = add_server(name, ip, None)  # do_droplet_id unknown for SA-only rows
+        conn = _get_db()
+        try:
+            conn.execute(
+                "UPDATE servers SET sa_server_id=?, status='ready' WHERE id=?",
+                (sa_id, our_id))
+            conn.commit()
+        finally:
+            conn.close()
+        sa_to_our[sa_id] = our_id
+        new_servers += 1
+
+    # 2. pull every app on every SA server
     existing_domains = {d["domain"] for d in get_domains()}
     added = 0
-    skipped = 0
-    for item in all_domains:
-        name = (item.get("name") or item.get("domain") or "").strip().lower()
-        if not name:
+    skipped_existing = 0
+    errors = 0
+    total_apps = 0
+    for sa in sa_servers:
+        sa_id = str(sa.get("id", ""))
+        try:
+            apps = serveravatar.list_applications(sa_id)
+        except Exception as e:
+            log_pipeline(f"server-{sa_id}", "import_from_sa", "warning",
+                         f"list_applications failed: {e}")
+            errors += 1
             continue
-        if name in existing_domains:
-            skipped += 1
-            continue
-        add_domain(name)
-        update_domain(name, status="detected")
-        added += 1
+        total_apps += len(apps)
+        our_server_id = sa_to_our.get(sa_id)
+        for app_obj in apps:
+            # SA stores the primary domain in various fields depending on
+            # version. Try them in order.
+            name = (app_obj.get("primary_domain")
+                    or app_obj.get("name")
+                    or app_obj.get("url") or "").strip().lower()
+            # Strip any http(s):// prefix or trailing paths
+            name = name.replace("https://", "").replace("http://", "")
+            name = name.split("/")[0].strip()
+            if not name or "." not in name:
+                continue
+            if name in existing_domains:
+                skipped_existing += 1
+                continue
+            add_domain(name)
+            # Link to its SA server + mark as already-hosted
+            update_domain(name, server_id=our_server_id, status="hosted")
+            existing_domains.add(name)
+            added += 1
 
-    audit("import_from_spaceship", actor_ip=request.remote_addr or "",
-          detail=f"added={added} skipped={skipped} total={len(all_domains)}")
+    audit("import_from_sa", actor_ip=request.remote_addr or "",
+          detail=f"added={added} new_servers={new_servers} "
+                 f"apps_seen={total_apps} skipped={skipped_existing} errors={errors}")
 
-    if added:
-        flash(f"Imported {added} domain(s) from Spaceship. "
-              f"Each shows status='detected' — run Pipeline with "
-              f"'Skip Purchase' to host any of them.", "success")
-    else:
-        flash(f"No new domains to import (Spaceship returned "
-              f"{len(all_domains)}, all already in dashboard).", "info")
+    parts = [f"Imported {added} hosted domain(s) from ServerAvatar"]
+    if new_servers:
+        parts.append(f"+ {new_servers} new server row(s)")
+    if skipped_existing:
+        parts.append(f"{skipped_existing} already tracked")
+    if errors:
+        parts.append(f"{errors} SA server(s) failed to list — check logs")
+    flash(" · ".join(parts) + ".",
+          "success" if added and not errors else "info" if added else "warning")
     return redirect(url_for("domains_page"))
 
 
