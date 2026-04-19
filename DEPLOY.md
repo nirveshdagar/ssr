@@ -25,14 +25,20 @@ EOF
 sudo chown -R ssr:ssr /opt/ssr
 ```
 
-## 3. Environment config (1 min)
+## 3. Environment + data dir (1 min)
 
 ```bash
+# Env file
 sudo cp /opt/ssr/.env.example /etc/ssr.env
 sudo chmod 600 /etc/ssr.env
 sudo chown ssr:ssr /etc/ssr.env
 # Review /etc/ssr.env — SSR_BEHIND_PROXY=1 and SSR_HTTPS_ONLY=1 are the
 # production defaults.
+
+# Data dir — must exist before systemd unit can start (ReadWritePaths=
+# needs the path during namespace setup)
+sudo mkdir -p /opt/ssr/data/site_archives
+sudo chown -R ssr:ssr /opt/ssr/data
 ```
 
 ## 4. systemd + auto-start (1 min)

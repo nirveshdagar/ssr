@@ -2,6 +2,9 @@
 Description=SSR Dashboard (Site Server Rotation)
 After=network-online.target
 Wants=network-online.target
+# StartLimit* live in [Unit] per systemd 229+; keeps the `systemctl` warning quiet.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -9,21 +12,15 @@ User=ssr
 Group=ssr
 WorkingDirectory=/opt/ssr
 EnvironmentFile=/etc/ssr.env
-
-# Ensure the app's data directory exists + is writable BEFORE ProtectSystem
-# locks the namespace. The leading `+` runs ExecStartPre as root (required
-# to mkdir under /opt which is root-owned), then chowns to the ssr user so
-# the main ExecStart (running as ssr) can write to it.
-ExecStartPre=+/bin/mkdir -p /opt/ssr/data /opt/ssr/data/site_archives
-ExecStartPre=+/bin/chown -R ssr:ssr /opt/ssr/data
-
+# NOTE: /opt/ssr/data must exist before the service starts — systemd sets up
+# the ReadWritePaths= namespace BEFORE any ExecStartPre hooks run, so we
+# cannot create the dir here. Creation is handled by the installer (see
+# setup/install.sh or DEPLOY.md step 3).
 ExecStart=/opt/ssr/venv/bin/python /opt/ssr/app.py 8000
 
 # Restart on crash with a small backoff (don't thrash if misconfigured)
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 # stdout/stderr go to journalctl
 StandardOutput=journal
@@ -35,8 +32,10 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-# Only these paths are writable
-ReadWritePaths=/opt/ssr/data
+# Only this path is writable. The leading `-` makes systemd tolerant if the
+# path doesn't exist yet (it'll refuse to start — caught by deploy.sh — but
+# won't corrupt the unit state). Installer MUST create /opt/ssr/data first.
+ReadWritePaths=-/opt/ssr/data
 
 [Install]
 WantedBy=multi-user.target
