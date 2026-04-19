@@ -1140,6 +1140,130 @@ def api_create_server():
     return redirect(url_for("servers_page"))
 
 
+@app.route("/api/servers/import-from-do", methods=["POST"])
+@login_required
+def api_import_from_do():
+    """Pull every droplet the DO API returns and add DB rows for anything
+    we don't already know about. Does NOT install SA — user has to do that
+    manually (via the SA dashboard or by running `install_agent_on_droplet`
+    later). Newly imported rows get status='detected' and no sa_server_id
+    so the pipeline treats them as unready until SA is wired up.
+    """
+    from modules.digitalocean import list_droplets, DOAllTokensFailed
+    from database import get_db as _get_db
+
+    try:
+        # No tag filter — pull ALL droplets so user can see their whole fleet
+        do_droplets = list_droplets(tag=None)
+    except DOAllTokensFailed as e:
+        flash(f"DO API rejected both tokens: {e}", "danger")
+        return redirect(url_for("servers_page"))
+    except Exception as e:
+        flash(f"DO API error: {e}", "danger")
+        return redirect(url_for("servers_page"))
+
+    existing_droplet_ids = {str(s["do_droplet_id"]) for s in get_servers()
+                            if s.get("do_droplet_id")}
+    existing_ips = {s["ip"] for s in get_servers() if s.get("ip")}
+
+    added = 0
+    skipped_existing = 0
+    for d in do_droplets:
+        droplet_id = str(d.get("id", ""))
+        name = d.get("name", f"droplet-{droplet_id}")
+        # Find the public IPv4
+        ip = ""
+        for net in d.get("networks", {}).get("v4", []):
+            if net.get("type") == "public":
+                ip = net["ip_address"]
+                break
+        if not ip:
+            continue
+        if droplet_id in existing_droplet_ids or ip in existing_ips:
+            skipped_existing += 1
+            continue
+
+        sid = add_server(name, ip, droplet_id)
+        # Update with region + size_slug from DO for display
+        conn = _get_db()
+        try:
+            conn.execute(
+                "UPDATE servers SET status=?, region=?, size_slug=? WHERE id=?",
+                ("detected", d.get("region", {}).get("slug", ""),
+                 d.get("size_slug", ""), sid),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        added += 1
+
+    audit("import_from_do", actor_ip=request.remote_addr or "",
+          detail=f"added={added} skipped={skipped_existing}")
+
+    if added:
+        flash(f"Imported {added} droplet(s) from DigitalOcean. "
+              f"Each row has status='detected' — click through to wire up "
+              f"ServerAvatar agent before running pipelines on them.",
+              "success")
+    else:
+        flash(f"No new droplets to import (already had {skipped_existing} "
+              f"of {len(do_droplets)} DO droplet(s)).", "info")
+    return redirect(url_for("servers_page"))
+
+
+@app.route("/api/domains/import-from-spaceship", methods=["POST"])
+@login_required
+def api_import_from_spaceship():
+    """Pull every domain Spaceship lists and add DB rows for anything not
+    already tracked. Imported domains get status='detected' — user runs
+    Pipeline (with Skip Purchase) to continue the hosting flow.
+    """
+    from modules import spaceship
+
+    try:
+        # Paginate — Spaceship API hard-caps at take=25
+        all_domains = []
+        skip = 0
+        while True:
+            resp = spaceship.list_domains(take=25, skip=skip)
+            items = resp.get("items") or resp.get("data") or []
+            if not items:
+                break
+            all_domains.extend(items)
+            skip += len(items)
+            if len(items) < 25:
+                break
+    except Exception as e:
+        flash(f"Spaceship API error: {e}", "danger")
+        return redirect(url_for("domains_page"))
+
+    existing_domains = {d["domain"] for d in get_domains()}
+    added = 0
+    skipped = 0
+    for item in all_domains:
+        name = (item.get("name") or item.get("domain") or "").strip().lower()
+        if not name:
+            continue
+        if name in existing_domains:
+            skipped += 1
+            continue
+        add_domain(name)
+        update_domain(name, status="detected")
+        added += 1
+
+    audit("import_from_spaceship", actor_ip=request.remote_addr or "",
+          detail=f"added={added} skipped={skipped} total={len(all_domains)}")
+
+    if added:
+        flash(f"Imported {added} domain(s) from Spaceship. "
+              f"Each shows status='detected' — run Pipeline with "
+              f"'Skip Purchase' to host any of them.", "success")
+    else:
+        flash(f"No new domains to import (Spaceship returned "
+              f"{len(all_domains)}, all already in dashboard).", "info")
+    return redirect(url_for("domains_page"))
+
+
 @app.route("/api/servers/add-existing", methods=["POST"])
 @login_required
 def api_add_existing_server():

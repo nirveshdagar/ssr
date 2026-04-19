@@ -7,6 +7,13 @@
         <form action="/api/domains/check-all-ns" method="POST"><button class="btn btn-soft btn-soft-success btn-sm"><i class="bi bi-broadcast me-1"></i>Check NS</button></form>
         <a href="/api/domains/export" class="btn btn-soft btn-sm"><i class="bi bi-download me-1"></i>Export CSV</a>
         <button class="btn btn-soft btn-sm" data-bs-toggle="modal" data-bs-target="#importModal"><i class="bi bi-upload me-1"></i>Import CSV</button>
+        <form action="/api/domains/import-from-spaceship" method="POST" class="m-0 d-inline"
+              onsubmit="return confirm('Pull every domain from your Spaceship account and add any we don\'t already have?');">
+            <button type="submit" class="btn btn-soft btn-soft-info btn-sm"
+                    title="Fetch all domains from Spaceship and list them here">
+                <i class="bi bi-rocket me-1"></i>Import from Spaceship
+            </button>
+        </form>
         <button class="btn btn-primary-s btn-primary-sm" data-bs-toggle="modal" data-bs-target="#addModal"><i class="bi bi-plus-circle me-1"></i>Add</button>
     </div>
 </div>

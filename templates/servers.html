@@ -5,7 +5,13 @@
     <div class="section-title"><i class="bi bi-hdd-rack-fill"></i> Servers</div>
     <div class="d-flex gap-2">
         <button class="btn btn-primary-s" data-bs-toggle="modal" data-bs-target="#createModal"><i class="bi bi-cloud-plus me-1"></i>Create DO Server</button>
-        <button class="btn btn-soft" data-bs-toggle="modal" data-bs-target="#addExistingModal"><i class="bi bi-plus-circle me-1"></i>Add Existing</button>
+        <form action="/api/servers/import-from-do" method="POST" class="m-0 d-inline"
+              onsubmit="return confirm('Pull every droplet from your DigitalOcean account and add any we don\'t already have?');">
+            <button type="submit" class="btn btn-soft btn-soft-info" title="Fetch all droplets from your DO account and add them here">
+                <i class="bi bi-cloud-download me-1"></i>Import from DO
+            </button>
+        </form>
+        <button class="btn btn-soft" data-bs-toggle="modal" data-bs-target="#addExistingModal"><i class="bi bi-plus-circle me-1"></i>Add Manually</button>
     </div>
 </div>
 
