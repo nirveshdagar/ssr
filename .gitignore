@@ -33,3 +33,6 @@ DEPLOY.zip
 dist/
 build/
 *.egg-info/
+
+# Session notes with secrets — local-only
+PROGRESS.md
