@@ -252,7 +252,22 @@ def _pipeline_worker_impl(domain, skip_purchase, server_id, start_from):
             if not server:
                 return
         else:
-            server = _find_server(server_id)
+            # Resuming past step 6 — must operate on the domain's existing
+            # server, not a random eligible one. Honor an explicit server_id
+            # from the UI; otherwise look up the server stored on the domain
+            # row when steps 1-6 originally ran.
+            resume_id = server_id
+            if resume_id is None:
+                d = get_domain(domain)
+                resume_id = d and d["server_id"]
+            server = _find_server(resume_id) if resume_id else None
+            if not server:
+                log_pipeline(domain, "pipeline", "failed",
+                             f"Cannot resume from step {start_from}: no server "
+                             "associated with this domain. Re-run from step 6 "
+                             "or pick a server explicitly.")
+                update_domain(domain, status="error")
+                return
 
         if _check_cancel(domain): raise PipelineCanceled()
         # ===== STEP 7 — Create Site on ServerAvatar =============================
@@ -274,6 +289,25 @@ def _pipeline_worker_impl(domain, skip_purchase, server_id, start_from):
             php = _step9_generate_content(domain)
             if php is None:
                 # Either blocked or failed — worker already updated status. Stop.
+                return
+        else:
+            # Resuming at step 10 — load previously generated content from
+            # domain.site_html (filled by step 9). Fall back to the on-disk
+            # archive if site_html got cleared. If neither exists, fail loud
+            # rather than uploading None.
+            d = get_domain(domain)
+            php = (d and d["site_html"]) or None
+            if not php or len(php) < 100:
+                from modules.migration import read_archive
+                archived = read_archive(domain)
+                if archived is not None:
+                    php, _ = archived
+            if not php or len(php) < 100:
+                log_pipeline(domain, "pipeline", "failed",
+                             "Cannot resume from step 10: no generated content "
+                             "found (site_html empty and no archive). Re-run "
+                             "from step 9 to regenerate.")
+                update_domain(domain, status="error")
                 return
 
         if _check_cancel(domain): raise PipelineCanceled()
