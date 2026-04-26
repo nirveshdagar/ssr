@@ -97,6 +97,7 @@
                         <button class="btn btn-soft btn-soft-success btn-sm" data-bs-toggle="modal" data-bs-target="#pipelineModal" data-domain="{{ d.domain }}" title="Run Pipeline"><i class="bi bi-play-fill"></i></button>
                         <form action="/api/domains/{{ d.domain }}/cancel-pipeline" method="POST" class="d-inline" onsubmit="return confirm('Cancel pipeline for {{ d.domain }}? Will stop at the next step boundary.');"><button class="btn btn-soft btn-soft-warning btn-sm" title="Cancel running pipeline"><i class="bi bi-stop-fill"></i></button></form>
                         <button class="btn btn-soft btn-soft-warning btn-sm watch-btn" data-domain="{{ d.domain }}" title="Watch Steps"><i class="bi bi-eye"></i></button>
+                        <button class="btn btn-soft btn-soft-info btn-sm history-btn" data-bs-toggle="modal" data-bs-target="#historyModal" data-domain="{{ d.domain }}" title="Run History"><i class="bi bi-clock-history"></i></button>
                         <button class="btn btn-soft btn-soft-info btn-sm" data-bs-toggle="modal" data-bs-target="#cfModal" data-domain="{{ d.domain }}" data-email="{{ d.cf_email or '' }}" data-key="{{ d.cf_global_key or '' }}" data-zone="{{ d.cf_zone_id or '' }}" title="CF Credentials"><i class="bi bi-cloud"></i></button>
                         <form action="/api/domains/{{ d.domain }}/check-ns" method="POST" class="d-inline"><button class="btn btn-soft btn-soft-success btn-sm" title="Check NS"><i class="bi bi-broadcast"></i></button></form>
                         <form action="/api/domains/{{ d.domain }}/full-delete" method="POST" class="d-inline full-del-form"><button class="btn btn-soft btn-soft-danger btn-sm" title="Full Delete (SA+CF+Spaceship+DB)"><i class="bi bi-trash"></i></button></form>
@@ -189,6 +190,15 @@
     </div><div class="modal-footer"><button type="button" id="preflightBtn" class="btn btn-soft me-auto"><i class="bi bi-shield-check me-1"></i>Run preflight</button><button type="button" class="btn btn-soft" data-bs-dismiss="modal">Cancel</button><button type="submit" class="btn btn-primary-s"><i class="bi bi-play-fill me-1"></i>Start</button></div></form>
 </div></div></div>
 
+<div class="modal fade" id="historyModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content">
+    <div class="modal-header"><h5 class="modal-title">Run History — <span id="histDomain" style="color:var(--primary);"></span></h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+    <div class="modal-body" style="max-height:70vh;overflow-y:auto;">
+        <div id="histList"><span class="text-muted">Loading...</span></div>
+        <div id="histDetail" class="mt-3" style="display:none;border-top:1px solid var(--border);padding-top:1rem;"></div>
+    </div>
+    <div class="modal-footer"><button type="button" class="btn btn-soft" data-bs-dismiss="modal">Close</button></div>
+</div></div></div>
+
 <div class="modal fade" id="cfModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content">
     <div class="modal-header"><h5 class="modal-title">CF Credentials — <span id="cfDomain" style="color:var(--primary);"></span></h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
     <form id="cfForm" method="POST"><div class="modal-body">
@@ -201,6 +211,58 @@
 
 {% block extra_js %}
 document.getElementById('pipelineModal').addEventListener('show.bs.modal',function(e){const d=e.relatedTarget.dataset.domain;document.getElementById('pipeDomain').textContent=d;document.getElementById('pipelineForm').action='/api/domains/'+d+'/run-pipeline';const p=document.getElementById('preflightPanel');if(p){p.style.display='none';document.getElementById('preflightResults').innerHTML='';}});
+document.getElementById('historyModal')?.addEventListener('show.bs.modal',async function(e){
+    const d=e.relatedTarget.dataset.domain;
+    document.getElementById('histDomain').textContent=d;
+    const list=document.getElementById('histList');
+    const detail=document.getElementById('histDetail');
+    detail.style.display='none';
+    detail.innerHTML='';
+    list.innerHTML='<span class="text-muted">Loading...</span>';
+    try{
+        const r=await fetch('/api/domains/'+encodeURIComponent(d)+'/runs');
+        const j=await r.json();
+        if(!j.runs||j.runs.length===0){
+            list.innerHTML='<span class="text-muted">No runs yet for this domain.</span>';
+            return;
+        }
+        list.innerHTML=j.runs.map(r=>{
+            const started=r.started_at?new Date(r.started_at*1000).toLocaleString():'?';
+            const dur=(r.ended_at&&r.started_at)?((r.ended_at-r.started_at).toFixed(1)+'s'):'in progress';
+            const badgeClass='badge-'+(r.status==='running'?'running':r.status==='completed'?'live':r.status==='canceled'?'pending':'error');
+            return '<div class="hist-row" data-run-id="'+r.id+'" style="cursor:pointer;padding:.5rem .25rem;border-bottom:1px solid var(--border);"><div class="d-flex justify-content-between align-items-center"><div><strong>Run #'+r.id+'</strong> <small class="text-muted ms-2">'+started+'</small></div><div><span class="badge-s '+badgeClass+'">'+r.status+'</span><small class="text-muted ms-2">'+dur+'</small></div></div>'+(r.error?'<small style="color:#E74C3C">'+r.error+'</small>':'')+'</div>';
+        }).join('');
+        list.querySelectorAll('.hist-row').forEach(row=>{
+            row.addEventListener('click',async function(){
+                const rid=this.dataset.runId;
+                detail.style.display='';
+                detail.innerHTML='<span class="text-muted">Loading run #'+rid+'...</span>';
+                try{
+                    const rr=await fetch('/api/runs/'+rid);
+                    const dj=await rr.json();
+                    const params=dj.run.params_json?JSON.parse(dj.run.params_json):{};
+                    const stepRows=(dj.steps||[]).map(s=>{
+                        const sBadge='badge-'+(s.status==='running'?'running':s.status==='completed'?'live':s.status==='failed'?'error':'pending');
+                        const dur=(s.ended_at&&s.started_at)?((s.ended_at-s.started_at).toFixed(1)+'s'):(s.started_at?'running':'-');
+                        let artifactBlock='';
+                        if(s.artifact_json){
+                            try{
+                                const a=JSON.parse(s.artifact_json);
+                                artifactBlock='<pre style="font-size:.7rem;background:#F8F9FC;padding:.4rem;margin:.25rem 0 0;border-radius:4px;white-space:pre-wrap;">'+JSON.stringify(a,null,2)+'</pre>';
+                            }catch(_){}
+                        }
+                        return '<div style="padding:.4rem 0;border-bottom:1px dotted var(--border);"><div class="d-flex justify-content-between"><div><strong>Step '+s.step_num+'</strong> '+(s.message?'<small class="text-muted">— '+s.message.replace(/</g,'&lt;')+'</small>':'')+'</div><div><span class="badge-s '+sBadge+'">'+s.status+'</span><small class="text-muted ms-2">'+dur+'</small></div></div>'+artifactBlock+'</div>';
+                    }).join('');
+                    detail.innerHTML='<h6>Run #'+rid+' — params</h6><pre style="font-size:.75rem;background:#F8F9FC;padding:.4rem;border-radius:4px;">'+JSON.stringify(params,null,2)+'</pre><h6 class="mt-3">Steps</h6>'+(stepRows||'<span class="text-muted">No steps recorded.</span>');
+                }catch(err){
+                    detail.innerHTML='<span style="color:#E74C3C">Detail load error: '+(err.message||err)+'</span>';
+                }
+            });
+        });
+    }catch(err){
+        list.innerHTML='<span style="color:#E74C3C">History load error: '+(err.message||err)+'</span>';
+    }
+});
 document.getElementById('preflightBtn')?.addEventListener('click',async function(){
     const d=document.getElementById('pipeDomain').textContent;
     const skip=document.getElementById('sP').checked?'?skip_purchase=on':'';

@@ -1023,6 +1023,27 @@ def api_cancel_pipeline(domain):
     return redirect(url_for("domains_page"))
 
 
+@app.route("/api/domains/<domain>/runs")
+@login_required
+def api_domain_runs(domain):
+    """Recent pipeline_runs for a domain (history list, no step details)."""
+    from database import list_pipeline_runs
+    runs = list_pipeline_runs(domain, limit=int(request.args.get("limit", "20")))
+    return jsonify({"runs": runs})
+
+
+@app.route("/api/runs/<int:run_id>")
+@login_required
+def api_run_detail(run_id):
+    """Full detail for a single run: the run row + its step_runs (status,
+    timing, message, artifact_json) ordered by step_num."""
+    from database import get_pipeline_run, get_step_runs
+    run = get_pipeline_run(run_id)
+    if not run:
+        return jsonify({"error": "Run not found"}), 404
+    return jsonify({"run": run, "steps": get_step_runs(run_id)})
+
+
 @app.route("/api/preflight/<domain>")
 @login_required
 def api_preflight(domain):
