@@ -170,6 +170,26 @@ def init_db():
     );
     """)
 
+    # Durable job queue. Replaces the daemon-thread spawns scattered through
+    # app.py and pipeline.py — long-running work (pipelines, server creation,
+    # full-domain teardown) goes here so a Flask restart doesn't kill it
+    # mid-step. See modules/jobs.py.
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS jobs (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind          TEXT NOT NULL,
+        payload_json  TEXT NOT NULL,
+        status        TEXT NOT NULL,            -- queued | running | done | failed | canceled
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        max_attempts  INTEGER NOT NULL DEFAULT 1,
+        locked_by     TEXT,
+        locked_at     REAL,
+        last_error    TEXT,
+        created_at    REAL NOT NULL,
+        updated_at    REAL NOT NULL
+    );
+    """)
+
     # --- Indexes (issue #1) ---
     # Hot queries: pipeline_log by domain / by created_at DESC; step_tracker
     # lookups per-domain; domains by server_id / status. Without these, the
@@ -181,6 +201,7 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_domains_server_id        ON domains(server_id);
     CREATE INDEX IF NOT EXISTS idx_domains_status           ON domains(status);
     CREATE INDEX IF NOT EXISTS idx_audit_log_created_at     ON audit_log(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_jobs_status_created      ON jobs(status, created_at);
     """)
 
     conn.commit()

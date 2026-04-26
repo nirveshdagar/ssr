@@ -97,45 +97,55 @@ class PipelineCanceled(Exception):
 
 def run_full_pipeline(domain, skip_purchase=False, server_id=None,
                       start_from=None):
-    """Kick off the full pipeline in a daemon thread; returns the thread or
-    `None` if a pipeline for this domain is already running.
+    """Enqueue a durable pipeline job. Returns the job id, or None if this
+    domain already has a pipeline running. The slot is acquired here so a
+    second click while a job is queued/running is rejected immediately,
+    matching the pre-queue behavior.
     """
+    from modules.jobs import enqueue_job
     if not _try_acquire_slot(domain):
         log_pipeline(domain, "pipeline", "warning",
                      "Pipeline start ignored — another run is already in progress")
         return None
-    thread = threading.Thread(
-        target=_pipeline_worker,
-        args=(domain, skip_purchase, server_id, start_from),
-        daemon=True,
-    )
-    thread.start()
-    return thread
+    return enqueue_job("pipeline.full", {
+        "domain": domain,
+        "skip_purchase": skip_purchase,
+        "server_id": server_id,
+        "start_from": start_from,
+    })
 
 
 def run_bulk_pipeline(domains, skip_purchase=False, server_id=None):
-    """Run pipeline for multiple domains sequentially (avoids rate limits)."""
-    thread = threading.Thread(
-        target=_bulk_worker,
-        args=(domains, skip_purchase, server_id),
-        daemon=True,
-    )
-    thread.start()
-    return thread
-
-
-def _bulk_worker(domains, skip_purchase, server_id):
+    """Enqueue one pipeline.full job per domain. With a single worker they
+    serialize naturally, preserving the rate-limit-avoidance behavior of the
+    old thread-based bulk worker.
+    """
+    from modules.jobs import enqueue_job
+    job_ids = []
     for d in domains:
         if not _try_acquire_slot(d):
             log_pipeline(d, "pipeline", "warning",
                          "Bulk skip — another pipeline already running for this domain")
             continue
-        try:
-            _pipeline_worker(d, skip_purchase, server_id, None)
-        finally:
-            # _pipeline_worker releases the slot itself on exit; no-op here,
-            # but guard against an unexpected synchronous-path error.
-            _release_slot(d)
+        job_ids.append(enqueue_job("pipeline.full", {
+            "domain": d,
+            "skip_purchase": skip_purchase,
+            "server_id": server_id,
+            "start_from": None,
+        }))
+    return job_ids
+
+
+def pipeline_full_handler(payload):
+    """Job handler registered for kind='pipeline.full'. Body is the same as
+    the old thread target — _pipeline_worker handles the heartbeat + slot
+    release in its finally."""
+    _pipeline_worker(
+        payload["domain"],
+        payload.get("skip_purchase", False),
+        payload.get("server_id"),
+        payload.get("start_from"),
+    )
 
 
 # ---------------------------------------------------------------------------

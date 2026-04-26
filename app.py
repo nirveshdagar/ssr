@@ -889,8 +889,8 @@ def api_delete_domain(domain):
 @app.route("/api/domains/<domain>/full-delete", methods=["POST"])
 @login_required
 def api_full_delete_domain(domain):
-    import threading
-    threading.Thread(target=_teardown_domain, args=(domain,), daemon=True).start()
+    from modules.jobs import enqueue_job
+    enqueue_job("domain.teardown", {"domain": domain})
     audit("domain_full_delete", target=domain, actor_ip=request.remote_addr or "")
     flash(f"Full deletion started for {domain} (SA + CF + Spaceship + DB)", "warning")
     return redirect(url_for("domains_page"))
@@ -918,8 +918,8 @@ def api_bulk_delete():
             delete_domain(domain)
         flash(f"Deleted {len(domains_list)} domain(s) from dashboard", "info")
     else:
-        import threading
-        threading.Thread(target=_bulk_teardown, args=(domains_list,), daemon=True).start()
+        from modules.jobs import enqueue_job
+        enqueue_job("domain.bulk_teardown", {"domains": domains_list})
         flash(f"Full deletion started for {len(domains_list)} domain(s)", "warning")
 
     return redirect(url_for("domains_page"))
@@ -1088,6 +1088,86 @@ def servers_page():
     return render_template("servers.html", servers=servers)
 
 
+def _server_create_handler(payload):
+    """Job handler for kind='server.create'. Same body the api_create_server
+    endpoint used to run inline as a daemon thread, lifted to module scope
+    so the durable job worker can dispatch it after a restart.
+    """
+    name = payload["name"]
+    region = payload.get("region", "nyc1")
+    size = payload.get("size", "s-1vcpu-1gb")
+
+    from modules.digitalocean import create_droplet
+    from modules.serveravatar import get_server_info
+    import time, paramiko, requests
+
+    try:
+        server_id, ip, droplet_id = create_droplet(name, region=region, size=size)
+        log_pipeline(name, "server_create", "running", f"Droplet ready: {ip}. Waiting 30s...")
+        time.sleep(30)
+
+        root_pass = get_setting("server_root_password") or "SsrServer@2024"
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            key_path = os.path.join(os.path.dirname(__file__), "data", "ssr_key")
+            if os.path.exists(key_path):
+                ssh.connect(ip, username="root", key_filename=key_path, timeout=30)
+            else:
+                ssh.connect(ip, username="root", password=root_pass, timeout=30)
+            ssh.exec_command(f"echo 'root:{root_pass}' | chpasswd")
+            ssh.exec_command(
+                "sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' "
+                "/etc/ssh/sshd_config.d/*.conf 2>/dev/null; "
+                "sed -i 's/#PasswordAuthentication/PasswordAuthentication/g' "
+                "/etc/ssh/sshd_config; systemctl restart ssh"
+            )
+            ssh.close()
+            log_pipeline(name, "server_create", "running", "SSH password enabled")
+        except Exception as e:
+            log_pipeline(name, "server_create", "warning", f"SSH setup: {e}")
+
+        sa_token = get_setting("serveravatar_api_key") or ""
+        sa_org = get_setting("serveravatar_org_id") or ""
+        resp = requests.post(
+            f"https://api.serveravatar.com/organizations/{sa_org}/direct-installation/generate-command",
+            headers={"Authorization": sa_token, "Content-Type": "application/json",
+                     "Accept": "application/json"},
+            json={"name": name, "ip": ip, "ssh_port": 22,
+                  "root_password_available": True, "root_password": root_pass,
+                  "web_server": "apache2", "database_type": "mysql", "nodejs": False},
+            timeout=120
+        )
+        resp.raise_for_status()
+        sa_data = resp.json()
+        sa_server_id = str(sa_data.get("server", {}).get("id", ""))
+        update_server(server_id, sa_server_id=sa_server_id, sa_org_id=sa_org)
+        log_pipeline(name, "server_create", "running",
+                     f"SA agent installing (ID: {sa_server_id})...")
+
+        deadline = time.time() + 600
+        while time.time() < deadline:
+            try:
+                info = get_server_info(sa_server_id)
+                agent = str(info.get("agent_status", ""))
+                if agent in ("1", "connected", "active"):
+                    update_server(server_id, status="ready")
+                    log_pipeline(name, "server_create", "completed",
+                                 f"Server READY: {ip} (SA: {sa_server_id})")
+                    return
+                log_pipeline(name, "sa_install", "running", f"Agent status: {agent}")
+            except Exception:
+                pass
+            time.sleep(20)
+
+        update_server(server_id, status="ready")
+        log_pipeline(name, "server_create", "warning",
+                     "SA agent install timeout — marked ready anyway")
+
+    except Exception as e:
+        log_pipeline(name, "server_create", "failed", str(e))
+
+
 @app.route("/api/servers/create", methods=["POST"])
 @login_required
 def api_create_server():
@@ -1095,80 +1175,8 @@ def api_create_server():
     region = request.form.get("region", "nyc1").strip()
     size = request.form.get("size", "s-1vcpu-1gb").strip()
 
-    from modules.digitalocean import create_droplet
-    from modules.serveravatar import get_server_info
-    import threading
-
-    def _worker():
-        try:
-            import time, paramiko, requests
-
-            server_id, ip, droplet_id = create_droplet(name, region=region, size=size)
-            log_pipeline(name, "server_create", "running", f"Droplet ready: {ip}. Waiting 30s...")
-            time.sleep(30)
-
-            root_pass = get_setting("server_root_password") or "SsrServer@2024"
-            try:
-                ssh = paramiko.SSHClient()
-                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                key_path = os.path.join(os.path.dirname(__file__), "data", "ssr_key")
-                if os.path.exists(key_path):
-                    ssh.connect(ip, username="root", key_filename=key_path, timeout=30)
-                else:
-                    ssh.connect(ip, username="root", password=root_pass, timeout=30)
-                ssh.exec_command(f"echo 'root:{root_pass}' | chpasswd")
-                ssh.exec_command(
-                    "sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' "
-                    "/etc/ssh/sshd_config.d/*.conf 2>/dev/null; "
-                    "sed -i 's/#PasswordAuthentication/PasswordAuthentication/g' "
-                    "/etc/ssh/sshd_config; systemctl restart ssh"
-                )
-                ssh.close()
-                log_pipeline(name, "server_create", "running", "SSH password enabled")
-            except Exception as e:
-                log_pipeline(name, "server_create", "warning", f"SSH setup: {e}")
-
-            sa_token = get_setting("serveravatar_api_key") or ""
-            sa_org = get_setting("serveravatar_org_id") or ""
-            resp = requests.post(
-                f"https://api.serveravatar.com/organizations/{sa_org}/direct-installation/generate-command",
-                headers={"Authorization": sa_token, "Content-Type": "application/json",
-                         "Accept": "application/json"},
-                json={"name": name, "ip": ip, "ssh_port": 22,
-                      "root_password_available": True, "root_password": root_pass,
-                      "web_server": "apache2", "database_type": "mysql", "nodejs": False},
-                timeout=120
-            )
-            resp.raise_for_status()
-            sa_data = resp.json()
-            sa_server_id = str(sa_data.get("server", {}).get("id", ""))
-            update_server(server_id, sa_server_id=sa_server_id, sa_org_id=sa_org)
-            log_pipeline(name, "server_create", "running",
-                         f"SA agent installing (ID: {sa_server_id})...")
-
-            deadline = time.time() + 600
-            while time.time() < deadline:
-                try:
-                    info = get_server_info(sa_server_id)
-                    agent = str(info.get("agent_status", ""))
-                    if agent in ("1", "connected", "active"):
-                        update_server(server_id, status="ready")
-                        log_pipeline(name, "server_create", "completed",
-                                     f"Server READY: {ip} (SA: {sa_server_id})")
-                        return
-                    log_pipeline(name, "sa_install", "running", f"Agent status: {agent}")
-                except Exception:
-                    pass
-                time.sleep(20)
-
-            update_server(server_id, status="ready")
-            log_pipeline(name, "server_create", "warning",
-                         "SA agent install timeout — marked ready anyway")
-
-        except Exception as e:
-            log_pipeline(name, "server_create", "failed", str(e))
-
-    threading.Thread(target=_worker, daemon=True).start()
+    from modules.jobs import enqueue_job
+    enqueue_job("server.create", {"name": name, "region": region, "size": size})
     flash(f"Server creation started: {name}", "success")
     return redirect(url_for("servers_page"))
 
@@ -1860,6 +1868,23 @@ def api_status():
         "recent_logs": [dict(l) for l in get_pipeline_logs(limit=10)],
         "active_watchers": get_all_active_watchers()
     })
+
+
+# ========================= JOB QUEUE BOOT =========================
+# Register handlers + boot the durable job worker. Done at module-load
+# time AFTER all handler functions are defined (pipeline.pipeline_full_handler,
+# _server_create_handler, _teardown_domain, _bulk_teardown). recover_orphans
+# resets any 'running' rows left over from a prior process before the new
+# worker starts polling, so a crash mid-job doesn't leak the row.
+from modules import jobs as _jobs
+from modules.pipeline import pipeline_full_handler as _pipeline_full_handler
+
+_jobs.register_handler("pipeline.full",        _pipeline_full_handler)
+_jobs.register_handler("server.create",        _server_create_handler)
+_jobs.register_handler("domain.teardown",      lambda p: _teardown_domain(p["domain"]))
+_jobs.register_handler("domain.bulk_teardown", lambda p: _bulk_teardown(p["domains"]))
+_jobs.recover_orphans()
+_jobs.start_worker()
 
 
 # ========================= RUN =========================
