@@ -275,7 +275,8 @@ def _pipeline_worker_impl(domain, skip_purchase, server_id, start_from):
         if _check_cancel(domain): raise PipelineCanceled()
         # ===== STEP 10 — Upload index.php =======================================
         if start_from is None or start_from <= 10:
-            _step10_upload_index_php(domain, server, php)
+            if not _step10_upload_index_php(domain, server, php):
+                return
 
         log_pipeline(domain, "pipeline", "completed", f"Pipeline v2 complete for {domain}")
 
