@@ -1214,6 +1214,55 @@ def api_create_server():
     return redirect(url_for("servers_page"))
 
 
+@app.route("/api/servers/sync-from-do", methods=["POST"])
+@login_required
+def api_servers_sync_from_do():
+    """Reverse of import-from-do: drop dashboard rows whose DO droplet has
+    been destroyed upstream. Only touches rows with do_droplet_id set —
+    manually-added servers without a DO droplet id are left alone.
+    Refuses to remove rows that still have domains referencing them, so a
+    sync after an upstream destruction won't cascade-orphan their domains.
+    """
+    from modules.digitalocean import list_droplets
+    from database import get_db
+    try:
+        live = {int(d["id"]) for d in list_droplets()}
+    except Exception as e:
+        flash(f"DO list failed: {e}", "warning")
+        return redirect(url_for("servers_page"))
+
+    conn = get_db()
+    removed, blocked, kept = [], [], 0
+    try:
+        rows = conn.execute(
+            "SELECT id, name, ip, do_droplet_id FROM servers WHERE do_droplet_id IS NOT NULL"
+        ).fetchall()
+        for r in rows:
+            if int(r["do_droplet_id"]) in live:
+                kept += 1
+                continue
+            ref = conn.execute(
+                "SELECT COUNT(*) FROM domains WHERE server_id=?", (r["id"],)
+            ).fetchone()[0]
+            if ref:
+                blocked.append(f"{r['name']} ({ref} domain(s))")
+                continue
+            conn.execute("DELETE FROM servers WHERE id=?", (r["id"],))
+            removed.append(r["name"] or f"srv-{r['id']}")
+        conn.commit()
+    finally:
+        conn.close()
+
+    audit("servers_sync_from_do",
+          actor_ip=request.remote_addr or "",
+          detail=f"removed={len(removed)} kept={kept} blocked={len(blocked)}")
+    msg = f"Sync done — removed {len(removed)}, kept {kept}"
+    if blocked:
+        msg += f". Blocked (still referenced): {', '.join(blocked)}"
+    flash(msg, "info" if removed or not blocked else "warning")
+    return redirect(url_for("servers_page"))
+
+
 @app.route("/api/servers/import-from-do", methods=["POST"])
 @login_required
 def api_import_from_do():
@@ -1283,6 +1332,87 @@ def api_import_from_do():
         flash(f"No new droplets to import (already had {skipped_existing} "
               f"of {len(do_droplets)} DO droplet(s)).", "info")
     return redirect(url_for("servers_page"))
+
+
+@app.route("/api/domains/sync-from-sa", methods=["POST"])
+@login_required
+def api_domains_sync_from_sa():
+    """Reverse of import-from-sa: drop domain rows that no longer have a
+    matching SA application. Only touches domains that previously WERE
+    hosted (status in {app_created, ssl_installed, hosted, live}) and
+    that reference a known server. Domains in earlier states (pending,
+    detected, cf_assigned, etc.) are skipped — they were never on SA.
+
+    Releases the CF key slot before removing each row so cf_keys.domains_used
+    stays accurate (same flow as the manual soft-delete).
+    """
+    from modules import serveravatar
+    from modules.cf_key_pool import release_cf_key_slot
+    from database import get_db, delete_domain
+
+    HOSTED_STATES = ("app_created", "ssl_installed", "hosted", "live")
+
+    conn = get_db()
+    server_ids_to_check = set()
+    try:
+        rows = conn.execute(
+            "SELECT id, sa_server_id FROM servers WHERE sa_server_id IS NOT NULL AND status='ready'"
+        ).fetchall()
+        for r in rows:
+            server_ids_to_check.add((r["id"], r["sa_server_id"]))
+    finally:
+        conn.close()
+
+    # Build the set of (db_server_id, domain_name) pairs that exist on SA.
+    live_pairs = set()
+    failed_servers = []
+    for db_id, sa_id in server_ids_to_check:
+        try:
+            apps = serveravatar.list_applications(sa_id)
+            for a in apps:
+                name = (a.get("name") or a.get("primary_domain") or "").lower().strip()
+                if name:
+                    live_pairs.add((db_id, name))
+        except Exception as e:
+            failed_servers.append(f"sa_id={sa_id}: {e}")
+
+    if failed_servers:
+        flash("SA list failed for: " + "; ".join(failed_servers[:3]),
+              "warning")
+        return redirect(url_for("domains_page"))
+
+    conn = get_db()
+    removed = []
+    try:
+        rows = conn.execute(
+            f"SELECT domain, server_id, status FROM domains "
+            f"WHERE status IN ({','.join('?' * len(HOSTED_STATES))}) "
+            f"AND server_id IS NOT NULL",
+            HOSTED_STATES
+        ).fetchall()
+        for r in rows:
+            pair = (r["server_id"], r["domain"].lower())
+            if pair in live_pairs:
+                continue
+            removed.append(r["domain"])
+    finally:
+        conn.close()
+
+    for d in removed:
+        try: release_cf_key_slot(d)
+        except Exception: pass
+        delete_domain(d)
+
+    audit("domains_sync_from_sa",
+          actor_ip=request.remote_addr or "",
+          detail=f"removed={len(removed)}")
+    flash(
+        f"Sync done — removed {len(removed)} domain(s) no longer on SA "
+        + (f"({', '.join(removed[:3])}{'...' if len(removed) > 3 else ''})"
+           if removed else ""),
+        "info",
+    )
+    return redirect(url_for("domains_page"))
 
 
 @app.route("/api/domains/import-from-sa", methods=["POST"])
