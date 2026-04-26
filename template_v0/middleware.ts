@@ -8,7 +8,7 @@
  */
 import { NextResponse, type NextRequest } from "next/server"
 import { getIronSession } from "iron-session"
-import { sessionOptions, type SsrSession } from "./lib/auth"
+import { sessionOptions, type SsrSession } from "./lib/auth-config"
 
 const PUBLIC_PATHS = new Set<string>([
   "/login",

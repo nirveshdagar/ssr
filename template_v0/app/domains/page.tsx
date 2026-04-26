@@ -40,7 +40,8 @@ import {
   DataTableCell,
   MonoCode,
 } from "@/components/ssr/data-table"
-import { DOMAINS, type PipelineStatus } from "@/lib/ssr/mock-data"
+import { type PipelineStatus } from "@/lib/ssr/mock-data"
+import { useDomains } from "@/hooks/use-domains"
 import { cn } from "@/lib/utils"
 
 const STATUS_FILTERS: { key: PipelineStatus | "all"; label: string }[] = [
@@ -57,6 +58,8 @@ export default function DomainsPage() {
   const [filter, setFilter] = React.useState<PipelineStatus | "all">("all")
   const [query, setQuery] = React.useState("")
   const [selected, setSelected] = React.useState<Set<string>>(new Set())
+
+  const { rows: DOMAINS, isLoading } = useDomains()
 
   const filtered = DOMAINS.filter((d) => {
     if (filter !== "all" && d.status !== filter) return false
