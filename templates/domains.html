@@ -183,7 +183,8 @@
         <div class="mb-3"><label class="form-label">Skip</label><div class="form-check"><input type="checkbox" class="form-check-input" name="skip_purchase" id="sP"><label class="form-check-label" for="sP">Skip purchase</label></div></div>
         <div class="mb-3"><label class="form-label">Start From</label><select name="start_from" class="form-select"><option value="">Auto-detect</option><option value="1">1 — Buy / Detect Domain</option><option value="2">2 — Assign CF Key</option><option value="3">3 — Create CF Zone</option><option value="4">4 — Set Nameservers</option><option value="5">5 — Wait for Zone Active</option><option value="6">6 — Pick / Provision Server</option><option value="7">7 — Create SA Site</option><option value="8">8 — Issue & Install Origin SSL</option><option value="9">9 — Generate Site Content</option><option value="10">10 — Upload index.php</option></select></div>
         <div class="mb-3"><label class="form-label">Server</label><select name="server_id" class="form-select"><option value="">Auto</option>{% for s in servers %}<option value="{{ s.id }}">{{ s.name }} ({{ s.ip }})</option>{% endfor %}</select></div>
-    </div><div class="modal-footer"><button type="button" class="btn btn-soft" data-bs-dismiss="modal">Cancel</button><button type="submit" class="btn btn-primary-s"><i class="bi bi-play-fill me-1"></i>Start</button></div></form>
+        <div id="preflightPanel" class="mb-3" style="display:none"><label class="form-label mb-1">Preflight</label><div id="preflightResults" style="font-size:.8rem;line-height:1.55;"></div></div>
+    </div><div class="modal-footer"><button type="button" id="preflightBtn" class="btn btn-soft me-auto"><i class="bi bi-shield-check me-1"></i>Run preflight</button><button type="button" class="btn btn-soft" data-bs-dismiss="modal">Cancel</button><button type="submit" class="btn btn-primary-s"><i class="bi bi-play-fill me-1"></i>Start</button></div></form>
 </div></div></div>
 
 <div class="modal fade" id="cfModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content">
@@ -197,7 +198,27 @@
 {% endblock %}
 
 {% block extra_js %}
-document.getElementById('pipelineModal').addEventListener('show.bs.modal',function(e){const d=e.relatedTarget.dataset.domain;document.getElementById('pipeDomain').textContent=d;document.getElementById('pipelineForm').action='/api/domains/'+d+'/run-pipeline';});
+document.getElementById('pipelineModal').addEventListener('show.bs.modal',function(e){const d=e.relatedTarget.dataset.domain;document.getElementById('pipeDomain').textContent=d;document.getElementById('pipelineForm').action='/api/domains/'+d+'/run-pipeline';const p=document.getElementById('preflightPanel');if(p){p.style.display='none';document.getElementById('preflightResults').innerHTML='';}});
+document.getElementById('preflightBtn')?.addEventListener('click',async function(){
+    const d=document.getElementById('pipeDomain').textContent;
+    const skip=document.getElementById('sP').checked?'?skip_purchase=on':'';
+    const panel=document.getElementById('preflightPanel');
+    const out=document.getElementById('preflightResults');
+    panel.style.display='';
+    out.innerHTML='<span class="text-muted">Running checks...</span>';
+    try{
+        const r=await fetch('/api/preflight/'+encodeURIComponent(d)+skip);
+        const j=await r.json();
+        const rows=Object.entries(j.checks).map(([k,v])=>{
+            const icon=v.ok?'<i class="bi bi-check-circle-fill" style="color:#27ae60"></i>':'<i class="bi bi-x-circle-fill" style="color:#e74c3c"></i>';
+            return '<div>'+icon+' <strong>'+k+'</strong> — '+(v.message||'').replace(/</g,'&lt;')+'</div>';
+        }).join('');
+        const summary=j.ok?'<div style="color:#27ae60;font-weight:600">All checks passed.</div>':'<div style="color:#e74c3c;font-weight:600">One or more checks failed — review before running.</div>';
+        out.innerHTML=summary+'<div class="mt-2">'+rows+'</div>';
+    }catch(err){
+        out.innerHTML='<span style="color:#e74c3c">Preflight error: '+(err.message||err)+'</span>';
+    }
+});
 document.getElementById('cfModal').addEventListener('show.bs.modal',function(e){const b=e.relatedTarget;document.getElementById('cfDomain').textContent=b.dataset.domain;document.getElementById('cfForm').action='/api/domains/'+b.dataset.domain+'/update-cf';document.getElementById('cfEmail').value=b.dataset.email;document.getElementById('cfKey').value=b.dataset.key;document.getElementById('cfZone').value=b.dataset.zone;});
 document.getElementById('selectAll')?.addEventListener('change',function(){document.querySelectorAll('.domain-cb').forEach(c=>c.checked=this.checked);updateCount();});
 // Inject selected domain IDs into any bulk form

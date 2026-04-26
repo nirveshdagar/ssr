@@ -1023,6 +1023,18 @@ def api_cancel_pipeline(domain):
     return redirect(url_for("domains_page"))
 
 
+@app.route("/api/preflight/<domain>")
+@login_required
+def api_preflight(domain):
+    """Run preflight checks for the given domain. Returns JSON aggregate.
+    Domain is currently unused by the checks (they're all global) but is in
+    the URL for future per-domain state checks (e.g., cf_zone_id present)
+    without changing the route shape."""
+    from modules import preflight
+    skip_purchase = request.args.get("skip_purchase") == "on"
+    return jsonify(preflight.run_all(skip_purchase=skip_purchase))
+
+
 @app.route("/api/domains/<domain>/run-pipeline", methods=["POST"])
 @login_required
 def api_run_pipeline(domain):
