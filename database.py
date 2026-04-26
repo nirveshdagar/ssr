@@ -5,6 +5,37 @@ from datetime import datetime
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "ssr.db")
 
 
+# ---------------------------------------------------------------------------
+# Status taxonomy
+# ---------------------------------------------------------------------------
+# domain.status was historically a single bucket 'error' that collapsed
+# transient API failures (operator can re-run) and operator-config failures
+# (operator must change something) into one indistinguishable state. Splitting
+# them lets the dashboard surface "retry me" vs "look at me" differently.
+#
+# Existing granular states stay (cf_pool_full, content_blocked, ns_pending_external).
+# Legacy 'error' rows from before the split are treated as retryable for UI
+# coloring — operators can still re-run without losing the row.
+
+RETRYABLE_ERROR_STATUSES = frozenset({"retryable_error", "error"})
+
+# Terminal = needs human intervention before a re-run can succeed.
+TERMINAL_ERROR_STATUSES = frozenset({"terminal_error", "cf_pool_full",
+                                      "content_blocked"})
+
+
+def is_retryable_error(status):
+    return status in RETRYABLE_ERROR_STATUSES
+
+
+def is_terminal_error(status):
+    return status in TERMINAL_ERROR_STATUSES
+
+
+def is_error_status(status):
+    return is_retryable_error(status) or is_terminal_error(status)
+
+
 def get_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     # timeout=10: block up to 10s when another writer holds the lock instead

@@ -110,7 +110,8 @@
         }
         .badge-live { background: var(--accent-teal-bg); color: #00A884; }
         .badge-pending { background: #F0F2F8; color: var(--text-muted); }
-        .badge-error, .badge-failed, .badge-purchase_failed, .badge-cf_failed { background: var(--accent-coral-bg); color: #E74C3C; }
+        .badge-error, .badge-terminal_error, .badge-failed, .badge-purchase_failed, .badge-cf_failed { background: var(--accent-coral-bg); color: #E74C3C; }
+        .badge-retryable_error { background: var(--accent-amber-bg); color: #E17055; }
         .badge-running, .badge-creating, .badge-purchasing, .badge-cf_creating {
             background: var(--accent-blue-bg); color: var(--accent-blue); animation: pulse 2s infinite;
         }

@@ -45,7 +45,9 @@
                 <option value="content_blocked" {% if status_filter=='content_blocked' %}selected{% endif %}>Content Blocked</option>
                 <option value="cf_pool_full" {% if status_filter=='cf_pool_full' %}selected{% endif %}>CF Pool Full</option>
                 <option value="purchase_failed" {% if status_filter=='purchase_failed' %}selected{% endif %}>Purchase Failed</option>
-                <option value="error" {% if status_filter=='error' %}selected{% endif %}>Error</option>
+                <option value="retryable_error" {% if status_filter=='retryable_error' %}selected{% endif %}>Retryable Error</option>
+                <option value="terminal_error" {% if status_filter=='terminal_error' %}selected{% endif %}>Terminal Error</option>
+                <option value="error" {% if status_filter=='error' %}selected{% endif %}>Error (legacy)</option>
             </select>
         </div>
         <div class="col-auto">

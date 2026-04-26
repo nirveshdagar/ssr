@@ -219,7 +219,8 @@ def _pipeline_worker(domain, skip_purchase, server_id, start_from):
             ds = d["status"] if d else None
             if ds == "canceled":
                 end_pipeline_run(run_id, "canceled")
-            elif ds in ("error", "content_blocked"):
+            elif ds in ("error", "retryable_error", "terminal_error",
+                         "content_blocked", "cf_pool_full"):
                 end_pipeline_run(run_id, "failed", error=ds)
             else:
                 end_pipeline_run(run_id, "completed")
@@ -295,7 +296,7 @@ def _pipeline_worker_impl(domain, skip_purchase, server_id, start_from):
                              f"Cannot resume from step {start_from}: no server "
                              "associated with this domain. Re-run from step 6 "
                              "or pick a server explicitly.")
-                update_domain(domain, status="error")
+                update_domain(domain, status="terminal_error")
                 return
 
         if _check_cancel(domain): raise PipelineCanceled()
@@ -336,7 +337,7 @@ def _pipeline_worker_impl(domain, skip_purchase, server_id, start_from):
                              "Cannot resume from step 10: no generated content "
                              "found (site_html empty and no archive). Re-run "
                              "from step 9 to regenerate.")
-                update_domain(domain, status="error")
+                update_domain(domain, status="terminal_error")
                 return
 
         if _check_cancel(domain): raise PipelineCanceled()
@@ -360,7 +361,7 @@ def _pipeline_worker_impl(domain, skip_purchase, server_id, start_from):
         # (truncated to 4 KB so it fits in the log row) for post-mortem.
         log_pipeline(domain, "pipeline", "failed",
                      f"Unhandled pipeline error: {type(e).__name__}: {e}\n\n{tb[:4000]}")
-        update_domain(domain, status="error")
+        update_domain(domain, status="retryable_error")
         try:
             from modules.notify import notify_pipeline_failure
             # Alerts get just the summary — full tb lives in pipeline_log.
@@ -392,7 +393,7 @@ def _step1_buy_or_detect(domain, skip_purchase):
         is_available = bool(info.get("available") or info.get("isAvailable"))
     except Exception as e:
         update_step(domain, 1, "failed", f"availability check failed: {e}")
-        update_domain(domain, status="error")
+        update_domain(domain, status="retryable_error")
         return False
 
     if is_available:
@@ -463,7 +464,7 @@ def _step2_assign_cf_key(domain):
         return False
     except Exception as e:
         update_step(domain, 2, "failed", str(e))
-        update_domain(domain, status="error")
+        update_domain(domain, status="retryable_error")
         return False
 
 
@@ -481,7 +482,7 @@ def _step3_create_zone(domain):
         return True
     except Exception as e:
         update_step(domain, 3, "failed", str(e)[:400])
-        update_domain(domain, status="error")
+        update_domain(domain, status="retryable_error")
         return False
 
 
@@ -624,7 +625,7 @@ def _step7_create_app_and_dns(domain, server):
         app_id = serveravatar.create_application(server["sa_server_id"], domain)
     except Exception as e:
         update_step(domain, 7, "failed", f"SA create_application: {e}")
-        update_domain(domain, status="error")
+        update_domain(domain, status="retryable_error")
         return False
     update_domain(domain, server_id=server["id"])
 
@@ -634,7 +635,7 @@ def _step7_create_app_and_dns(domain, server):
         cloudflare_api.setup_domain_dns(domain, server["ip"])
     except Exception as e:
         update_step(domain, 7, "failed", f"CF DNS setup: {e}")
-        update_domain(domain, status="error")
+        update_domain(domain, status="retryable_error")
         return False
 
     # sites_count is computed on-read from domains.server_id — no bump needed.
@@ -749,7 +750,7 @@ def _step9_generate_content(domain):
         return None
     except Exception as e:
         update_step(domain, 9, "failed", f"LLM error: {e}")
-        update_domain(domain, status="error")
+        update_domain(domain, status="retryable_error")
         return None
 
 
@@ -777,7 +778,7 @@ def _step10_upload_index_php(domain, server, php):
         return True
     except Exception as e:
         update_step(domain, 10, "failed", str(e))
-        update_domain(domain, status="error")
+        update_domain(domain, status="retryable_error")
         return False
 
 
