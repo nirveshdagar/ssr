@@ -36,3 +36,6 @@ build/
 
 # Session notes with secrets — local-only
 PROGRESS.md
+
+# Claude Code per-user permission allowlist — may contain secrets in command args
+.claude/settings.local.json
