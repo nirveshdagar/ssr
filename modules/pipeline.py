@@ -744,6 +744,13 @@ def _step8_issue_and_install_ssl(domain, server):
     if install_ok:
         update_step(domain, 8, "completed", f"SSL installed ({install_msg})")
         update_domain(domain, status="ssl_installed")
+        try:
+            meta = _extract_cert_metadata(bundle["certificate"])
+            if meta:
+                set_step_artifact(domain, 8, meta)
+        except Exception as e:
+            log_pipeline(domain, "ssl_metadata", "warning",
+                         f"cert metadata extraction failed (non-fatal): {e}")
         return True
     update_step(domain, 8, "warning",
                 f"SA SSL install failed: {install_msg}  — site still reachable "
@@ -819,6 +826,56 @@ def _step10_upload_index_php(domain, server, php):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _extract_cert_metadata(pem: str) -> dict:
+    """Parse a PEM-encoded X.509 cert and return a small JSON-serializable
+    dict of audit-worthy fields (subject CN, issuer CN, validity window,
+    sha256 fingerprint, key bytes). Returns {} on parse failure.
+
+    Used by step 8 to populate the step_run artifact_json — the full PEM
+    bytes still live in domain.origin_cert_pem; this is the metadata trail.
+    """
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+    except ImportError:
+        return {}
+    try:
+        cert = x509.load_pem_x509_certificate(pem.encode("utf-8") if isinstance(pem, str) else pem)
+    except Exception:
+        return {}
+
+    def _cn(name):
+        try:
+            attrs = name.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
+            return attrs[0].value if attrs else ""
+        except Exception:
+            return ""
+
+    try:
+        fingerprint = cert.fingerprint(hashes.SHA256()).hex()
+    except Exception:
+        fingerprint = ""
+
+    try:
+        # cryptography>=42 prefers the timezone-aware properties; fall back
+        # to legacy *_naive attrs on older versions.
+        not_before = (getattr(cert, "not_valid_before_utc", None)
+                       or cert.not_valid_before).isoformat()
+        not_after = (getattr(cert, "not_valid_after_utc", None)
+                      or cert.not_valid_after).isoformat()
+    except Exception:
+        not_before = not_after = ""
+
+    return {
+        "subject_cn": _cn(cert.subject),
+        "issuer_cn": _cn(cert.issuer),
+        "not_before": not_before,
+        "not_after": not_after,
+        "sha256": fingerprint,
+        "serial_number": str(cert.serial_number) if hasattr(cert, "serial_number") else "",
+    }
+
 
 def _find_server(explicit_id=None):
     """Return a ready server with free capacity; honor explicit_id if given.
