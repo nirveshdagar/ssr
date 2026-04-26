@@ -104,6 +104,47 @@ def get_zone_status(domain):
     return details.get("status", "unknown")
 
 
+# -------------------- Zone settings (SSL mode, Always-HTTPS, etc) --------------------
+
+VALID_SSL_MODES = ("off", "flexible", "full", "strict")
+
+
+def get_zone_setting(domain, setting_id):
+    """GET /zones/{zone_id}/settings/{setting_id} — returns the 'value' field
+    or None if missing."""
+    zone_id = _get_zone_id(domain)
+    headers = _headers_for_domain(domain)
+    r = _cf_request("GET",
+        f"{CF_API}/zones/{zone_id}/settings/{setting_id}",
+        headers=headers, timeout=30)
+    r.raise_for_status()
+    return (r.json().get("result") or {}).get("value")
+
+
+def set_zone_setting(domain, setting_id, value):
+    """PATCH /zones/{zone_id}/settings/{setting_id} with {value: ...}."""
+    zone_id = _get_zone_id(domain)
+    headers = _headers_for_domain(domain)
+    r = _cf_request("PATCH",
+        f"{CF_API}/zones/{zone_id}/settings/{setting_id}",
+        json={"value": value}, headers=headers, timeout=30)
+    r.raise_for_status()
+    return (r.json().get("result") or {}).get("value")
+
+
+def set_ssl_mode(domain, mode):
+    """Set the SSL/TLS encryption mode. mode in {'off','flexible','full','strict'}."""
+    if mode not in VALID_SSL_MODES:
+        raise ValueError(f"ssl mode must be one of {VALID_SSL_MODES}; got {mode!r}")
+    return set_zone_setting(domain, "ssl", mode)
+
+
+def set_always_use_https(domain, enabled):
+    """Toggle the Always-Use-HTTPS edge redirect. enabled is bool."""
+    return set_zone_setting(domain, "always_use_https",
+                              "on" if enabled else "off")
+
+
 # -------------------- DNS records --------------------
 
 def get_dns_records(domain, record_type="A"):
@@ -186,43 +227,13 @@ def set_dns_a_record_www(domain, ip, proxied=True):
     return resp.json().get("success", False)
 
 
-# -------------------- SSL settings --------------------
-
-def set_ssl_mode(domain, mode="full"):
-    """Set SSL mode: off, flexible, full, full_strict."""
-    zone_id = _get_zone_id(domain)
-    headers = _headers_for_domain(domain)
-    resp = _cf_request("PATCH",
-        f"{CF_API}/zones/{zone_id}/settings/ssl",
-        json={"value": mode},
-        headers=headers,
-        timeout=30
-    )
-    resp.raise_for_status()
-    return resp.json().get("success", False)
-
-
-def enable_always_https(domain):
-    """Enable Always Use HTTPS."""
-    zone_id = _get_zone_id(domain)
-    headers = _headers_for_domain(domain)
-    resp = _cf_request("PATCH",
-        f"{CF_API}/zones/{zone_id}/settings/always_use_https",
-        json={"value": "on"},
-        headers=headers,
-        timeout=30
-    )
-    resp.raise_for_status()
-    return resp.json().get("success", False)
-
-
 def setup_domain_dns(domain, ip):
     """Initial DNS setup: A records + SSL + HTTPS."""
     try:
         set_dns_a_record(domain, ip, proxied=True)
         set_dns_a_record_www(domain, ip, proxied=True)
         set_ssl_mode(domain, "full")
-        enable_always_https(domain)
+        set_always_use_https(domain, True)
         return True
     except Exception as e:
         log_pipeline(domain, "dns_setup", "failed", str(e))

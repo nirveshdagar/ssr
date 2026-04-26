@@ -99,36 +99,63 @@
             {% if kdomains %}
             <tr class="collapse" id="kdoms-{{ k.id }}">
                 <td colspan="7" style="background:#FAFBFD;padding:.75rem 1rem;">
-                    <form action="/api/cf-keys/{{ k.id }}/bulk-set-ip" method="POST"
-                          onsubmit="return confirm('Change A-records for ' + this.querySelectorAll('input[name=domains]:checked').length + ' domain(s) to ' + this.querySelector('input[name=new_ip]').value + '?');">
-                        <div class="d-flex align-items-center gap-2 mb-2" style="font-size:.78rem;">
-                            <label class="form-check form-check-inline m-0">
-                                <input type="checkbox" class="form-check-input kdom-all" data-key="{{ k.id }}">
-                                <span class="ms-1 text-muted">Select all</span>
+                    <div class="d-flex align-items-center gap-2 mb-2" style="font-size:.78rem;">
+                        <label class="form-check form-check-inline m-0">
+                            <input type="checkbox" class="form-check-input kdom-all" data-key="{{ k.id }}">
+                            <span class="ms-1 text-muted">Select all</span>
+                        </label>
+                        <span class="text-muted ms-1" style="font-size:.7rem;">Pick the action below; selection applies to all forms.</span>
+                    </div>
+                    <div class="row g-1 mb-3" style="font-size:.78rem;">
+                        {% for d in kdomains %}
+                        <div class="col-md-6 col-lg-4">
+                            <label class="form-check m-0">
+                                <input type="checkbox" value="{{ d.domain }}" class="form-check-input kdom-cb-{{ k.id }}">
+                                <span class="ms-1"><code>{{ d.domain }}</code>
+                                    {% if d.current_proxy_ip %}
+                                    <small class="text-muted">→ {{ d.current_proxy_ip }}</small>
+                                    {% endif %}
+                                    <span class="badge-s badge-{{ d.status }}" style="font-size:.6rem;padding:.15em .45em;margin-left:.25rem;">{{ d.status }}</span>
+                                </span>
                             </label>
+                        </div>
+                        {% endfor %}
+                    </div>
+                    <!-- Form 1: bulk A-record IP change -->
+                    <form id="kform-ip-{{ k.id }}" action="/api/cf-keys/{{ k.id }}/bulk-set-ip" method="POST"
+                          onsubmit="return confirm('Change A-records for ' + document.querySelectorAll('.kdom-cb-{{ k.id }}:checked').length + ' domain(s) to ' + this.querySelector('input[name=new_ip]').value + '?');">
+                        <div class="d-flex align-items-center gap-2 mb-2 flex-wrap" style="font-size:.78rem;">
+                            <span class="text-muted" style="min-width:90px;"><i class="bi bi-globe2 me-1"></i>A records:</span>
                             <input type="text" name="new_ip" class="form-control form-control-sm" style="max-width:160px;" placeholder="New origin IP" required>
                             <label class="form-check form-check-inline m-0">
                                 <input type="checkbox" class="form-check-input" name="proxied" checked>
-                                <span class="ms-1 text-muted">Proxied (orange cloud)</span>
+                                <span class="ms-1 text-muted">Proxied</span>
                             </label>
                             <button type="submit" class="btn btn-soft btn-soft-warning btn-sm" title="Change A-records (apex + www) for selected domains">
                                 <i class="bi bi-arrow-right-circle me-1"></i>Change A records
                             </button>
                         </div>
-                        <div class="row g-1" style="font-size:.78rem;">
-                            {% for d in kdomains %}
-                            <div class="col-md-6 col-lg-4">
-                                <label class="form-check m-0">
-                                    <input type="checkbox" name="domains" value="{{ d.domain }}" class="form-check-input kdom-cb-{{ k.id }}">
-                                    <span class="ms-1"><code>{{ d.domain }}</code>
-                                        {% if d.current_proxy_ip %}
-                                        <small class="text-muted">→ {{ d.current_proxy_ip }}</small>
-                                        {% endif %}
-                                        <span class="badge-s badge-{{ d.status }}" style="font-size:.6rem;padding:.15em .45em;margin-left:.25rem;">{{ d.status }}</span>
-                                    </span>
-                                </label>
-                            </div>
-                            {% endfor %}
+                    </form>
+                    <!-- Form 2: bulk SSL mode + Always-HTTPS -->
+                    <form id="kform-ssl-{{ k.id }}" action="/api/cf-keys/{{ k.id }}/bulk-set-settings" method="POST"
+                          onsubmit="return confirm('Apply settings to ' + document.querySelectorAll('.kdom-cb-{{ k.id }}:checked').length + ' domain(s)?');">
+                        <div class="d-flex align-items-center gap-2 flex-wrap" style="font-size:.78rem;">
+                            <span class="text-muted" style="min-width:90px;"><i class="bi bi-shield-lock me-1"></i>SSL/HTTPS:</span>
+                            <select name="ssl_mode" class="form-select form-select-sm" style="max-width:160px;">
+                                <option value="">SSL: unchanged</option>
+                                <option value="off">SSL: Off</option>
+                                <option value="flexible">SSL: Flexible</option>
+                                <option value="full">SSL: Full</option>
+                                <option value="strict">SSL: Full (strict)</option>
+                            </select>
+                            <select name="always_https" class="form-select form-select-sm" style="max-width:200px;">
+                                <option value="">Always-HTTPS: unchanged</option>
+                                <option value="on">Always-HTTPS: On</option>
+                                <option value="off">Always-HTTPS: Off</option>
+                            </select>
+                            <button type="submit" class="btn btn-soft btn-soft-warning btn-sm" title="Apply SSL mode + Always-HTTPS to selected domains">
+                                <i class="bi bi-shield-check me-1"></i>Apply settings
+                            </button>
                         </div>
                     </form>
                 </td>
@@ -167,11 +194,34 @@
 {% endblock %}
 
 {% block extra_js %}
-// Per-key 'Select all' for the bulk-set-IP form
+// Per-key 'Select all' for the bulk-action forms
 document.querySelectorAll('.kdom-all').forEach(master=>{
     master.addEventListener('change',function(){
         const k=this.dataset.key;
         document.querySelectorAll('.kdom-cb-'+k).forEach(c=>{c.checked=this.checked;});
+    });
+});
+// Both bulk forms (kform-ip-* and kform-ssl-*) share the same checkbox
+// list above; inject the checked domains as hidden inputs at submit time.
+document.querySelectorAll('form[id^="kform-ip-"], form[id^="kform-ssl-"]').forEach(form=>{
+    form.addEventListener('submit',function(e){
+        const id=this.id;
+        const k=id.replace(/^kform-(ip|ssl)-/,'');
+        // Strip any prior injection from a re-submit attempt
+        this.querySelectorAll('input[type=hidden][name=domains][data-injected]').forEach(el=>el.remove());
+        let n=0;
+        document.querySelectorAll('.kdom-cb-'+k+':checked').forEach(cb=>{
+            const h=document.createElement('input');
+            h.type='hidden'; h.name='domains'; h.value=cb.value;
+            h.dataset.injected='1';
+            this.appendChild(h);
+            n++;
+        });
+        if(n===0){
+            e.preventDefault();
+            alert('Pick at least one domain first.');
+            return false;
+        }
     });
 });
 document.getElementById('editCfKeyModal')?.addEventListener('show.bs.modal',function(e){

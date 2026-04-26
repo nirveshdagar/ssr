@@ -630,6 +630,124 @@ def cloudflare_page():
                            domains_by_key=domains_by_key)
 
 
+def _cf_bulk_set_settings_handler(payload):
+    """Job handler: apply a set of zone settings (SSL mode, Always-HTTPS) to
+    each listed domain. Skips any setting whose value is None (i.e., the
+    operator left it 'unchanged' in the form). Per-domain failures don't
+    abort the rest.
+    """
+    from modules import cloudflare_api
+    ssl_mode = payload.get("ssl_mode")
+    always_https = payload.get("always_https")  # True / False / None
+    domains = payload.get("domains", [])
+
+    success, failed = [], []
+    for d in domains:
+        try:
+            if ssl_mode is not None:
+                cloudflare_api.set_ssl_mode(d, ssl_mode)
+            if always_https is not None:
+                cloudflare_api.set_always_use_https(d, bool(always_https))
+            success.append(d)
+            log_pipeline(d, "bulk_set_settings", "completed",
+                         f"ssl_mode={ssl_mode} always_https={always_https}")
+        except Exception as e:
+            failed.append(f"{d}: {type(e).__name__}: {e}")
+            log_pipeline(d, "bulk_set_settings", "failed",
+                         f"settings change failed: {e}")
+    log_pipeline("cf_bulk_set_settings", "bulk_set_settings",
+                 "completed" if not failed else "warning",
+                 f"ssl_mode={ssl_mode} always_https={always_https} "
+                 f"ok={len(success)} failed={len(failed)}")
+
+
+@app.route("/api/cf-keys/<int:key_id>/bulk-set-settings", methods=["POST"])
+@login_required
+def api_cf_keys_bulk_set_settings(key_id):
+    """Bulk SSL mode + Always-HTTPS toggle for selected domains under one
+    CF key. Form fields:
+        domains[]    — selected domain names (must all be assigned to this key)
+        ssl_mode     — 'off'/'flexible'/'full'/'strict' (or '' to leave unchanged)
+        always_https — 'on' (enable) / 'off' (disable) / '' (unchanged)
+    Empty fields mean 'don't touch'. Refuses if neither field is set.
+    """
+    from modules.cloudflare_api import VALID_SSL_MODES
+    from modules.jobs import enqueue_job
+    from database import get_db
+
+    requested = request.form.getlist("domains")
+    ssl_mode_raw = (request.form.get("ssl_mode") or "").strip().lower()
+    always_https_raw = (request.form.get("always_https") or "").strip().lower()
+
+    if not requested:
+        flash("No domains selected", "warning")
+        return redirect(url_for("cloudflare_page"))
+
+    ssl_mode = None
+    if ssl_mode_raw:
+        if ssl_mode_raw not in VALID_SSL_MODES:
+            flash(f"Invalid SSL mode: {ssl_mode_raw!r}. "
+                  f"Allowed: {', '.join(VALID_SSL_MODES)}.", "danger")
+            return redirect(url_for("cloudflare_page"))
+        ssl_mode = ssl_mode_raw
+
+    always_https = None
+    if always_https_raw == "on":
+        always_https = True
+    elif always_https_raw == "off":
+        always_https = False
+    elif always_https_raw not in ("", "unchanged"):
+        flash(f"Invalid always_https: {always_https_raw!r}", "danger")
+        return redirect(url_for("cloudflare_page"))
+
+    if ssl_mode is None and always_https is None:
+        flash("Pick at least one setting to change "
+              "(SSL mode or Always-HTTPS).", "warning")
+        return redirect(url_for("cloudflare_page"))
+
+    # Belt-and-braces: verify every domain is actually assigned to this key.
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            f"""SELECT domain FROM domains
+                 WHERE cf_key_id = ?
+                   AND domain IN ({','.join('?' * len(requested))})""",
+            (key_id, *requested)
+        ).fetchall()
+        verified = [r["domain"] for r in rows]
+    finally:
+        conn.close()
+
+    rejected = set(requested) - set(verified)
+    if rejected:
+        flash(
+            f"Refused: {len(rejected)} domain(s) are not assigned to CF "
+            f"key #{key_id}. Nothing was changed.",
+            "danger",
+        )
+        return redirect(url_for("cloudflare_page"))
+
+    job_id = enqueue_job("cf.bulk_set_settings", {
+        "key_id": key_id,
+        "domains": verified,
+        "ssl_mode": ssl_mode,
+        "always_https": always_https,
+    })
+    audit("cf_bulk_set_settings",
+          target=f"cf_key={key_id}",
+          actor_ip=request.remote_addr or "",
+          detail=(f"ssl_mode={ssl_mode} always_https={always_https} "
+                   f"count={len(verified)} job={job_id}"))
+    flash(
+        f"Settings change enqueued (job #{job_id}) — "
+        f"{len(verified)} domain(s), ssl_mode={ssl_mode}, "
+        f"always_https={always_https}. Progress in Logs as "
+        "'bulk_set_settings' entries.",
+        "info",
+    )
+    return redirect(url_for("cloudflare_page"))
+
+
 def _cf_bulk_set_ip_handler(payload):
     """Job handler: change the apex + www A-records to `new_ip` for each
     listed domain. Honors the chosen proxied flag. Updates
@@ -2474,6 +2592,7 @@ _jobs.register_handler("server.create",        _server_create_handler)
 _jobs.register_handler("domain.teardown",      lambda p: _teardown_domain(p["domain"]))
 _jobs.register_handler("domain.bulk_teardown", lambda p: _bulk_teardown(p["domains"]))
 _jobs.register_handler("cf.bulk_set_ip",       _cf_bulk_set_ip_handler)
+_jobs.register_handler("cf.bulk_set_settings", _cf_bulk_set_settings_handler)
 _jobs.recover_orphans()
 _jobs.start_worker()
 
