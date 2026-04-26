@@ -2247,9 +2247,13 @@ def api_status():
 # resets any 'running' rows left over from a prior process before the new
 # worker starts polling, so a crash mid-job doesn't leak the row.
 from modules import jobs as _jobs
-from modules.pipeline import pipeline_full_handler as _pipeline_full_handler
+from modules.pipeline import (
+    pipeline_full_handler as _pipeline_full_handler,
+    pipeline_bulk_handler as _pipeline_bulk_handler,
+)
 
 _jobs.register_handler("pipeline.full",        _pipeline_full_handler)
+_jobs.register_handler("pipeline.bulk",        _pipeline_bulk_handler)
 _jobs.register_handler("server.create",        _server_create_handler)
 _jobs.register_handler("domain.teardown",      lambda p: _teardown_domain(p["domain"]))
 _jobs.register_handler("domain.bulk_teardown", lambda p: _bulk_teardown(p["domains"]))

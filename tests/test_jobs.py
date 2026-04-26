@@ -229,3 +229,54 @@ def test_start_worker_idempotent_with_pool(jobs_module):
         assert first_pool == second_pool
     finally:
         jobs_module.stop_worker(timeout=2.0)
+
+
+def test_bulk_pipeline_runs_serially_via_single_bulk_job(tmp_db):
+    """Audit P1 #4 regression guard: with a multi-worker pool the OLD
+    'enqueue N pipeline.full jobs' approach lost the rate-limit-avoidance
+    serialization. The fix enqueues ONE pipeline.bulk job whose handler
+    iterates internally, so even with 4 pool workers the batch domains
+    run in lockstep on a single worker.
+    """
+    from modules import pipeline, jobs
+    from database import add_domain
+
+    jobs._handlers.clear()
+    for d in ("a.com", "b.com", "c.com"):
+        add_domain(d)
+
+    # Track concurrent vs. sequential execution
+    import threading, time
+    in_handler = []
+    in_handler_lock = threading.Lock()
+    max_concurrent = {"n": 0}
+
+    def fake_pipeline_worker(domain, *_a, **_kw):
+        with in_handler_lock:
+            in_handler.append(domain)
+            max_concurrent["n"] = max(max_concurrent["n"], len(in_handler))
+        time.sleep(0.05)
+        with in_handler_lock:
+            in_handler.remove(domain)
+
+    # Patch the inner worker so we don't need real upstream calls.
+    import unittest.mock as _mock
+    with _mock.patch.object(pipeline, "_pipeline_worker", side_effect=fake_pipeline_worker):
+        jobs.register_handler("pipeline.bulk", pipeline.pipeline_bulk_handler)
+        # Enqueue + drive the queue manually so we don't have to rely on
+        # the live worker thread timing.
+        jobs.run_bulk_pipeline_job_id = pipeline.run_bulk_pipeline(
+            ["a.com", "b.com", "c.com"]
+        )
+        # One job in the queue (a SINGLE pipeline.bulk, not 3 pipeline.full)
+        bulk_jobs = jobs.list_jobs(kind="pipeline.bulk", status="queued")
+        assert len(bulk_jobs) == 1, "should enqueue ONE bulk job, not N pipeline.full"
+        full_jobs = jobs.list_jobs(kind="pipeline.full")
+        assert len(full_jobs) == 0, "bulk path must not emit pipeline.full jobs"
+        # Drive it
+        job = jobs._claim_one()
+        jobs._run_one(job)
+
+    # All three domains processed; max concurrent must be 1.
+    assert max_concurrent["n"] == 1, \
+        f"bulk handler ran domains concurrently (max={max_concurrent['n']})"

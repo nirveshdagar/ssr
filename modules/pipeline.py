@@ -116,24 +116,32 @@ def run_full_pipeline(domain, skip_purchase=False, server_id=None,
 
 
 def run_bulk_pipeline(domains, skip_purchase=False, server_id=None):
-    """Enqueue one pipeline.full job per domain. With a single worker they
-    serialize naturally, preserving the rate-limit-avoidance behavior of the
-    old thread-based bulk worker.
+    """Enqueue ONE pipeline.bulk job that internally iterates over the
+    domain list. Only one worker processes the bulk job at a time, so
+    same-batch domains run sequentially regardless of pool size — that
+    preserves the rate-limit-avoidance behavior the old thread-based
+    bulk worker had. Other pool workers stay free to process individual
+    pipeline.full jobs (so a single-domain manual run isn't blocked by
+    a long bulk).
+
+    Domains whose per-domain slot is already held are skipped + logged.
+    Returns the bulk job id (or None if every domain was busy).
     """
     from modules.jobs import enqueue_job
-    job_ids = []
+    eligible = []
     for d in domains:
-        if not _try_acquire_slot(d):
+        if _try_acquire_slot(d):
+            eligible.append(d)
+        else:
             log_pipeline(d, "pipeline", "warning",
                          "Bulk skip — another pipeline already running for this domain")
-            continue
-        job_ids.append(enqueue_job("pipeline.full", {
-            "domain": d,
-            "skip_purchase": skip_purchase,
-            "server_id": server_id,
-            "start_from": None,
-        }))
-    return job_ids
+    if not eligible:
+        return None
+    return enqueue_job("pipeline.bulk", {
+        "domains": eligible,
+        "skip_purchase": skip_purchase,
+        "server_id": server_id,
+    })
 
 
 def pipeline_full_handler(payload):
@@ -146,6 +154,24 @@ def pipeline_full_handler(payload):
         payload.get("server_id"),
         payload.get("start_from"),
     )
+
+
+def pipeline_bulk_handler(payload):
+    """Job handler registered for kind='pipeline.bulk'. Iterates the domain
+    list serially within ONE worker, calling _pipeline_worker for each.
+    Slots were already acquired by the enqueuer (run_bulk_pipeline) — the
+    inner _pipeline_worker releases each slot in its own finally."""
+    skip_purchase = payload.get("skip_purchase", False)
+    server_id = payload.get("server_id")
+    for d in payload["domains"]:
+        try:
+            _pipeline_worker(d, skip_purchase, server_id, None)
+        except Exception as e:
+            # Don't let one domain's unhandled exception abort the rest of
+            # the batch. _pipeline_worker handles its own exceptions, but
+            # belt-and-braces guard.
+            log_pipeline(d, "pipeline", "failed",
+                         f"Bulk-worker exception escaped: {type(e).__name__}: {e}")
 
 
 # ---------------------------------------------------------------------------
