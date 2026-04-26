@@ -259,9 +259,45 @@ document.getElementById('historyModal')?.addEventListener('show.bs.modal',async 
                                 artifactBlock='<pre style="font-size:.7rem;background:#F8F9FC;padding:.4rem;margin:.25rem 0 0;border-radius:4px;white-space:pre-wrap;">'+JSON.stringify(a,null,2)+'</pre>';
                             }catch(_){}
                         }
-                        return '<div style="padding:.4rem 0;border-bottom:1px dotted var(--border);"><div class="d-flex justify-content-between"><div><strong>Step '+s.step_num+'</strong> '+(s.message?'<small class="text-muted">— '+s.message.replace(/</g,'&lt;')+'</small>':'')+'</div><div><span class="badge-s '+sBadge+'">'+s.status+'</span><small class="text-muted ms-2">'+dur+'</small></div></div>'+artifactBlock+'</div>';
+                        const actions='<div class="mt-1 d-flex gap-1">'
+                            +'<button class="btn btn-soft btn-soft-success btn-sm step-retry-btn" data-step="'+s.step_num+'" title="Retry / continue from this step"><i class="bi bi-play-fill"></i> Retry from here</button>'
+                            +'<button class="btn btn-soft btn-soft-info btn-sm step-skip-btn" data-step="'+(s.step_num+1)+'" title="Skip this step (start next run from step '+(s.step_num+1)+')"'+(s.step_num>=10?' disabled':'')+'><i class="bi bi-skip-end-fill"></i> Skip</button>'
+                            +'<button class="btn btn-soft btn-soft-info btn-sm step-override-btn" data-step="'+s.step_num+'" title="Override this step\'s output with a manual value"><i class="bi bi-pencil-square"></i> Override</button>'
+                            +'</div>';
+                        return '<div style="padding:.4rem 0;border-bottom:1px dotted var(--border);"><div class="d-flex justify-content-between"><div><strong>Step '+s.step_num+'</strong> '+(s.message?'<small class="text-muted">— '+s.message.replace(/</g,'&lt;')+'</small>':'')+'</div><div><span class="badge-s '+sBadge+'">'+s.status+'</span><small class="text-muted ms-2">'+dur+'</small></div></div>'+artifactBlock+actions+'</div>';
                     }).join('');
                     detail.innerHTML='<h6>Run #'+rid+' — params</h6><pre style="font-size:.75rem;background:#F8F9FC;padding:.4rem;border-radius:4px;">'+JSON.stringify(params,null,2)+'</pre><h6 class="mt-3">Steps</h6>'+(stepRows||'<span class="text-muted">No steps recorded.</span>');
+                    const dom=document.getElementById('histDomain').textContent;
+                    const csrfHeaders={'Origin':window.location.origin};
+                    const postEmpty=async(url)=>{
+                        const fd=new FormData();
+                        const r=await fetch(url,{method:'POST',body:fd,headers:csrfHeaders});
+                        return r.ok||r.redirected;
+                    };
+                    detail.querySelectorAll('.step-retry-btn').forEach(b=>b.addEventListener('click',async function(){
+                        const step=this.dataset.step;
+                        if(!confirm('Retry pipeline for '+dom+' starting from step '+step+'?'))return;
+                        const ok=await postEmpty('/api/domains/'+encodeURIComponent(dom)+'/run-from/'+step);
+                        if(ok)window.location.reload();
+                    }));
+                    detail.querySelectorAll('.step-skip-btn').forEach(b=>b.addEventListener('click',async function(){
+                        const next=this.dataset.step;
+                        if(!confirm('Skip this step? The next run will start from step '+next+'.'))return;
+                        const ok=await postEmpty('/api/domains/'+encodeURIComponent(dom)+'/run-from/'+next);
+                        if(ok)window.location.reload();
+                    }));
+                    detail.querySelectorAll('.step-override-btn').forEach(b=>b.addEventListener('click',function(){
+                        const step=this.dataset.step;
+                        const fieldHint=({1:'status',2:'cf_email',3:'cf_zone_id',7:'current_proxy_ip',8:'origin_cert_pem',9:'site_html'})[step]||'site_html';
+                        const field=prompt('Field to override (one of: site_html, status, cf_zone_id, cf_nameservers, cf_email, cf_global_key, current_proxy_ip, origin_cert_pem, origin_key_pem):',fieldHint);
+                        if(!field)return;
+                        const value=prompt('New value for '+field+':','');
+                        if(value===null)return;
+                        const fd=new FormData();
+                        fd.append('field',field);
+                        fd.append('value',value);
+                        fetch('/api/domains/'+encodeURIComponent(dom)+'/override-field',{method:'POST',body:fd,headers:csrfHeaders}).then(r=>{if(r.ok||r.redirected)window.location.reload();});
+                    }));
                 }catch(err){
                     detail.innerHTML='<span style="color:#E74C3C">Detail load error: '+(err.message||err)+'</span>';
                 }

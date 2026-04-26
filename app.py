@@ -1104,6 +1104,72 @@ def api_run_detail(run_id):
     return jsonify({"run": run, "steps": get_step_runs(run_id)})
 
 
+@app.route("/api/domains/<domain>/run-from/<int:step_num>", methods=["POST"])
+@login_required
+def api_run_from_step(domain, step_num):
+    """Kick off a pipeline starting at `step_num`. Used by the history-modal
+    'Retry from here' / 'Continue from here' buttons. 'Skip this step' is
+    just /run-from/<N+1> — the same endpoint with the next number.
+
+    No body required — pulls the previously-stored server_id (if any) from
+    the domain row via the existing start_from-> 6 safety logic. POST without
+    a CSRF body still requires Origin/Referer per _security_middleware.
+    """
+    if step_num < 1 or step_num > 10:
+        flash("step_num must be between 1 and 10", "warning")
+        return redirect(url_for("domains_page"))
+    skip_purchase = request.form.get("skip_purchase") == "on"
+    job_id = run_full_pipeline(domain, skip_purchase=skip_purchase,
+                                start_from=step_num)
+    if job_id is None:
+        flash(f"Pipeline for {domain} already running — request ignored",
+              "warning")
+    else:
+        audit("pipeline_run_from",
+              target=domain, actor_ip=request.remote_addr or "",
+              detail=f"start_from={step_num}")
+        flash(f"Pipeline started for {domain} from step {step_num}", "success")
+    return redirect(url_for("domains_page"))
+
+
+# Whitelist of domain columns that operators can override via the step
+# console. Anything not here is rejected — prevents accidental writes to
+# server_id (would mis-route subsequent runs), cf_key_id (would corrupt
+# the slot accounting), audit IDs, etc.
+_OVERRIDABLE_DOMAIN_COLS = {
+    "site_html",         # step 9 output: paste your own PHP
+    "status",            # any step: nudge the state machine
+    "cf_zone_id",        # step 3 output: bring-your-own zone
+    "cf_nameservers",    # step 3 output: brought-your-own NS
+    "cf_email", "cf_global_key",  # step 2 manual override
+    "current_proxy_ip",  # step 7 output
+    "origin_cert_pem", "origin_key_pem",  # step 8 BYO cert
+}
+
+
+@app.route("/api/domains/<domain>/override-field", methods=["POST"])
+@login_required
+def api_override_field(domain):
+    """Override one whitelisted domain column with a manual value. Used by
+    the step console's 'Override' button when an automated step keeps
+    failing or you want to substitute your own value (e.g., paste hand-written
+    PHP for step 9 instead of letting the LLM regenerate).
+    """
+    field = (request.form.get("field") or "").strip()
+    value = request.form.get("value", "")
+    if field not in _OVERRIDABLE_DOMAIN_COLS:
+        flash(f"Field '{field}' not overridable. Allowed: "
+              + ", ".join(sorted(_OVERRIDABLE_DOMAIN_COLS)),
+              "danger")
+        return redirect(url_for("domains_page"))
+    update_domain(domain, **{field: value})
+    audit("domain_override",
+          target=domain, actor_ip=request.remote_addr or "",
+          detail=f"field={field} value_len={len(value)}")
+    flash(f"Override saved: {domain}.{field} ({len(value)} chars)", "success")
+    return redirect(url_for("domains_page"))
+
+
 @app.route("/api/preflight/<domain>")
 @login_required
 def api_preflight(domain):
