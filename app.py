@@ -485,7 +485,7 @@ def api_cf_keys_add():
 
     if not email or not api_key:
         flash("Email and API key are required", "danger")
-        return redirect(url_for("settings"))
+        return redirect(url_for("cloudflare_page"))
 
     # Live-verify by calling /accounts (that's what gives us the real Account ID
     # we need for zone creation — NOT /user, which returns the user ID).
@@ -498,16 +498,16 @@ def api_cf_keys_add():
         )
         if r.status_code != 200:
             flash(f"CF rejected the key ({r.status_code}): {r.text[:200]}", "danger")
-            return redirect(url_for("settings"))
+            return redirect(url_for("cloudflare_page"))
         accts = (r.json().get("result") or [])
         if not accts:
             flash("CF auth ok but no accounts returned — is billing set up on this CF account?",
                   "warning")
-            return redirect(url_for("settings"))
+            return redirect(url_for("cloudflare_page"))
         acct_id = accts[0].get("id") or ""
     except Exception as e:
         flash(f"Could not verify CF key: {e}", "danger")
-        return redirect(url_for("settings"))
+        return redirect(url_for("cloudflare_page"))
 
     try:
         new_id = add_cf_key(email, api_key, alias=alias, cf_account_id=acct_id)
@@ -516,7 +516,7 @@ def api_cf_keys_add():
         flash(str(e), "warning")
     except Exception as e:
         flash(f"Failed to add key: {e}", "danger")
-    return redirect(url_for("settings"))
+    return redirect(url_for("cloudflare_page"))
 
 
 @app.route("/api/cf-keys/refresh-accounts", methods=["POST"])
@@ -541,7 +541,7 @@ def api_cf_keys_refresh_accounts():
     summary = f"{changed} fixed · {errored} errored · {len(results)-changed-errored} already correct"
     flash("CF account-ID refresh: " + summary + "\n" + "\n".join(lines),
           "warning" if errored else ("success" if changed else "info"))
-    return redirect(url_for("settings"))
+    return redirect(url_for("cloudflare_page"))
 
 
 @app.route("/api/cf-keys/<int:key_id>/toggle", methods=["POST"])
@@ -561,7 +561,67 @@ def api_cf_keys_toggle(key_id):
             flash(f"Key #{key_id} set to {'active' if new_val else 'inactive'}", "info")
     finally:
         conn.close()
-    return redirect(url_for("settings"))
+    return redirect(url_for("cloudflare_page"))
+
+
+@app.route("/cloudflare")
+@login_required
+def cloudflare_page():
+    """Dedicated CF management page: list pool keys, add new, edit alias /
+    max_domains / is_active, delete unreferenced keys, refresh account IDs.
+    Lifted out of /settings so the CF concerns aren't buried under 30 other
+    settings panels.
+
+    list_cf_keys() omits api_key for security; this route augments each row
+    with its api_key so the page can show a (mask + reveal) for verification.
+    The page is auth-gated like everything else.
+    """
+    from modules.cf_key_pool import list_cf_keys
+    from database import get_db
+    cf_keys = list_cf_keys()
+    if cf_keys:
+        conn = get_db()
+        try:
+            api_keys = {r["id"]: r["api_key"] for r in conn.execute(
+                "SELECT id, api_key FROM cf_keys"
+            ).fetchall()}
+        finally:
+            conn.close()
+        for k in cf_keys:
+            k["api_key"] = api_keys.get(k["id"], "")
+    return render_template("cloudflare.html", cf_keys=cf_keys)
+
+
+@app.route("/api/cf-keys/<int:key_id>/edit", methods=["POST"])
+@login_required
+def api_cf_keys_edit(key_id):
+    """Edit a CF key's alias or max_domains. Cannot edit email / api_key
+    (re-add a fresh key for that — preserves the 'verify on add' flow)."""
+    from database import get_db
+    alias = (request.form.get("alias") or "").strip() or None
+    try:
+        max_domains = int(request.form.get("max_domains") or 0)
+    except ValueError:
+        flash("max_domains must be an integer", "warning")
+        return redirect(url_for("cloudflare_page"))
+    if max_domains < 1 or max_domains > 1000:
+        flash("max_domains must be between 1 and 1000", "warning")
+        return redirect(url_for("cloudflare_page"))
+
+    conn = get_db()
+    try:
+        cur = conn.execute(
+            "UPDATE cf_keys SET alias=?, max_domains=? WHERE id=?",
+            (alias, max_domains, key_id)
+        )
+        conn.commit()
+        if cur.rowcount:
+            flash(f"CF key #{key_id} updated", "success")
+        else:
+            flash("Key not found", "warning")
+    finally:
+        conn.close()
+    return redirect(url_for("cloudflare_page"))
 
 
 @app.route("/api/cf-keys/<int:key_id>/delete", methods=["POST"])
@@ -582,7 +642,7 @@ def api_cf_keys_delete(key_id):
             flash(f"CF key #{key_id} removed from pool", "success")
     finally:
         conn.close()
-    return redirect(url_for("settings"))
+    return redirect(url_for("cloudflare_page"))
 
 
 # ========================= LLM KEY TEST =========================

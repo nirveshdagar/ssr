@@ -1,0 +1,148 @@
+{% extends "base.html" %}
+{% block title %}Cloudflare{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <div class="section-title"><i class="bi bi-cloud-fill"></i> Cloudflare Management</div>
+    <div class="d-flex gap-2">
+        <form action="/api/cf-keys/refresh-accounts" method="POST" class="m-0 d-inline"
+              onsubmit="return confirm('Re-fetch the real Account ID for every CF key in the pool?');">
+            <button type="submit" class="btn btn-soft btn-soft-info" title="Re-resolve cf_account_id from CF for every key">
+                <i class="bi bi-arrow-repeat me-1"></i>Refresh Account IDs
+            </button>
+        </form>
+        <button class="btn btn-primary-s" data-bs-toggle="modal" data-bs-target="#addCfKeyModal">
+            <i class="bi bi-plus-circle me-1"></i>Add CF Key
+        </button>
+    </div>
+</div>
+
+<div class="alert alert-info py-2 mb-3" style="background:var(--accent-blue-bg);border-color:rgba(9,132,227,.15);color:var(--accent-blue);">
+    <small><i class="bi bi-info-circle me-1"></i>
+        CF Global API keys are used to create per-domain DNS zones. The pool
+        rotates across keys so no single CF account hits its 1000-zone limit.
+        Each key holds up to <strong>max_domains</strong> zones (default 20);
+        change per-key as needed.
+    </small>
+</div>
+
+<div class="card-s card-s-static p-4">
+    {% if cf_keys %}
+    <div class="table-responsive"><table class="table table-s">
+        <thead>
+            <tr>
+                <th>Alias</th><th>Email</th><th>API Key</th><th>Account ID</th>
+                <th>Used</th><th>Active</th><th></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for k in cf_keys %}
+            <tr>
+                <td><strong>{{ k.alias or '—' }}</strong></td>
+                <td><code style="font-size:.78rem;">{{ k.email }}</code></td>
+                <td>
+                    <span class="cfkey-mask" data-full="{{ k.api_key }}">
+                        <code style="font-size:.78rem;">{{ k.api_key[:6] }}…{{ k.api_key[-4:] }}</code>
+                    </span>
+                    <button class="btn btn-soft btn-sm cfkey-reveal-btn" title="Reveal / copy">
+                        <i class="bi bi-eye"></i>
+                    </button>
+                </td>
+                <td><code style="font-size:.72rem;">{{ k.cf_account_id[:10] }}…</code></td>
+                <td>
+                    {% set used = k.domains_used or 0 %}
+                    {% set cap  = k.max_domains or 20 %}
+                    {% set pct  = (used * 100 / (cap or 1)) | round(0) %}
+                    <div class="d-flex align-items-center gap-2">
+                        <span>{{ used }}/{{ cap }}</span>
+                        <div style="flex:0 0 50px;height:6px;background:#e9ecef;border-radius:3px;overflow:hidden;">
+                            <div style="height:100%;width:{{ pct }}%;background:{% if pct >= 100 %}#dc3545{% elif pct >= 80 %}#f59e0b{% else %}#16a34a{% endif %};"></div>
+                        </div>
+                    </div>
+                </td>
+                <td>
+                    {% if k.is_active %}
+                        <span class="badge-s badge-active">active</span>
+                    {% else %}
+                        <span class="badge-s badge-inactive">inactive</span>
+                    {% endif %}
+                </td>
+                <td>
+                    <div class="d-flex gap-1">
+                        <button class="btn btn-soft btn-soft-info btn-sm cfkey-edit-btn"
+                                data-bs-toggle="modal" data-bs-target="#editCfKeyModal"
+                                data-key-id="{{ k.id }}"
+                                data-alias="{{ k.alias or '' }}"
+                                data-max="{{ k.max_domains or 20 }}"
+                                title="Edit alias / max_domains">
+                            <i class="bi bi-pencil"></i>
+                        </button>
+                        <form action="/api/cf-keys/{{ k.id }}/toggle" method="POST" class="m-0">
+                            <button type="submit" class="btn btn-soft btn-soft-warning btn-sm" title="Toggle active/inactive">
+                                <i class="bi bi-power"></i>
+                            </button>
+                        </form>
+                        <form action="/api/cf-keys/{{ k.id }}/delete" method="POST" class="m-0"
+                              onsubmit="return confirm('Delete CF key #{{ k.id }} ({{ k.alias or k.email }}) from pool? Will be refused if any domain still references it.');">
+                            <button type="submit" class="btn btn-soft btn-soft-danger btn-sm" title="Remove from pool">
+                                <i class="bi bi-trash"></i>
+                            </button>
+                        </form>
+                    </div>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table></div>
+    {% else %}
+        <div class="empty-state">
+            <i class="bi bi-cloud-slash"></i>
+            <p>No CF keys in pool yet</p>
+            <button class="btn btn-primary-s" data-bs-toggle="modal" data-bs-target="#addCfKeyModal">Add your first CF key</button>
+        </div>
+    {% endif %}
+</div>
+
+<!-- Add CF key modal -->
+<div class="modal fade" id="addCfKeyModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content">
+    <div class="modal-header"><h5 class="modal-title">Add Cloudflare API Key</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+    <form action="/api/cf-keys/add" method="POST"><div class="modal-body">
+        <div class="mb-3"><label class="form-label">Cloudflare account email</label><input type="email" name="email" class="form-control" required></div>
+        <div class="mb-3"><label class="form-label">Global API Key</label><div class="password-field"><input type="password" name="api_key" class="form-control" required><button type="button" class="toggle-vis"><i class="bi bi-eye"></i></button></div><small class="text-muted">Found at dash.cloudflare.com → Profile → API Tokens → Global API Key.</small></div>
+        <div class="mb-3"><label class="form-label">Alias <small class="text-muted">(optional, for your own labeling)</small></label><input type="text" name="alias" class="form-control" placeholder="e.g. CF-mainacct"></div>
+    </div><div class="modal-footer"><button type="button" class="btn btn-soft" data-bs-dismiss="modal">Cancel</button><button type="submit" class="btn btn-primary-s">Verify & Add to Pool</button></div></form>
+</div></div></div>
+
+<!-- Edit CF key modal -->
+<div class="modal fade" id="editCfKeyModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content">
+    <div class="modal-header"><h5 class="modal-title">Edit CF Key</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+    <form id="editCfKeyForm" method="POST"><div class="modal-body">
+        <div class="mb-3"><label class="form-label">Alias</label><input type="text" id="editCfKeyAlias" name="alias" class="form-control"></div>
+        <div class="mb-3"><label class="form-label">Max domains</label><input type="number" id="editCfKeyMax" name="max_domains" class="form-control" min="1" max="1000" required><small class="text-muted">CF accounts allow ~1000 zones; we cap per-key to spread load.</small></div>
+    </div><div class="modal-footer"><button type="button" class="btn btn-soft" data-bs-dismiss="modal">Cancel</button><button type="submit" class="btn btn-primary-s">Save</button></div></form>
+</div></div></div>
+{% endblock %}
+
+{% block extra_js %}
+document.querySelectorAll('.cfkey-reveal-btn').forEach(btn=>{
+    btn.addEventListener('click',function(){
+        const span=this.previousElementSibling;
+        const full=span.dataset.full;
+        if(!span.dataset.shown){
+            span.innerHTML='<code style="font-size:.78rem;">'+full+'</code>';
+            span.dataset.shown='1';
+            this.querySelector('i').className='bi bi-eye-slash';
+            navigator.clipboard?.writeText(full).catch(()=>{});
+        }else{
+            span.innerHTML='<code style="font-size:.78rem;">'+full.slice(0,6)+'…'+full.slice(-4)+'</code>';
+            delete span.dataset.shown;
+            this.querySelector('i').className='bi bi-eye';
+        }
+    });
+});
+document.getElementById('editCfKeyModal')?.addEventListener('show.bs.modal',function(e){
+    const b=e.relatedTarget;
+    document.getElementById('editCfKeyForm').action='/api/cf-keys/'+b.dataset.keyId+'/edit';
+    document.getElementById('editCfKeyAlias').value=b.dataset.alias;
+    document.getElementById('editCfKeyMax').value=b.dataset.max;
+});
+{% endblock %}
