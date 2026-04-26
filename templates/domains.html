@@ -52,6 +52,10 @@
                 <option value="content_blocked" {% if status_filter=='content_blocked' %}selected{% endif %}>Content Blocked</option>
                 <option value="cf_pool_full" {% if status_filter=='cf_pool_full' %}selected{% endif %}>CF Pool Full</option>
                 <option value="purchase_failed" {% if status_filter=='purchase_failed' %}selected{% endif %}>Purchase Failed</option>
+                <option value="manual_action_required" {% if status_filter=='manual_action_required' %}selected{% endif %}>Manual Action Required</option>
+                <option value="waiting_dns" {% if status_filter=='waiting_dns' %}selected{% endif %}>Waiting (DNS)</option>
+                <option value="ready_for_ssl" {% if status_filter=='ready_for_ssl' %}selected{% endif %}>Ready for SSL</option>
+                <option value="ready_for_content" {% if status_filter=='ready_for_content' %}selected{% endif %}>Ready for Content</option>
                 <option value="retryable_error" {% if status_filter=='retryable_error' %}selected{% endif %}>Retryable Error</option>
                 <option value="terminal_error" {% if status_filter=='terminal_error' %}selected{% endif %}>Terminal Error</option>
                 <option value="error" {% if status_filter=='error' %}selected{% endif %}>Error (legacy)</option>
@@ -238,8 +242,21 @@ document.getElementById('historyModal')?.addEventListener('show.bs.modal',async 
             const started=r.started_at?new Date(r.started_at*1000).toLocaleString():'?';
             const dur=(r.ended_at&&r.started_at)?((r.ended_at-r.started_at).toFixed(1)+'s'):'in progress';
             const badgeClass='badge-'+(r.status==='running'?'running':r.status==='completed'?'live':r.status==='canceled'?'pending':'error');
-            return '<div class="hist-row" data-run-id="'+r.id+'" style="cursor:pointer;padding:.5rem .25rem;border-bottom:1px solid var(--border);"><div class="d-flex justify-content-between align-items-center"><div><strong>Run #'+r.id+'</strong> <small class="text-muted ms-2">'+started+'</small></div><div><span class="badge-s '+badgeClass+'">'+r.status+'</span><small class="text-muted ms-2">'+dur+'</small></div></div>'+(r.error?'<small style="color:#E74C3C">'+r.error+'</small>':'')+'</div>';
+            const stopBtn=r.status==='running'
+                ?'<button class="btn btn-soft btn-soft-warning btn-sm hist-stop-btn ms-2" data-domain="'+d+'" title="Cancel this running pipeline"><i class="bi bi-stop-fill"></i> Stop</button>'
+                :'';
+            return '<div class="hist-row" data-run-id="'+r.id+'" style="cursor:pointer;padding:.5rem .25rem;border-bottom:1px solid var(--border);"><div class="d-flex justify-content-between align-items-center"><div><strong>Run #'+r.id+'</strong> <small class="text-muted ms-2">'+started+'</small></div><div><span class="badge-s '+badgeClass+'">'+r.status+'</span><small class="text-muted ms-2">'+dur+'</small>'+stopBtn+'</div></div>'+(r.error?'<small style="color:#E74C3C">'+r.error+'</small>':'')+'</div>';
         }).join('');
+        list.querySelectorAll('.hist-stop-btn').forEach(btn=>{
+            btn.addEventListener('click',async function(ev){
+                ev.stopPropagation();  // don't open the run detail
+                const dn=this.dataset.domain;
+                if(!confirm('Cancel running pipeline for '+dn+'? Will stop at the next step boundary.'))return;
+                const fd=new FormData();
+                const r=await fetch('/api/domains/'+encodeURIComponent(dn)+'/cancel-pipeline',{method:'POST',body:fd,headers:{'Origin':window.location.origin}});
+                if(r.ok||r.redirected)window.location.reload();
+            });
+        });
         list.querySelectorAll('.hist-row').forEach(row=>{
             row.addEventListener('click',async function(){
                 const rid=this.dataset.runId;

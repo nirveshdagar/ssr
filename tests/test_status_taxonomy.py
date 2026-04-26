@@ -64,6 +64,50 @@ def test_retryable_and_terminal_sets_are_disjoint():
     assert overlap == frozenset(), f"unexpected overlap: {overlap}"
 
 
+@pytest.mark.parametrize("s,expected", [
+    ("manual_action_required", True),
+    ("waiting_dns", True),
+    ("ns_pending_external", True),  # legacy alias
+    ("ready_for_ssl", False),
+    ("live", False),
+    ("error", False),
+    ("", False),
+    (None, False),
+])
+def test_is_waiting_status(s, expected):
+    from database import is_waiting_status
+    assert is_waiting_status(s) is expected
+
+
+@pytest.mark.parametrize("s,expected", [
+    ("ready_for_ssl", True),
+    ("ready_for_content", True),
+    ("zone_active", True),       # legacy alias
+    ("ssl_installed", True),     # legacy alias
+    ("manual_action_required", False),
+    ("error", False),
+    ("live", False),
+    (None, False),
+])
+def test_is_ready_status(s, expected):
+    from database import is_ready_status
+    assert is_ready_status(s) is expected
+
+
+def test_status_set_categories_are_disjoint_meaningfully():
+    """Waiting/ready states overlap with neither error category. Within
+    waiting/ready, legacy aliases are intentionally in BOTH the new and
+    legacy bucket — that's by design and not an error."""
+    from database import (
+        RETRYABLE_ERROR_STATUSES, TERMINAL_ERROR_STATUSES,
+        WAITING_STATUSES, READY_STATUSES,
+    )
+    err = RETRYABLE_ERROR_STATUSES | TERMINAL_ERROR_STATUSES
+    assert err & WAITING_STATUSES == frozenset()
+    assert err & READY_STATUSES == frozenset()
+    assert WAITING_STATUSES & READY_STATUSES == frozenset()
+
+
 def test_no_pipeline_step_uses_legacy_error_status():
     """Quick guardrail: after the split, no pipeline step should still
     write the bare 'error' status. Legacy 'error' rows from old DB state

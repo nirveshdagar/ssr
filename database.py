@@ -23,6 +23,27 @@ RETRYABLE_ERROR_STATUSES = frozenset({"retryable_error", "error"})
 TERMINAL_ERROR_STATUSES = frozenset({"terminal_error", "cf_pool_full",
                                       "content_blocked"})
 
+# Waiting = pipeline paused, awaiting an external event (DNS propagation,
+# manual NS change at registrar, registrant info pending). The pipeline
+# isn't 'running' or 'failed' — it's blocked on something outside our
+# control. Operators get a distinct badge color so 'I need to act' is
+# obvious.
+WAITING_STATUSES = frozenset({
+    "manual_action_required",   # generic human-action gate
+    "waiting_dns",              # DNS / NS propagation in flight
+    "ns_pending_external",      # legacy: external registrar NS change
+})
+
+# Ready = a step finished and the pipeline is positioned to start the
+# next phase. These are checkpoints between steps. Useful as both
+# pipeline-set states and operator-set overrides.
+READY_STATUSES = frozenset({
+    "ready_for_ssl",            # zone active, server provisioned — ready for step 8
+    "ready_for_content",        # SSL installed — ready for step 9 (LLM)
+    "zone_active",              # legacy alias for ready_for_ssl
+    "ssl_installed",            # legacy alias for ready_for_content
+})
+
 
 def is_retryable_error(status):
     return status in RETRYABLE_ERROR_STATUSES
@@ -34,6 +55,14 @@ def is_terminal_error(status):
 
 def is_error_status(status):
     return is_retryable_error(status) or is_terminal_error(status)
+
+
+def is_waiting_status(status):
+    return status in WAITING_STATUSES
+
+
+def is_ready_status(status):
+    return status in READY_STATUSES
 
 
 def get_db():

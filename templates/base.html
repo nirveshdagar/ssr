@@ -112,6 +112,14 @@
         .badge-pending { background: #F0F2F8; color: var(--text-muted); }
         .badge-error, .badge-terminal_error, .badge-failed, .badge-purchase_failed, .badge-cf_failed { background: var(--accent-coral-bg); color: #E74C3C; }
         .badge-retryable_error { background: var(--accent-amber-bg); color: #E17055; }
+        /* Waiting states: pipeline blocked on an external event */
+        .badge-manual_action_required, .badge-waiting_dns, .badge-ns_pending_external {
+            background: var(--accent-amber-bg); color: #d97706;
+        }
+        /* Ready states: between-steps checkpoints */
+        .badge-ready_for_ssl, .badge-ready_for_content, .badge-zone_active, .badge-ssl_installed {
+            background: var(--accent-blue-bg); color: var(--accent-blue);
+        }
         .badge-running, .badge-creating, .badge-purchasing, .badge-cf_creating {
             background: var(--accent-blue-bg); color: var(--accent-blue); animation: pulse 2s infinite;
         }
