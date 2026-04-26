@@ -1408,6 +1408,53 @@ def api_add_existing_server():
     return redirect(url_for("servers_page"))
 
 
+@app.route("/api/servers/<int:server_id>/db-delete", methods=["POST"])
+@login_required
+def api_db_delete_server(server_id):
+    """Soft delete: drop the dashboard row only.
+
+    Does NOT touch the DO droplet or the SA server record. Use when the
+    droplet has already been destroyed elsewhere, or when you want the
+    droplet to keep running but not be tracked here. Domains still
+    referencing this server are blocked — clear them first.
+    """
+    from database import get_db
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT * FROM servers WHERE id=?", (server_id,)).fetchone()
+        if not row:
+            flash("Server not found", "warning")
+            return redirect(url_for("servers_page"))
+
+        ref = conn.execute(
+            "SELECT COUNT(*) FROM domains WHERE server_id=?", (server_id,)
+        ).fetchone()[0]
+        if ref:
+            flash(
+                f"Cannot remove — {ref} domain(s) still reference this server. "
+                "Soft-delete or move those domains first.",
+                "warning",
+            )
+            return redirect(url_for("servers_page"))
+
+        conn.execute("DELETE FROM servers WHERE id=?", (server_id,))
+        conn.commit()
+        audit("server_db_delete", target=str(server_id),
+              actor_ip=request.remote_addr or "",
+              detail=f"name={row['name']} ip={row['ip']}")
+        log_pipeline(row["name"] or f"srv-{server_id}",
+                     "server_db_delete", "completed",
+                     f"Soft-deleted server #{server_id} (DO droplet untouched)")
+        flash(
+            f"Server '{row['name']}' removed from dashboard. "
+            "DO droplet + SA record still exist.",
+            "info",
+        )
+    finally:
+        conn.close()
+    return redirect(url_for("servers_page"))
+
+
 @app.route("/api/servers/<int:server_id>/delete", methods=["POST"])
 @login_required
 def api_delete_server(server_id):

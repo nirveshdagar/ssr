@@ -77,6 +77,13 @@
                         </button>
                     </form>
                     {% endif %}
+                    <form action="/api/servers/{{ s.id }}/db-delete" method="POST" class="m-0"
+                          onsubmit="return confirm('Remove {{ s.name }} from dashboard ONLY? The DO droplet + SA record will keep running.');">
+                        <button type="submit" class="btn btn-soft btn-soft-warning btn-sm"
+                                title="Soft delete — remove from dashboard only (droplet keeps running)">
+                            <i class="bi bi-trash"></i>
+                        </button>
+                    </form>
                     <button class="btn btn-soft btn-soft-danger btn-sm delete-server-btn"
                             data-bs-toggle="modal" data-bs-target="#deleteServerModal"
                             data-server-id="{{ s.id }}"
@@ -84,8 +91,8 @@
                             data-server-ip="{{ s.ip }}"
                             data-droplet-id="{{ s.do_droplet_id or '' }}"
                             data-sa-id="{{ s.sa_server_id or '' }}"
-                            title="Destroy server (droplet + SA + DB)">
-                        <i class="bi bi-trash"></i>
+                            title="Hard delete — destroy droplet + SA + DB row">
+                        <i class="bi bi-trash-fill"></i>
                     </button>
                     </div>
                 </td>

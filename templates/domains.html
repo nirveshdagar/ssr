@@ -100,7 +100,8 @@
                         <button class="btn btn-soft btn-soft-info btn-sm history-btn" data-bs-toggle="modal" data-bs-target="#historyModal" data-domain="{{ d.domain }}" title="Run History"><i class="bi bi-clock-history"></i></button>
                         <button class="btn btn-soft btn-soft-info btn-sm" data-bs-toggle="modal" data-bs-target="#cfModal" data-domain="{{ d.domain }}" data-email="{{ d.cf_email or '' }}" data-key="{{ d.cf_global_key or '' }}" data-zone="{{ d.cf_zone_id or '' }}" title="CF Credentials"><i class="bi bi-cloud"></i></button>
                         <form action="/api/domains/{{ d.domain }}/check-ns" method="POST" class="d-inline"><button class="btn btn-soft btn-soft-success btn-sm" title="Check NS"><i class="bi bi-broadcast"></i></button></form>
-                        <form action="/api/domains/{{ d.domain }}/full-delete" method="POST" class="d-inline full-del-form"><button class="btn btn-soft btn-soft-danger btn-sm" title="Full Delete (SA+CF+Spaceship+DB)"><i class="bi bi-trash"></i></button></form>
+                        <form action="/api/domains/{{ d.domain }}/delete" method="POST" class="d-inline" onsubmit="return confirm('Remove {{ d.domain }} from dashboard ONLY? The SA app, CF zone, and Spaceship record stay intact.');"><button class="btn btn-soft btn-soft-warning btn-sm" title="Soft delete — remove from dashboard only"><i class="bi bi-trash"></i></button></form>
+                        <form action="/api/domains/{{ d.domain }}/full-delete" method="POST" class="d-inline full-del-form"><button class="btn btn-soft btn-soft-danger btn-sm" title="Hard delete — full teardown (SA + CF + Spaceship + DB)"><i class="bi bi-trash-fill"></i></button></form>
                     </div>
                 </td>
             </tr>
