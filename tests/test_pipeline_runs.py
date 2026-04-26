@@ -165,3 +165,83 @@ def test_list_pipeline_runs_filters_by_domain(tmp_db):
     assert len(a_runs) == 2
     assert len(b_runs) == 1
     assert all(r["domain"] == "a.com" for r in a_runs)
+
+
+# ---------------------------------------------------------------------------
+# Per-step artifacts
+# ---------------------------------------------------------------------------
+
+def test_set_step_artifact_no_active_run_is_noop(tmp_db):
+    from database import set_step_artifact, get_db
+    set_step_artifact("orphan.com", 3, {"cf_zone_id": "abc"})
+    conn = get_db()
+    try:
+        n = conn.execute("SELECT COUNT(*) FROM pipeline_step_runs").fetchone()[0]
+    finally:
+        conn.close()
+    assert n == 0
+
+
+def test_set_step_artifact_writes_when_run_active(tmp_db):
+    import json
+    from database import (
+        start_pipeline_run, init_steps, update_step,
+        set_step_artifact, get_step_runs,
+    )
+    init_steps("art.com")
+    run_id = start_pipeline_run("art.com")
+    update_step("art.com", 3, "running", "creating zone")
+    set_step_artifact("art.com", 3, {
+        "cf_zone_id": "abc123", "cf_nameservers": ["ns1", "ns2"]
+    })
+    update_step("art.com", 3, "completed", "done")
+    runs = get_step_runs(run_id)
+    assert len(runs) == 1
+    artifact = json.loads(runs[0]["artifact_json"])
+    assert artifact == {"cf_zone_id": "abc123",
+                         "cf_nameservers": ["ns1", "ns2"]}
+
+
+def test_set_step_artifact_merges_keys(tmp_db):
+    """Two artifact writes for the same step should shallow-merge: the
+    second's keys overwrite, the first's other keys persist."""
+    import json
+    from database import (
+        start_pipeline_run, init_steps, update_step,
+        set_step_artifact, get_step_runs,
+    )
+    init_steps("merge.com")
+    run_id = start_pipeline_run("merge.com")
+    update_step("merge.com", 6, "running", "provisioning")
+    set_step_artifact("merge.com", 6, {"server_id": 1, "source": "provisioned"})
+    set_step_artifact("merge.com", 6, {"server_ip": "1.2.3.4"})
+    artifact = json.loads(get_step_runs(run_id)[0]["artifact_json"])
+    assert artifact == {"server_id": 1, "source": "provisioned",
+                         "server_ip": "1.2.3.4"}
+
+
+def test_set_step_artifact_only_targets_running_step(tmp_db):
+    """If a run is finished, set_step_artifact for that domain should
+    no-op — it only targets the latest *running* run."""
+    import json
+    from database import (
+        start_pipeline_run, end_pipeline_run, init_steps, update_step,
+        set_step_artifact, get_step_runs,
+    )
+    init_steps("done.com")
+    run_id = start_pipeline_run("done.com")
+    update_step("done.com", 1, "completed", "done")
+    end_pipeline_run(run_id, "completed")
+    set_step_artifact("done.com", 1, {"after_run": True})
+    runs = get_step_runs(run_id)
+    # Step row exists but artifact wasn't applied.
+    assert runs[0]["artifact_json"] is None
+
+
+def test_set_step_artifact_no_step_row_yet_is_noop(tmp_db):
+    """If update_step hasn't created the step_run row, set_step_artifact
+    should be a no-op rather than raising."""
+    from database import start_pipeline_run, set_step_artifact, get_step_runs
+    run_id = start_pipeline_run("nostep.com")
+    set_step_artifact("nostep.com", 3, {"x": 1})
+    assert get_step_runs(run_id) == []

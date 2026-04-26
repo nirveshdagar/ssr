@@ -38,7 +38,7 @@ import random
 from database import (
     add_domain, update_domain, get_domain, get_servers, get_db,
     log_pipeline, get_setting, init_steps, update_step,
-    heartbeat,
+    heartbeat, set_step_artifact,
 )
 from modules import spaceship, cloudflare_api, serveravatar, website_generator, digitalocean
 from modules.cf_key_pool import (
@@ -454,6 +454,11 @@ def _step2_assign_cf_key(domain):
         key = assign_cf_key_to_domain(domain)
         update_step(domain, 2, "completed",
                     f"Assigned {key['alias'] or key['email']} (used {key['domains_used']}/{key['max_domains']})")
+        set_step_artifact(domain, 2, {
+            "cf_key_id": key["id"], "cf_key_alias": key["alias"],
+            "cf_email": key["email"], "domains_used": key["domains_used"],
+            "max_domains": key["max_domains"],
+        })
         update_domain(domain, status="cf_assigned")
         return True
     except CFKeyPoolExhausted as e:
@@ -478,6 +483,10 @@ def _step3_create_zone(domain):
         info = cloudflare_api.create_zone_for_domain(domain)
         update_step(domain, 3, "completed",
                     f"zone={info['zone_id'][:12]}… NS={','.join(info['nameservers'])}")
+        set_step_artifact(domain, 3, {
+            "cf_zone_id": info["zone_id"],
+            "cf_nameservers": info["nameservers"],
+        })
         update_domain(domain, status="zone_created")
         return True
     except Exception as e:
@@ -547,6 +556,11 @@ def _step6_get_or_provision_server(domain, explicit_server_id=None):
         update_step(domain, 6, "completed",
                     f"Using existing server #{server['id']} {server['name']} ({server['ip']})  "
                     f"sites={server.get('sites_count',0)}/{server.get('max_sites',60)}")
+        set_step_artifact(domain, 6, {
+            "source": "existing", "server_id": server["id"],
+            "server_name": server["name"], "server_ip": server["ip"],
+            "sa_server_id": server.get("sa_server_id"),
+        })
         return server
 
     # Provision new droplet
@@ -562,6 +576,11 @@ def _step6_get_or_provision_server(domain, explicit_server_id=None):
         update_server(server_id_db, sa_server_id=sa_server_id, status="ready")
         update_step(domain, 6, "completed",
                     f"Provisioned server #{server_id_db} {server_name} ({ip})  sa_id={sa_server_id}")
+        set_step_artifact(domain, 6, {
+            "source": "provisioned", "server_id": server_id_db,
+            "server_name": server_name, "server_ip": ip,
+            "sa_server_id": sa_server_id, "do_droplet_id": droplet_id,
+        })
         # return fresh row as a dict so `.get()` calls downstream keep working
         for s in get_servers():
             if s["id"] == server_id_db:
@@ -640,6 +659,10 @@ def _step7_create_app_and_dns(domain, server):
 
     # sites_count is computed on-read from domains.server_id — no bump needed.
     update_domain(domain, status="app_created", current_proxy_ip=server["ip"])
+    set_step_artifact(domain, 7, {
+        "sa_app_id": app_id, "server_id": server["id"],
+        "server_ip": server["ip"], "proxied": True,
+    })
 
     # Cache the CF apex+www A-record IDs so dead-server migration can PATCH
     # them in O(1) instead of list+search. Non-fatal if it fails.
@@ -741,6 +764,11 @@ def _step9_generate_content(domain):
         update_domain(domain, site_html=php)
         update_step(domain, 9, "completed",
                     f"Generated (niche='{niche}'  bytes={len(php)})")
+        import hashlib as _h
+        set_step_artifact(domain, 9, {
+            "niche": niche, "byte_size": len(php),
+            "sha256": _h.sha256(php.encode("utf-8")).hexdigest(),
+        })
         return php
     except ContentBlockedError as e:
         update_step(domain, 9, "failed",
@@ -775,6 +803,12 @@ def _step10_upload_index_php(domain, server, php):
         update_step(domain, 10, "completed",
                     f"Hosted on {server['ip']}. Dashboard will flip to 'live' "
                     f"once https://{domain}/ responds (usually a few min).")
+        d_now = get_domain(domain)
+        set_step_artifact(domain, 10, {
+            "server_ip": server["ip"], "server_id": server["id"],
+            "byte_size": len(php),
+            "archive_path": d_now["content_archive_path"] if d_now else None,
+        })
         return True
     except Exception as e:
         update_step(domain, 10, "failed", str(e))

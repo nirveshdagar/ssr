@@ -742,6 +742,55 @@ def get_step_runs(run_id):
         conn.close()
 
 
+def set_step_artifact(domain, step_num, artifact):
+    """Merge `artifact` (dict, JSON-serializable) into the
+    pipeline_step_runs.artifact_json field for the matching
+    (active run, step_num) row.
+
+    No-op if there's no running pipeline_runs for the domain. The merge
+    is shallow — top-level keys in `artifact` overwrite existing keys on
+    the row, other keys are preserved.
+
+    Use this from step success paths to persist audit metadata about
+    what the step produced (zone_id, server_id, content sha256, etc.).
+    The full bytes (PHP, cert PEM) still live in the domain row /
+    archive file — artifact_json holds references and metadata for the
+    history trail.
+    """
+    import json as _json
+    conn = get_db()
+    try:
+        run_row = conn.execute(
+            """SELECT id FROM pipeline_runs
+                WHERE domain = ? AND status = 'running'
+                ORDER BY id DESC LIMIT 1""",
+            (domain,)
+        ).fetchone()
+        if not run_row:
+            return
+        step_row = conn.execute(
+            """SELECT id, artifact_json FROM pipeline_step_runs
+                WHERE run_id = ? AND step_num = ?""",
+            (run_row["id"], step_num)
+        ).fetchone()
+        if not step_row:
+            return
+        merged = {}
+        if step_row["artifact_json"]:
+            try:
+                merged = _json.loads(step_row["artifact_json"]) or {}
+            except (ValueError, TypeError):
+                merged = {}
+        merged.update(artifact)
+        conn.execute(
+            "UPDATE pipeline_step_runs SET artifact_json = ? WHERE id = ?",
+            (_json.dumps(merged), step_row["id"])
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_steps(domain):
     """Get all step statuses for a domain (for watcher display)."""
     conn = get_db()
