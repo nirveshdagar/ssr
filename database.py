@@ -190,6 +190,40 @@ def init_db():
     );
     """)
 
+    # Per-run pipeline state. step_tracker stores ONLY the latest attempt per
+    # (domain, step) — we lose history on rerun. pipeline_runs + pipeline_step_runs
+    # retain the full history across runs so an operator can look at "this
+    # domain has been re-run 3 times; here's what each attempt did".
+    # artifact_json is reserved for future per-step artifact storage (cert PEM,
+    # generated PHP, CF zone id, etc.) — currently nullable, not yet wired.
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS pipeline_runs (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        domain        TEXT NOT NULL,
+        job_id        INTEGER,                  -- jobs.id when triggered via queue
+        status        TEXT NOT NULL,            -- running | completed | failed | canceled
+        params_json   TEXT,
+        started_at    REAL NOT NULL,
+        ended_at      REAL,
+        error         TEXT
+    );
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS pipeline_step_runs (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id        INTEGER NOT NULL,
+        step_num      INTEGER NOT NULL,
+        status        TEXT NOT NULL,
+        attempt       INTEGER NOT NULL DEFAULT 1,
+        started_at    REAL,
+        ended_at      REAL,
+        message       TEXT,
+        artifact_json TEXT,
+        error         TEXT,
+        FOREIGN KEY (run_id) REFERENCES pipeline_runs(id)
+    );
+    """)
+
     # --- Indexes (issue #1) ---
     # Hot queries: pipeline_log by domain / by created_at DESC; step_tracker
     # lookups per-domain; domains by server_id / status. Without these, the
@@ -202,6 +236,8 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_domains_status           ON domains(status);
     CREATE INDEX IF NOT EXISTS idx_audit_log_created_at     ON audit_log(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_jobs_status_created      ON jobs(status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_pipeline_runs_domain     ON pipeline_runs(domain, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_pipeline_step_runs_run   ON pipeline_step_runs(run_id);
     """)
 
     conn.commit()
@@ -534,7 +570,14 @@ def update_step(domain, step_num, status, message=""):
     """
     Update a step's status for the watcher.
     status: pending, running, completed, failed, skipped, warning
+
+    Writes go to step_tracker (legacy: latest-attempt-only, used by current
+    watcher UI) AND mirror into pipeline_step_runs scoped to the active
+    pipeline_runs row for this domain (if any) so the new tables retain
+    full history across reruns. If no pipeline_runs row is in 'running'
+    state for this domain, only step_tracker is touched.
     """
+    import time as _time
     conn = get_db()
     now = datetime.now().isoformat(timespec="seconds")
     if status == "running":
@@ -552,8 +595,120 @@ def update_step(domain, step_num, status, message=""):
             UPDATE step_tracker SET status=?, message=?
             WHERE domain=? AND step_num=?
         """, (status, message, domain, step_num))
+
+    run_row = conn.execute(
+        """SELECT id FROM pipeline_runs
+            WHERE domain = ? AND status = 'running'
+            ORDER BY id DESC LIMIT 1""",
+        (domain,)
+    ).fetchone()
+    if run_row:
+        run_id = run_row["id"]
+        now_real = _time.time()
+        is_terminal = status in ("completed", "failed", "skipped", "warning")
+        existing = conn.execute(
+            "SELECT id FROM pipeline_step_runs WHERE run_id=? AND step_num=?",
+            (run_id, step_num)
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """INSERT INTO pipeline_step_runs
+                     (run_id, step_num, status, attempt, started_at, ended_at, message)
+                   VALUES (?, ?, ?, 1, ?, ?, ?)""",
+                (run_id, step_num, status,
+                 now_real if status == "running" else None,
+                 now_real if is_terminal else None,
+                 message)
+            )
+        else:
+            # Preserve started_at and ended_at once they're set so the first
+            # transition timestamps stick across re-updates within the same run.
+            conn.execute(
+                """UPDATE pipeline_step_runs
+                      SET status = ?,
+                          message = ?,
+                          started_at = COALESCE(started_at,
+                              CASE WHEN ? = 'running' THEN ? END),
+                          ended_at = COALESCE(ended_at,
+                              CASE WHEN ? THEN ? END)
+                    WHERE id = ?""",
+                (status, message, status, now_real,
+                 1 if is_terminal else 0, now_real, existing["id"])
+            )
     conn.commit()
     conn.close()
+
+
+def start_pipeline_run(domain, params=None, job_id=None):
+    """Insert a 'running' pipeline_runs row. Returns the new run id."""
+    import json as _json, time as _time
+    conn = get_db()
+    try:
+        cur = conn.execute(
+            """INSERT INTO pipeline_runs
+                 (domain, job_id, status, params_json, started_at)
+               VALUES (?, ?, 'running', ?, ?)""",
+            (domain, job_id,
+             _json.dumps(params) if params else None,
+             _time.time())
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def end_pipeline_run(run_id, status, error=None):
+    """Mark a pipeline_runs row ended. status: completed | failed | canceled."""
+    import time as _time
+    conn = get_db()
+    try:
+        conn.execute(
+            """UPDATE pipeline_runs
+                  SET status = ?, error = ?, ended_at = ?
+                WHERE id = ?""",
+            (status, error, _time.time(), run_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_pipeline_runs(domain, limit=20):
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM pipeline_runs WHERE domain = ? ORDER BY id DESC LIMIT ?",
+            (domain, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_pipeline_run(run_id):
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT * FROM pipeline_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_step_runs(run_id):
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM pipeline_step_runs
+                WHERE run_id = ?
+                ORDER BY step_num, attempt""",
+            (run_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 def get_steps(domain):

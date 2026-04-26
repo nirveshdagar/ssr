@@ -198,10 +198,32 @@ class HeartbeatTicker:
 
 
 def _pipeline_worker(domain, skip_purchase, server_id, start_from):
+    from database import (
+        start_pipeline_run, end_pipeline_run, get_domain as _get_domain,
+    )
+    run_id = start_pipeline_run(domain, {
+        "skip_purchase": skip_purchase,
+        "server_id": server_id,
+        "start_from": start_from,
+    })
     try:
         with HeartbeatTicker(domain, interval=1.0):
             _pipeline_worker_impl(domain, skip_purchase, server_id, start_from)
     finally:
+        # Determine final run outcome from the post-impl domain status.
+        # _pipeline_worker_impl handles its own exceptions and writes the
+        # outcome to domain.status: 'canceled' for explicit cancel,
+        # 'error'/'content_blocked' for failures, anything else for success.
+        try:
+            d = _get_domain(domain)
+            ds = d["status"] if d else None
+            if ds == "canceled":
+                end_pipeline_run(run_id, "canceled")
+            elif ds in ("error", "content_blocked"):
+                end_pipeline_run(run_id, "failed", error=ds)
+            else:
+                end_pipeline_run(run_id, "completed")
+        except Exception: pass
         # Always clear the cancel flag on exit so a late-arriving cancel
         # (set after the last _check_cancel boundary) can't sticky into the
         # next run and self-cancel it at step 1.
