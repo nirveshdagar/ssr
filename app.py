@@ -446,24 +446,45 @@ def settings():
 @app.route("/domains")
 @login_required
 def domains_page():
+    """List/filter domains.
+
+    The `q` query param has TWO modes:
+      1) Single token (no commas / newlines): substring match across
+         domain / cf_email / current_proxy_ip — old behavior.
+      2) Multi token (comma- or newline-separated): exact-match each
+         token against domain name. Useful for picking N specific
+         domains out of a large list and bulk-deleting them.
+    """
+    import re
     from modules.cf_key_pool import list_cf_keys
     domains = get_domains()
     servers = get_servers()
     cf_keys = list_cf_keys()
     cf_keys_by_id = {k["id"]: k for k in cf_keys}
     servers_by_id = {s["id"]: s for s in servers}
-    search = request.args.get("q", "").strip().lower()
+    search_raw = request.args.get("q", "").strip()
     status_filter = request.args.get("status", "").strip()
-    if search:
-        domains = [d for d in domains if search in d["domain"].lower()
-                   or search in (d["cf_email"] or "").lower()
-                   or search in (d["current_proxy_ip"] or "")]
+
+    tokens = [t.strip().lower() for t in re.split(r"[,\n]", search_raw)
+              if t.strip()]
+    is_bulk_list = len(tokens) > 1
+    if is_bulk_list:
+        wanted = set(tokens)
+        domains = [d for d in domains if d["domain"].lower() in wanted]
+    elif search_raw:
+        s = search_raw.lower()
+        domains = [d for d in domains if s in d["domain"].lower()
+                   or s in (d["cf_email"] or "").lower()
+                   or s in (d["current_proxy_ip"] or "")]
+
     if status_filter:
         domains = [d for d in domains if d["status"] == status_filter]
     return render_template("domains.html", domains=domains, servers=servers,
                            cf_keys_by_id=cf_keys_by_id,
                            servers_by_id=servers_by_id,
-                           search=search, status_filter=status_filter)
+                           search=search_raw, status_filter=status_filter,
+                           bulk_list_mode=is_bulk_list,
+                           bulk_match_count=len(domains) if is_bulk_list else None)
 
 
 # ========================= CF KEY POOL =========================

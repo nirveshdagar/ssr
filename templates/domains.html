@@ -27,12 +27,24 @@
 
 <!-- Search & Filter Bar -->
 <div class="card-s card-s-static p-3 mb-3">
-    <form method="GET" action="/domains" class="row g-2 align-items-center">
+    <form method="GET" action="/domains" class="row g-2 align-items-start">
         <div class="col-md-5">
             <div class="input-group input-group-sm">
-                <span class="input-group-text" style="background:#F8F9FC;border-color:var(--border);"><i class="bi bi-search" style="color:var(--text-muted);"></i></span>
-                <input type="text" class="form-control" name="q" value="{{ search or '' }}" placeholder="Search domains, emails, IPs...">
+                <span class="input-group-text align-items-start pt-2" style="background:#F8F9FC;border-color:var(--border);"><i class="bi bi-search" style="color:var(--text-muted);"></i></span>
+                <textarea class="form-control" name="q" rows="1"
+                          style="min-height:32px;resize:vertical;"
+                          placeholder="Search single (domain/email/IP), or paste multiple domains separated by commas or newlines for an exact-match list">{{ search or '' }}</textarea>
             </div>
+            {% if bulk_list_mode %}
+            <small class="text-muted ms-2" style="font-size:.72rem;">
+                <i class="bi bi-check2-square me-1"></i>Exact-match list mode — {{ bulk_match_count }} domain(s) shown.
+                Use <strong>Select all</strong> below and the bulk delete to remove them.
+            </small>
+            {% else %}
+            <small class="text-muted ms-2" style="font-size:.72rem;">
+                Tip: paste multiple domains separated by commas or newlines for exact-match filtering.
+            </small>
+            {% endif %}
         </div>
         <div class="col-md-3">
             <select name="status" class="form-select form-select-sm">
