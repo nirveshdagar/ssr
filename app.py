@@ -1089,8 +1089,13 @@ def api_cancel_pipeline(domain):
 @app.route("/api/domains/<domain>/runs")
 @login_required
 def api_domain_runs(domain):
-    """Recent pipeline_runs for a domain (history list, no step details)."""
+    """Recent pipeline_runs for a domain (history list, no step details).
+    Returns 404 if the domain isn't in our DB so a probe can't enumerate
+    valid vs. invalid domain names.
+    """
     from database import list_pipeline_runs
+    if not get_domain(domain):
+        return jsonify({"error": "Domain not found"}), 404
     runs = list_pipeline_runs(domain, limit=int(request.args.get("limit", "20")))
     return jsonify({"runs": runs})
 
@@ -1117,9 +1122,15 @@ def api_run_from_step(domain, step_num):
     No body required — pulls the previously-stored server_id (if any) from
     the domain row via the existing start_from-> 6 safety logic. POST without
     a CSRF body still requires Origin/Referer per _security_middleware.
+
+    Refuses unknown domains (404 equivalent flash) so a stray POST can't
+    silently insert a phantom row via the pipeline's add_domain() call.
     """
     if step_num < 1 or step_num > 10:
         flash("step_num must be between 1 and 10", "warning")
+        return redirect(url_for("domains_page"))
+    if not get_domain(domain):
+        flash(f"Unknown domain '{domain}' — add it first", "warning")
         return redirect(url_for("domains_page"))
     skip_purchase = request.form.get("skip_purchase") == "on"
     job_id = run_full_pipeline(domain, skip_purchase=skip_purchase,
@@ -1205,6 +1216,9 @@ def api_preflight(domain):
 @app.route("/api/domains/<domain>/run-pipeline", methods=["POST"])
 @login_required
 def api_run_pipeline(domain):
+    if not get_domain(domain):
+        flash(f"Unknown domain '{domain}' — add it first", "warning")
+        return redirect(url_for("domains_page"))
     skip_purchase = request.form.get("skip_purchase") == "on"
     server_id = request.form.get("server_id")
     start_from = request.form.get("start_from")

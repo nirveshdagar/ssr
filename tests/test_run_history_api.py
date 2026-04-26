@@ -34,7 +34,8 @@ def client(tmp_db, monkeypatch):
 
 
 def test_runs_endpoint_returns_recent_runs(client, tmp_db):
-    from database import start_pipeline_run, end_pipeline_run
+    from database import add_domain, start_pipeline_run, end_pipeline_run
+    add_domain("hist.com")
     a = start_pipeline_run("hist.com", {"skip_purchase": True})
     end_pipeline_run(a, "completed")
     b = start_pipeline_run("hist.com")
@@ -52,14 +53,25 @@ def test_runs_endpoint_returns_recent_runs(client, tmp_db):
     assert statuses == ["failed", "completed"]
 
 
-def test_runs_endpoint_empty_for_unknown_domain(client, tmp_db):
+def test_runs_endpoint_404_for_unknown_domain(client, tmp_db):
+    """Audit P2 #9: unknown domains should 404, not return 200+empty.
+    Prevents enumerating which domains exist in the DB."""
     r = client.get("/api/domains/never.com/runs")
+    assert r.status_code == 404
+    assert "error" in r.get_json()
+
+
+def test_runs_endpoint_returns_empty_list_for_known_domain_with_no_runs(client, tmp_db):
+    from database import add_domain
+    add_domain("known.com")
+    r = client.get("/api/domains/known.com/runs")
     assert r.status_code == 200
     assert r.get_json() == {"runs": []}
 
 
 def test_runs_endpoint_honors_limit(client, tmp_db):
-    from database import start_pipeline_run
+    from database import add_domain, start_pipeline_run
+    add_domain("limit.com")
     for _ in range(5):
         start_pipeline_run("limit.com")
     r = client.get("/api/domains/limit.com/runs?limit=2")

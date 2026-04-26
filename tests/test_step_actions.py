@@ -31,7 +31,7 @@ def test_run_from_step_enqueues_with_correct_start_from(client, tmp_db, monkeypa
     requested step. We patch run_full_pipeline at the app module level so
     the test verifies the wiring without spinning up the worker."""
     from database import add_domain
-    add_domain("retry.com")
+    add_domain("retry.com")  # required: endpoint refuses unknown domains
 
     captured = {}
     def fake_run(domain, **kwargs):
@@ -63,7 +63,28 @@ def test_run_from_step_rejects_out_of_range(client, tmp_db, monkeypatch):
     assert called["n"] == 0, "out-of-range step nums should not enqueue"
 
 
+def test_run_from_step_rejects_unknown_domain(client, tmp_db, monkeypatch):
+    """Regression for audit P1 #5: posting to /run-from/<N> with a domain
+    that doesn't exist must NOT silently call run_full_pipeline (which
+    would create the row via add_domain). Should reject."""
+    called = {"n": 0}
+    def fake_run(*a, **kw):
+        called["n"] += 1
+        return 1
+    import app as _app
+    monkeypatch.setattr(_app, "run_full_pipeline", fake_run)
+
+    client.post("/api/domains/nonexistent.com/run-from/3",
+                 headers={"Origin": "http://localhost"})
+    assert called["n"] == 0
+    # Verify no phantom row was created either.
+    from database import get_domain
+    assert get_domain("nonexistent.com") is None
+
+
 def test_run_from_step_propagates_skip_purchase(client, tmp_db, monkeypatch):
+    from database import add_domain
+    add_domain("x.com")
     captured = {}
     def fake_run(domain, **kwargs):
         captured.update(kwargs)
