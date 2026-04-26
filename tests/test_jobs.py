@@ -162,3 +162,70 @@ def test_jobs_run_in_fifo_order(jobs_module):
         jobs_module._run_one(job)
 
     assert seen == [0, 1, 2]
+
+
+def test_workers_run_jobs_in_parallel(jobs_module):
+    """Two jobs whose handlers each sleep 1s should finish in ~1s wall clock,
+    not ~2s, when the pool size is >= 2. This is the load-bearing test for
+    the multi-thread pool — if it regresses to single-worker, this fails."""
+    import threading
+    import time
+
+    barrier = threading.Barrier(2, timeout=3.0)
+    completed = []
+    completed_lock = threading.Lock()
+
+    def handler(payload):
+        # Both handlers must reach the barrier within 3s. If only one worker
+        # is running them, the second handler never reaches the barrier
+        # before the first finishes its sleep, and barrier.wait() times out.
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            with completed_lock:
+                completed.append(("timeout", payload["i"]))
+            return
+        time.sleep(0.2)  # tiny extra so we can observe both completing
+        with completed_lock:
+            completed.append(("ok", payload["i"]))
+
+    jobs_module.register_handler("test.parallel", handler)
+
+    jobs_module.enqueue_job("test.parallel", {"i": 0})
+    jobs_module.enqueue_job("test.parallel", {"i": 1})
+
+    # Override the poll interval so workers grab jobs quickly.
+    jobs_module.POLL_INTERVAL = 0.05
+
+    start = time.time()
+    jobs_module.start_worker(num_workers=2)
+    try:
+        # Wait for both jobs to finish — give it 5s ceiling.
+        deadline = start + 5.0
+        while time.time() < deadline:
+            with completed_lock:
+                if len(completed) == 2:
+                    break
+            time.sleep(0.05)
+    finally:
+        jobs_module.stop_worker(timeout=3.0)
+
+    elapsed = time.time() - start
+    assert len(completed) == 2, f"jobs didn't finish in time: {completed}"
+    statuses = [c[0] for c in completed]
+    assert statuses == ["ok", "ok"], \
+        f"workers ran serially (barrier timed out): {completed}"
+    # Both jobs ran in parallel → ~0.2s each, total ~0.2s. Generous ceiling
+    # for CI flakiness.
+    assert elapsed < 2.0, f"jobs serialized despite pool size 2: {elapsed:.2f}s"
+
+
+def test_start_worker_idempotent_with_pool(jobs_module):
+    jobs_module.start_worker(num_workers=2)
+    try:
+        first_pool = list(jobs_module._worker_threads)
+        jobs_module.start_worker(num_workers=2)  # should be a no-op
+        second_pool = list(jobs_module._worker_threads)
+        assert first_pool == second_pool
+    finally:
+        jobs_module.stop_worker(timeout=2.0)

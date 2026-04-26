@@ -40,13 +40,24 @@ from database import get_db
 # Registered handlers — populated by register_handler() at import time in app.py.
 _handlers: dict[str, Callable[[dict], None]] = {}
 
-# Worker singleton. Only one worker per process; start_worker is idempotent.
-_worker_thread: threading.Thread | None = None
+# Worker pool. Each thread runs the same _worker_loop, claiming one job at a
+# time. Pool size is configurable via start_worker(num_workers=N) — default 4.
+# Different jobs (different domains) run in parallel; the per-domain
+# _inflight_domains set in pipeline.py still serializes same-domain runs.
+#
+# Why threads (not multiprocess, not asyncio): every long-running operation in
+# this codebase is I/O-bound (HTTP, SSH, sqlite, LLM). The GIL releases on I/O,
+# so threads achieve real parallelism for our workload. Multiprocess would
+# require picklable handlers + cross-process domain locking; asyncio would
+# require rewriting every requests/paramiko/sqlite3 call. Threads are the
+# right ergonomic fit.
+_worker_threads: list[threading.Thread] = []
 _worker_stop = threading.Event()
 _worker_lock = threading.Lock()
-_worker_id = f"pid-{os.getpid()}"
+_worker_id_base = f"pid-{os.getpid()}"
 
 POLL_INTERVAL = 2.0
+DEFAULT_WORKERS = 4
 
 
 # ---------------------------------------------------------------------------
@@ -170,13 +181,17 @@ def recover_orphans() -> int:
 # Worker internals
 # ---------------------------------------------------------------------------
 
-def _claim_one() -> dict | None:
+def _claim_one(worker_id: str = None) -> dict | None:
     """Grab the oldest queued job. Returns the post-claim row dict (with
     bumped attempt_count + 'running' status) or None if queue is empty.
 
-    With a single worker this is race-free; the `AND status = 'queued'`
-    guard on the UPDATE makes it safe if a v2 multi-worker setup ever lands.
+    With multiple workers, the `AND status = 'queued'` guard on the UPDATE
+    + cur.rowcount check ensures only one worker can claim a given row.
+    SELECT-then-UPDATE is non-atomic but the guard makes the loser's UPDATE
+    a no-op — they just retry next poll.
     """
+    if worker_id is None:
+        worker_id = _worker_id_base
     now = time.time()
     conn = get_db()
     try:
@@ -196,7 +211,7 @@ def _claim_one() -> dict | None:
                       locked_at = ?,
                       updated_at = ?
                 WHERE id = ? AND status = 'queued'""",
-            (_worker_id, now, now, row["id"]),
+            (worker_id, now, now, row["id"]),
         )
         conn.commit()
         if cur.rowcount == 0:
@@ -272,10 +287,10 @@ def _run_one(job: dict) -> None:
             _finish(job["id"], "failed", err)
 
 
-def _worker_loop() -> None:
+def _worker_loop(worker_id: str) -> None:
     while not _worker_stop.is_set():
         try:
-            job = _claim_one()
+            job = _claim_one(worker_id=worker_id)
         except Exception:
             # If we can't even claim (DB lock contention, schema mismatch), back
             # off and retry rather than spin a tight failure loop.
@@ -287,24 +302,36 @@ def _worker_loop() -> None:
         _run_one(job)
 
 
-def start_worker() -> None:
-    """Idempotently start the in-process worker thread. Safe to call multiple
-    times — extra calls are no-ops while the existing worker is alive.
+def start_worker(num_workers: int = DEFAULT_WORKERS) -> None:
+    """Idempotently start a pool of N worker threads. Safe to call multiple
+    times — extra calls are no-ops while the existing pool is alive.
+
+    Each worker has a distinct worker_id ('pid-1234-w0', 'pid-1234-w1', ...)
+    written to jobs.locked_by so we can tell which worker is holding which
+    row in the (rare) case of contention or stuck jobs.
     """
-    global _worker_thread
+    global _worker_threads
     with _worker_lock:
-        if _worker_thread and _worker_thread.is_alive():
+        alive = [t for t in _worker_threads if t.is_alive()]
+        if alive:
             return
         _worker_stop.clear()
-        _worker_thread = threading.Thread(
-            target=_worker_loop, daemon=True, name="ssr-job-worker"
-        )
-        _worker_thread.start()
+        _worker_threads = []
+        for i in range(num_workers):
+            wid = f"{_worker_id_base}-w{i}"
+            t = threading.Thread(
+                target=_worker_loop,
+                args=(wid,),
+                daemon=True,
+                name=f"ssr-job-worker-{i}",
+            )
+            t.start()
+            _worker_threads.append(t)
 
 
 def stop_worker(timeout: float = 5.0) -> None:
-    """Stop the worker. Used in tests. The current job, if any, finishes —
-    handlers aren't interrupted."""
+    """Stop all workers. Used in tests. Currently-running handlers, if any,
+    finish — they aren't interrupted."""
     _worker_stop.set()
-    if _worker_thread:
-        _worker_thread.join(timeout=timeout)
+    for t in _worker_threads:
+        t.join(timeout=timeout)
