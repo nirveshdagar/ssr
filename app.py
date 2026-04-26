@@ -596,10 +596,16 @@ def cloudflare_page():
     contain only the masked version. If you need to copy-paste the original
     key into another tool, re-add it from the source (CF dashboard) — that
     flow is one-time and intentional.
+
+    Each key row also gets the list of domains assigned to it (via
+    domains.cf_key_id) so operators can see usage at a glance + select a
+    subset for bulk A-record changes (e.g., move 10 domains from a dead
+    origin server to a new one in one go).
     """
     from modules.cf_key_pool import list_cf_keys
     from database import get_db
     cf_keys = list_cf_keys()
+    domains_by_key = {}
     if cf_keys:
         conn = get_db()
         try:
@@ -609,11 +615,133 @@ def cloudflare_page():
                           substr(api_key, length(api_key) - 3) AS preview
                      FROM cf_keys"""
             ).fetchall()}
+            for r in conn.execute(
+                """SELECT cf_key_id, domain, status, current_proxy_ip
+                     FROM domains
+                    WHERE cf_key_id IS NOT NULL
+                    ORDER BY domain"""
+            ).fetchall():
+                domains_by_key.setdefault(r["cf_key_id"], []).append(dict(r))
         finally:
             conn.close()
         for k in cf_keys:
             k["key_preview"] = previews.get(k["id"], "")
-    return render_template("cloudflare.html", cf_keys=cf_keys)
+    return render_template("cloudflare.html", cf_keys=cf_keys,
+                           domains_by_key=domains_by_key)
+
+
+def _cf_bulk_set_ip_handler(payload):
+    """Job handler: change the apex + www A-records to `new_ip` for each
+    listed domain. Honors the chosen proxied flag. Updates
+    domains.current_proxy_ip on success. Each domain's two CF calls are
+    independent — if one domain fails, the rest still proceed.
+    """
+    import ipaddress
+    from modules import cloudflare_api
+    new_ip = payload["new_ip"]
+    proxied = bool(payload.get("proxied", True))
+    domains = payload.get("domains", [])
+
+    # Belt-and-braces: revalidate IP server-side. Endpoint already did this
+    # but the job could have been hand-enqueued.
+    try:
+        ipaddress.ip_address(new_ip)
+    except ValueError:
+        log_pipeline("cf_bulk_set_ip", "bulk_set_ip", "failed",
+                     f"invalid IP: {new_ip!r}")
+        return
+
+    success, failed = [], []
+    for d in domains:
+        try:
+            cloudflare_api.set_dns_a_record(d, new_ip, proxied=proxied)
+            cloudflare_api.set_dns_a_record_www(d, new_ip, proxied=proxied)
+            update_domain(d, current_proxy_ip=new_ip)
+            success.append(d)
+            log_pipeline(d, "bulk_set_ip", "completed",
+                         f"A records -> {new_ip} (proxied={proxied})")
+        except Exception as e:
+            failed.append(f"{d}: {type(e).__name__}: {e}")
+            log_pipeline(d, "bulk_set_ip", "failed",
+                         f"set A record failed: {e}")
+
+    log_pipeline("cf_bulk_set_ip", "bulk_set_ip",
+                 "completed" if not failed else "warning",
+                 f"new_ip={new_ip} proxied={proxied} "
+                 f"ok={len(success)} failed={len(failed)}")
+
+
+@app.route("/api/cf-keys/<int:key_id>/bulk-set-ip", methods=["POST"])
+@login_required
+def api_cf_keys_bulk_set_ip(key_id):
+    """Bulk A-record change for a list of domains all assigned to this CF
+    key. Form fields:
+        domains    — repeated form field, one per selected domain name
+        new_ip     — target origin IP (IPv4)
+        proxied    — 'on' to keep the orange cloud, omitted to grey-cloud
+
+    Each domain is verified to actually be assigned to this CF key (so a
+    forged form can't redirect a key's domains to an arbitrary IP via a
+    different key's endpoint). The actual CF API calls run as a durable
+    job so the request returns fast even on large batches.
+    """
+    import ipaddress
+    from database import get_db
+    from modules.jobs import enqueue_job
+
+    new_ip = (request.form.get("new_ip") or "").strip()
+    proxied = request.form.get("proxied") == "on"
+    requested = request.form.getlist("domains")
+
+    if not requested:
+        flash("No domains selected", "warning")
+        return redirect(url_for("cloudflare_page"))
+    try:
+        ipaddress.ip_address(new_ip)
+    except ValueError:
+        flash(f"Invalid IP address: {new_ip!r}", "danger")
+        return redirect(url_for("cloudflare_page"))
+
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            f"""SELECT domain FROM domains
+                 WHERE cf_key_id = ?
+                   AND domain IN ({','.join('?' * len(requested))})""",
+            (key_id, *requested)
+        ).fetchall()
+        verified = [r["domain"] for r in rows]
+    finally:
+        conn.close()
+
+    rejected = set(requested) - set(verified)
+    if rejected:
+        flash(
+            f"Refused: {len(rejected)} domain(s) are not assigned to CF "
+            f"key #{key_id} ({', '.join(list(rejected)[:3])}"
+            f"{'...' if len(rejected) > 3 else ''}). Nothing was changed.",
+            "danger",
+        )
+        return redirect(url_for("cloudflare_page"))
+
+    job_id = enqueue_job("cf.bulk_set_ip", {
+        "key_id": key_id,
+        "domains": verified,
+        "new_ip": new_ip,
+        "proxied": proxied,
+    })
+    audit("cf_bulk_set_ip",
+          target=f"cf_key={key_id}",
+          actor_ip=request.remote_addr or "",
+          detail=f"new_ip={new_ip} proxied={proxied} count={len(verified)} job={job_id}")
+    flash(
+        f"Bulk A-record change enqueued (job #{job_id}) — "
+        f"{len(verified)} domain(s) -> {new_ip} (proxied={proxied}). "
+        "Each domain triggers 2 CF API calls (apex + www); progress visible "
+        "in the Logs tab as 'bulk_set_ip' entries.",
+        "info",
+    )
+    return redirect(url_for("cloudflare_page"))
 
 
 @app.route("/api/cf-keys/<int:key_id>/edit", methods=["POST"])
@@ -2345,6 +2473,7 @@ _jobs.register_handler("pipeline.bulk",        _pipeline_bulk_handler)
 _jobs.register_handler("server.create",        _server_create_handler)
 _jobs.register_handler("domain.teardown",      lambda p: _teardown_domain(p["domain"]))
 _jobs.register_handler("domain.bulk_teardown", lambda p: _bulk_teardown(p["domains"]))
+_jobs.register_handler("cf.bulk_set_ip",       _cf_bulk_set_ip_handler)
 _jobs.recover_orphans()
 _jobs.start_worker()
 

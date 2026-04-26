@@ -36,8 +36,19 @@
         </thead>
         <tbody>
             {% for k in cf_keys %}
+            {% set kdomains = domains_by_key.get(k.id, []) %}
             <tr>
-                <td><strong>{{ k.alias or '—' }}</strong></td>
+                <td>
+                    <strong>{{ k.alias or '—' }}</strong>
+                    {% if kdomains %}
+                    <button type="button" class="btn btn-link btn-sm p-0 ms-1 text-decoration-none"
+                            data-bs-toggle="collapse" data-bs-target="#kdoms-{{ k.id }}"
+                            style="font-size:.72rem;color:var(--text-muted);"
+                            title="Show / hide the {{ kdomains|length }} domains using this key">
+                        <i class="bi bi-chevron-right"></i> {{ kdomains|length }} domain(s)
+                    </button>
+                    {% endif %}
+                </td>
                 <td><code style="font-size:.78rem;">{{ k.email }}</code></td>
                 <td>
                     <code style="font-size:.78rem;" title="Full key never leaves the database">{{ k.key_preview }}</code>
@@ -85,6 +96,44 @@
                     </div>
                 </td>
             </tr>
+            {% if kdomains %}
+            <tr class="collapse" id="kdoms-{{ k.id }}">
+                <td colspan="7" style="background:#FAFBFD;padding:.75rem 1rem;">
+                    <form action="/api/cf-keys/{{ k.id }}/bulk-set-ip" method="POST"
+                          onsubmit="return confirm('Change A-records for ' + this.querySelectorAll('input[name=domains]:checked').length + ' domain(s) to ' + this.querySelector('input[name=new_ip]').value + '?');">
+                        <div class="d-flex align-items-center gap-2 mb-2" style="font-size:.78rem;">
+                            <label class="form-check form-check-inline m-0">
+                                <input type="checkbox" class="form-check-input kdom-all" data-key="{{ k.id }}">
+                                <span class="ms-1 text-muted">Select all</span>
+                            </label>
+                            <input type="text" name="new_ip" class="form-control form-control-sm" style="max-width:160px;" placeholder="New origin IP" required>
+                            <label class="form-check form-check-inline m-0">
+                                <input type="checkbox" class="form-check-input" name="proxied" checked>
+                                <span class="ms-1 text-muted">Proxied (orange cloud)</span>
+                            </label>
+                            <button type="submit" class="btn btn-soft btn-soft-warning btn-sm" title="Change A-records (apex + www) for selected domains">
+                                <i class="bi bi-arrow-right-circle me-1"></i>Change A records
+                            </button>
+                        </div>
+                        <div class="row g-1" style="font-size:.78rem;">
+                            {% for d in kdomains %}
+                            <div class="col-md-6 col-lg-4">
+                                <label class="form-check m-0">
+                                    <input type="checkbox" name="domains" value="{{ d.domain }}" class="form-check-input kdom-cb-{{ k.id }}">
+                                    <span class="ms-1"><code>{{ d.domain }}</code>
+                                        {% if d.current_proxy_ip %}
+                                        <small class="text-muted">→ {{ d.current_proxy_ip }}</small>
+                                        {% endif %}
+                                        <span class="badge-s badge-{{ d.status }}" style="font-size:.6rem;padding:.15em .45em;margin-left:.25rem;">{{ d.status }}</span>
+                                    </span>
+                                </label>
+                            </div>
+                            {% endfor %}
+                        </div>
+                    </form>
+                </td>
+            </tr>
+            {% endif %}
             {% endfor %}
         </tbody>
     </table></div>
@@ -118,6 +167,13 @@
 {% endblock %}
 
 {% block extra_js %}
+// Per-key 'Select all' for the bulk-set-IP form
+document.querySelectorAll('.kdom-all').forEach(master=>{
+    master.addEventListener('change',function(){
+        const k=this.dataset.key;
+        document.querySelectorAll('.kdom-cb-'+k).forEach(c=>{c.checked=this.checked;});
+    });
+});
 document.getElementById('editCfKeyModal')?.addEventListener('show.bs.modal',function(e){
     const b=e.relatedTarget;
     document.getElementById('editCfKeyForm').action='/api/cf-keys/'+b.dataset.keyId+'/edit';
