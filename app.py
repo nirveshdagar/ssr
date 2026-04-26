@@ -630,6 +630,188 @@ def cloudflare_page():
                            domains_by_key=domains_by_key)
 
 
+_BULK_DNS_MAX_ROWS = 5000
+
+
+def _parse_bool_loose(s):
+    """'true' / '1' / 'yes' / 'on' -> True (case-insensitive). Anything else
+    (including '' / '0' / 'false' / None) -> False. CSV columns aren't
+    standardized so we accept the common variants."""
+    return str(s or "").strip().lower() in ("true", "1", "yes", "on")
+
+
+def _parse_dns_csv(text, allowed_domains):
+    """Parse the operator-supplied CSV body. Returns (valid_rows, errors).
+
+    Each valid row is a dict ready to feed into upsert_dns_record. Errors
+    is a list of '(line_no, message)' tuples for rows we had to skip.
+
+    Required columns (case-insensitive header): domain, type, name, content.
+    Optional: proxied (default false), ttl (default 1=auto).
+
+    `allowed_domains` is a set of lowercase domain names — any row whose
+    `domain` isn't in this set is rejected. The caller (endpoint) builds
+    this from cf_keys.id == this key.
+    """
+    import csv
+    import io
+    from modules.cloudflare_api import VALID_DNS_RECORD_TYPES
+
+    valid, errors = [], []
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        errors.append((0, "CSV is empty or has no header row"))
+        return valid, errors
+
+    headers = {h.lower().strip(): h for h in reader.fieldnames}
+    required = {"domain", "type", "name", "content"}
+    missing = required - headers.keys()
+    if missing:
+        errors.append((0, f"missing required columns: {sorted(missing)}"))
+        return valid, errors
+
+    for i, row in enumerate(reader, start=2):  # line 2 = first data row
+        if len(valid) + len(errors) >= _BULK_DNS_MAX_ROWS:
+            errors.append((i, f"row cap {_BULK_DNS_MAX_ROWS} reached; rest skipped"))
+            break
+        try:
+            dom = (row[headers["domain"]] or "").strip().lower()
+            rtype = (row[headers["type"]] or "").strip().upper()
+            name = (row[headers["name"]] or "").strip()
+            content = (row[headers["content"]] or "").strip()
+            proxied = _parse_bool_loose(
+                row[headers["proxied"]] if "proxied" in headers else "")
+            try:
+                ttl = int((row[headers["ttl"]] or "1").strip()) if "ttl" in headers else 1
+            except ValueError:
+                ttl = 1
+
+            if not dom:
+                errors.append((i, "empty domain")); continue
+            if dom not in allowed_domains:
+                errors.append((i, f"{dom!r} not assigned to this CF key"))
+                continue
+            if rtype not in VALID_DNS_RECORD_TYPES:
+                errors.append((i,
+                    f"type must be one of {VALID_DNS_RECORD_TYPES}; got {rtype!r}"))
+                continue
+            if not content:
+                errors.append((i, "empty content")); continue
+
+            valid.append({
+                "domain": dom, "type": rtype, "name": name,
+                "content": content, "proxied": proxied, "ttl": ttl,
+            })
+        except Exception as e:
+            errors.append((i, f"{type(e).__name__}: {e}"))
+    return valid, errors
+
+
+def _cf_bulk_dns_csv_handler(payload):
+    """Job handler: apply each parsed row via cloudflare_api.upsert_dns_record.
+    Per-row failures don't abort the rest. Each row logs a pipeline_log
+    entry; a final summary line gives ok/failed totals.
+    """
+    from modules import cloudflare_api
+    rows = payload.get("rows", [])
+    success, failed = 0, []
+    for row in rows:
+        d = row["domain"]
+        try:
+            cloudflare_api.upsert_dns_record(
+                d, row["type"], row["name"], row["content"],
+                proxied=row.get("proxied", False),
+                ttl=row.get("ttl", 1),
+            )
+            success += 1
+            log_pipeline(d, "bulk_dns_csv", "completed",
+                         f"{row['type']} {row['name']!r} -> "
+                         f"{row['content'][:60]} (proxied={row['proxied']})")
+        except Exception as e:
+            failed.append(f"{d} {row['type']} {row['name']}: {e}")
+            log_pipeline(d, "bulk_dns_csv", "failed",
+                         f"{row['type']} {row['name']!r} upsert failed: {e}")
+    log_pipeline("cf_bulk_dns_csv", "bulk_dns_csv",
+                 "completed" if not failed else "warning",
+                 f"ok={success} failed={len(failed)}")
+
+
+@app.route("/api/cf-keys/<int:key_id>/bulk-dns-csv", methods=["POST"])
+@login_required
+def api_cf_keys_bulk_dns_csv(key_id):
+    """Bulk DNS upsert from a CSV body. Form fields:
+        csv_text — the CSV content (paste OR file upload via name='csv_file')
+    Required header: domain,type,name,content. Optional: proxied,ttl.
+    Each row's `domain` must be assigned to THIS key (forged-form guard).
+    Bad rows are reported in the flash; valid rows enqueue a single
+    cf.bulk_dns_csv job that runs row-by-row.
+    """
+    from database import get_db
+    from modules.jobs import enqueue_job
+
+    csv_text = (request.form.get("csv_text") or "").strip()
+    if not csv_text and "csv_file" in request.files:
+        f = request.files["csv_file"]
+        if f and f.filename:
+            try:
+                csv_text = f.read().decode("utf-8", errors="replace")
+            except Exception as e:
+                flash(f"Could not read CSV file: {e}", "danger")
+                return redirect(url_for("cloudflare_page"))
+
+    if not csv_text:
+        flash("Provide CSV content (paste or upload).", "warning")
+        return redirect(url_for("cloudflare_page"))
+
+    # 256 KiB cap on the body — generous for thousands of rows but bounds
+    # memory + sqlite-payload size for the job row.
+    if len(csv_text.encode("utf-8")) > 256 * 1024:
+        flash("CSV body too large (>256 KiB). Split it into smaller batches.",
+              "danger")
+        return redirect(url_for("cloudflare_page"))
+
+    conn = get_db()
+    try:
+        allowed = {
+            r["domain"].lower()
+            for r in conn.execute(
+                "SELECT domain FROM domains WHERE cf_key_id=?", (key_id,)
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+
+    rows, errors = _parse_dns_csv(csv_text, allowed)
+
+    if not rows:
+        msg = "No valid rows found in CSV."
+        if errors:
+            msg += " Errors: " + "; ".join(
+                f"line {ln}: {m}" for ln, m in errors[:5])
+            if len(errors) > 5:
+                msg += f" (+{len(errors) - 5} more)"
+        flash(msg, "danger")
+        return redirect(url_for("cloudflare_page"))
+
+    job_id = enqueue_job("cf.bulk_dns_csv", {"key_id": key_id, "rows": rows})
+    audit("cf_bulk_dns_csv",
+          target=f"cf_key={key_id}",
+          actor_ip=request.remote_addr or "",
+          detail=(f"valid={len(rows)} skipped={len(errors)} "
+                   f"job={job_id}"))
+    parts = [f"DNS bulk-upsert enqueued (job #{job_id}) — "
+              f"{len(rows)} valid row(s)"]
+    if errors:
+        parts.append(
+            f"; skipped {len(errors)}: "
+            + "; ".join(f"line {ln}: {m}" for ln, m in errors[:3])
+            + ("..." if len(errors) > 3 else "")
+        )
+    parts.append(". Progress in Logs as 'bulk_dns_csv' entries.")
+    flash(" ".join(parts), "info" if not errors else "warning")
+    return redirect(url_for("cloudflare_page"))
+
+
 def _cf_bulk_set_settings_handler(payload):
     """Job handler: apply a set of zone settings (SSL mode, Always-HTTPS) to
     each listed domain. Skips any setting whose value is None (i.e., the
@@ -2623,6 +2805,7 @@ _jobs.register_handler("domain.teardown",      lambda p: _teardown_domain(p["dom
 _jobs.register_handler("domain.bulk_teardown", lambda p: _bulk_teardown(p["domains"]))
 _jobs.register_handler("cf.bulk_set_ip",       _cf_bulk_set_ip_handler)
 _jobs.register_handler("cf.bulk_set_settings", _cf_bulk_set_settings_handler)
+_jobs.register_handler("cf.bulk_dns_csv",      _cf_bulk_dns_csv_handler)
 _jobs.recover_orphans()
 _jobs.start_worker()
 

@@ -82,6 +82,13 @@
                                 title="Edit alias / max_domains">
                             <i class="bi bi-pencil"></i>
                         </button>
+                        <button class="btn btn-soft btn-soft-info btn-sm cfkey-dnscsv-btn"
+                                data-bs-toggle="modal" data-bs-target="#bulkDnsCsvModal"
+                                data-key-id="{{ k.id }}"
+                                data-alias="{{ k.alias or k.email }}"
+                                title="Bulk DNS upsert from CSV (A / AAAA / CNAME / TXT)">
+                            <i class="bi bi-filetype-csv"></i>
+                        </button>
                         <form action="/api/cf-keys/{{ k.id }}/toggle" method="POST" class="m-0">
                             <button type="submit" class="btn btn-soft btn-soft-warning btn-sm" title="Toggle active/inactive">
                                 <i class="bi bi-power"></i>
@@ -183,6 +190,38 @@
     </div><div class="modal-footer"><button type="button" class="btn btn-soft" data-bs-dismiss="modal">Cancel</button><button type="submit" class="btn btn-primary-s">Verify & Add to Pool</button></div></form>
 </div></div></div>
 
+<!-- Bulk DNS CSV upsert modal -->
+<div class="modal fade" id="bulkDnsCsvModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content">
+    <div class="modal-header"><h5 class="modal-title">Bulk DNS upsert — <span id="dnsCsvKeyName" style="color:var(--primary);"></span></h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+    <form id="bulkDnsCsvForm" method="POST" enctype="multipart/form-data"><div class="modal-body">
+        <div class="alert alert-info py-2 mb-3" style="background:var(--accent-blue-bg);border-color:rgba(9,132,227,.15);color:var(--accent-blue);">
+            <small><i class="bi bi-info-circle me-1"></i>
+                Idempotent upsert: each row finds the existing record by
+                <code>(domain, type, name)</code> and updates it; creates if missing.
+                Required columns: <code>domain,type,name,content</code>.
+                Optional: <code>proxied</code> (true/false), <code>ttl</code> (1=auto).
+                Types supported: <strong>A, AAAA, CNAME, TXT</strong>.
+                Domain rows must already be assigned to this CF key.
+                Cap: 256 KiB body, 5000 rows.
+            </small>
+        </div>
+        <div class="mb-2"><label class="form-label">Paste CSV</label>
+            <textarea name="csv_text" class="form-control" rows="8"
+                      style="font-family:ui-monospace,Consolas,monospace;font-size:.78rem;"
+                      placeholder="domain,type,name,content,proxied,ttl&#10;example.com,A,@,1.2.3.4,true,1&#10;example.com,A,www,1.2.3.4,true,1&#10;example.com,CNAME,blog,medium.com,false,300&#10;example.com,TXT,_dmarc,v=DMARC1; p=none,,3600"></textarea>
+        </div>
+        <div class="mb-2"><label class="form-label">…or upload a .csv file</label>
+            <input type="file" name="csv_file" accept=".csv,text/csv" class="form-control form-control-sm">
+            <small class="text-muted">If both paste + file are given, the paste wins.</small>
+        </div>
+    </div>
+    <div class="modal-footer">
+        <button type="button" class="btn btn-soft" data-bs-dismiss="modal">Cancel</button>
+        <button type="submit" class="btn btn-primary-s"><i class="bi bi-upload me-1"></i>Apply</button>
+    </div>
+    </form>
+</div></div></div>
+
 <!-- Edit CF key modal -->
 <div class="modal fade" id="editCfKeyModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content">
     <div class="modal-header"><h5 class="modal-title">Edit CF Key</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
@@ -229,5 +268,10 @@ document.getElementById('editCfKeyModal')?.addEventListener('show.bs.modal',func
     document.getElementById('editCfKeyForm').action='/api/cf-keys/'+b.dataset.keyId+'/edit';
     document.getElementById('editCfKeyAlias').value=b.dataset.alias;
     document.getElementById('editCfKeyMax').value=b.dataset.max;
+});
+document.getElementById('bulkDnsCsvModal')?.addEventListener('show.bs.modal',function(e){
+    const b=e.relatedTarget;
+    document.getElementById('bulkDnsCsvForm').action='/api/cf-keys/'+b.dataset.keyId+'/bulk-dns-csv';
+    document.getElementById('dnsCsvKeyName').textContent=b.dataset.alias||('key #'+b.dataset.keyId);
 });
 {% endblock %}

@@ -227,6 +227,73 @@ def set_dns_a_record_www(domain, ip, proxied=True):
     return resp.json().get("success", False)
 
 
+VALID_DNS_RECORD_TYPES = ("A", "AAAA", "CNAME", "TXT")
+
+
+def upsert_dns_record(domain, record_type, name, content,
+                      proxied=False, ttl=1):
+    """Idempotent DNS record upsert: find existing by (zone, full_name, type)
+    and PUT-update if found; POST-create otherwise.
+
+    Args:
+      domain: zone name (e.g., 'example.com'). Must already be a CF zone.
+      record_type: one of VALID_DNS_RECORD_TYPES.
+      name: subdomain — '@' or '' or the bare domain == apex; otherwise
+            'sub' resolves to 'sub.{domain}'.
+      content: the record value. For A/AAAA an IP; CNAME a hostname; TXT
+            an arbitrary string.
+      proxied: bool. Only honored for A / AAAA / CNAME (CF rejects it on TXT).
+      ttl: 1 == automatic.
+
+    Returns the record id on success. Raises on CF API failure.
+    """
+    record_type = (record_type or "").strip().upper()
+    if record_type not in VALID_DNS_RECORD_TYPES:
+        raise ValueError(
+            f"record_type must be one of {VALID_DNS_RECORD_TYPES}; "
+            f"got {record_type!r}"
+        )
+    zone_id = _get_zone_id(domain)
+    headers = _headers_for_domain(domain)
+
+    name = (name or "").strip()
+    if name in ("", "@", domain):
+        full_name = domain
+    elif name.endswith("." + domain) or name == domain:
+        full_name = name
+    else:
+        full_name = f"{name}.{domain}"
+
+    body = {
+        "type": record_type,
+        "name": full_name,
+        "content": content,
+        "ttl": int(ttl or 1),
+    }
+    if record_type in ("A", "AAAA", "CNAME"):
+        body["proxied"] = bool(proxied)
+
+    # Find existing — CF allows multiple records with the same (name, type)
+    # for some types, but for the upsert use case we treat the first as the
+    # canonical one. If you need true multi-record support, call CF directly.
+    r = _cf_request("GET", f"{CF_API}/zones/{zone_id}/dns_records",
+                    params={"name": full_name, "type": record_type},
+                    headers=headers, timeout=30)
+    r.raise_for_status()
+    existing = (r.json().get("result") or [])
+
+    if existing:
+        rec_id = existing[0]["id"]
+        r = _cf_request("PUT",
+                        f"{CF_API}/zones/{zone_id}/dns_records/{rec_id}",
+                        json=body, headers=headers, timeout=30)
+    else:
+        r = _cf_request("POST", f"{CF_API}/zones/{zone_id}/dns_records",
+                        json=body, headers=headers, timeout=30)
+    r.raise_for_status()
+    return (r.json().get("result") or {}).get("id")
+
+
 def setup_domain_dns(domain, ip):
     """Initial DNS setup: A records + SSL + HTTPS."""
     try:
