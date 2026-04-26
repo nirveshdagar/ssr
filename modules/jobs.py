@@ -57,7 +57,13 @@ _worker_lock = threading.Lock()
 _worker_id_base = f"pid-{os.getpid()}"
 
 POLL_INTERVAL = 2.0
-DEFAULT_WORKERS = 4
+# Configurable via SSR_JOB_WORKERS env var (set in /etc/ssr.env on prod).
+# Bumping this raises pipeline parallelism but also raises the rate at which
+# this process hits the CF / DO / SA APIs. Tune to your account quotas.
+try:
+    DEFAULT_WORKERS = max(1, int(os.environ.get("SSR_JOB_WORKERS", "4")))
+except ValueError:
+    DEFAULT_WORKERS = 4
 
 
 # ---------------------------------------------------------------------------

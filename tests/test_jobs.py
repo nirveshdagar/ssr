@@ -231,6 +231,46 @@ def test_start_worker_idempotent_with_pool(jobs_module):
         jobs_module.stop_worker(timeout=2.0)
 
 
+def test_default_workers_reads_env_var(monkeypatch):
+    """Audit P2 #8: SSR_JOB_WORKERS must override the hardcoded default."""
+    import importlib
+    monkeypatch.setenv("SSR_JOB_WORKERS", "8")
+    import modules.jobs as _j
+    importlib.reload(_j)
+    try:
+        assert _j.DEFAULT_WORKERS == 8
+    finally:
+        # Restore default state
+        monkeypatch.delenv("SSR_JOB_WORKERS", raising=False)
+        importlib.reload(_j)
+
+
+def test_default_workers_falls_back_on_garbage(monkeypatch):
+    import importlib
+    monkeypatch.setenv("SSR_JOB_WORKERS", "not-a-number")
+    import modules.jobs as _j
+    importlib.reload(_j)
+    try:
+        assert _j.DEFAULT_WORKERS == 4
+    finally:
+        monkeypatch.delenv("SSR_JOB_WORKERS", raising=False)
+        importlib.reload(_j)
+
+
+def test_default_workers_floor_is_one(monkeypatch):
+    import importlib
+    monkeypatch.setenv("SSR_JOB_WORKERS", "0")
+    import modules.jobs as _j
+    importlib.reload(_j)
+    try:
+        # max(1, int) protects against operator typo SSR_JOB_WORKERS=0 which
+        # would otherwise hang the queue with no workers ever claiming jobs.
+        assert _j.DEFAULT_WORKERS == 1
+    finally:
+        monkeypatch.delenv("SSR_JOB_WORKERS", raising=False)
+        importlib.reload(_j)
+
+
 def test_bulk_pipeline_runs_serially_via_single_bulk_job(tmp_db):
     """Audit P1 #4 regression guard: with a multi-worker pool the OLD
     'enqueue N pipeline.full jobs' approach lost the rate-limit-avoidance
