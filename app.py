@@ -2489,6 +2489,36 @@ def logs_page():
                            audit_rows=audit_rows)
 
 
+@app.route("/audit-log")
+@login_required
+def audit_log_page():
+    """Dedicated audit-log viewer with action/search filters + pagination.
+    The data already lived in the DB and was peeked at on /logs; this page
+    surfaces it with proper filtering for incident response and ops review.
+    """
+    from database import search_audit_log, get_audit_log_actions
+    PAGE_SIZE = 50
+    action = (request.args.get("action") or "").strip() or None
+    search = (request.args.get("q") or "").strip() or None
+    try:
+        page = max(1, int(request.args.get("page") or 1))
+    except ValueError:
+        page = 1
+    rows, total = search_audit_log(
+        action=action, search=search,
+        limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE,
+    )
+    actions = get_audit_log_actions()
+    last_page = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    return render_template("audit_log.html",
+                           rows=rows, total=total,
+                           actions=actions,
+                           action_filter=action or "",
+                           search=search or "",
+                           page=page, last_page=last_page,
+                           page_size=PAGE_SIZE)
+
+
 @app.route("/watcher")
 @login_required
 def watcher_page():

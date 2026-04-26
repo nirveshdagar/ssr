@@ -409,10 +409,58 @@ def audit(action: str, target: str = "", detail: str = "",
 
 
 def get_audit_log(limit: int = 200) -> list:
+    """Most-recent N rows from audit_log (back-compat). For filtering /
+    pagination use search_audit_log."""
     conn = get_db()
     try:
         rows = conn.execute(
             "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def search_audit_log(action=None, search=None, limit=50, offset=0):
+    """Filtered + paginated audit_log query. Returns (rows, total).
+
+    action: exact-match on action column ('login_ok', 'pipeline_run_from', ...)
+    search: substring match across target / detail / actor_ip
+    """
+    where, args = [], []
+    if action:
+        where.append("action = ?"); args.append(action)
+    if search:
+        where.append("(target LIKE ? OR detail LIKE ? OR actor_ip LIKE ?)")
+        like = f"%{search}%"
+        args.extend([like, like, like])
+    where_clause = (" WHERE " + " AND ".join(where)) if where else ""
+
+    conn = get_db()
+    try:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM audit_log{where_clause}", args
+        ).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT * FROM audit_log{where_clause} "
+            f"ORDER BY id DESC LIMIT ? OFFSET ?",
+            (*args, limit, offset)
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows], total
+
+
+def get_audit_log_actions():
+    """Distinct action names sorted by frequency desc — used for the filter
+    dropdown so operators see what's actually been logged."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT action, COUNT(*) AS n
+                 FROM audit_log
+                GROUP BY action
+                ORDER BY n DESC, action ASC"""
         ).fetchall()
     finally:
         conn.close()
