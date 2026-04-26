@@ -40,12 +40,7 @@
                 <td><strong>{{ k.alias or '—' }}</strong></td>
                 <td><code style="font-size:.78rem;">{{ k.email }}</code></td>
                 <td>
-                    <span class="cfkey-mask" data-full="{{ k.api_key }}">
-                        <code style="font-size:.78rem;">{{ k.api_key[:6] }}…{{ k.api_key[-4:] }}</code>
-                    </span>
-                    <button class="btn btn-soft btn-sm cfkey-reveal-btn" title="Reveal / copy">
-                        <i class="bi bi-eye"></i>
-                    </button>
+                    <code style="font-size:.78rem;" title="Full key never leaves the database">{{ k.key_preview }}</code>
                 </td>
                 <td><code style="font-size:.72rem;">{{ k.cf_account_id[:10] }}…</code></td>
                 <td>
@@ -123,22 +118,6 @@
 {% endblock %}
 
 {% block extra_js %}
-document.querySelectorAll('.cfkey-reveal-btn').forEach(btn=>{
-    btn.addEventListener('click',function(){
-        const span=this.previousElementSibling;
-        const full=span.dataset.full;
-        if(!span.dataset.shown){
-            span.innerHTML='<code style="font-size:.78rem;">'+full+'</code>';
-            span.dataset.shown='1';
-            this.querySelector('i').className='bi bi-eye-slash';
-            navigator.clipboard?.writeText(full).catch(()=>{});
-        }else{
-            span.innerHTML='<code style="font-size:.78rem;">'+full.slice(0,6)+'…'+full.slice(-4)+'</code>';
-            delete span.dataset.shown;
-            this.querySelector('i').className='bi bi-eye';
-        }
-    });
-});
 document.getElementById('editCfKeyModal')?.addEventListener('show.bs.modal',function(e){
     const b=e.relatedTarget;
     document.getElementById('editCfKeyForm').action='/api/cf-keys/'+b.dataset.keyId+'/edit';

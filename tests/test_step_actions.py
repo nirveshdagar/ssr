@@ -139,3 +139,50 @@ def test_override_field_status_column_works(client, tmp_db):
                  headers={"Origin": "http://localhost"})
     d = get_domain("ov4.com")
     assert d["status"] == "owned"
+
+
+def test_override_field_rejects_oversize_value(client, tmp_db):
+    """A 2 MiB site_html paste exceeds the 1 MiB cap and should be rejected
+    with nothing written. Regression guard for the size-cap fix."""
+    from database import add_domain, get_domain
+    add_domain("big.com")
+    huge = "x" * (2 * 1024 * 1024)  # 2 MiB
+    client.post("/api/domains/big.com/override-field",
+                 data={"field": "site_html", "value": huge},
+                 headers={"Origin": "http://localhost"})
+    d = get_domain("big.com")
+    # Nothing should have been written — site_html stays None/empty.
+    assert not (d["site_html"] or "")
+
+
+def test_override_field_rejects_oversize_status_value(client, tmp_db):
+    """status has a tight 64-byte cap; verify it rejects."""
+    from database import add_domain, get_domain
+    add_domain("bigstat.com")
+    over = "z" * 65
+    client.post("/api/domains/bigstat.com/override-field",
+                 data={"field": "status", "value": over},
+                 headers={"Origin": "http://localhost"})
+    d = get_domain("bigstat.com")
+    # Default status is 'pending' — assert the over-cap value didn't land.
+    assert d["status"] != over
+
+
+def test_override_field_audit_records_old_and_new_lens(client, tmp_db):
+    from database import add_domain, get_audit_log
+    add_domain("auditme.com")
+    # First override sets value
+    client.post("/api/domains/auditme.com/override-field",
+                 data={"field": "site_html", "value": "abcd"},
+                 headers={"Origin": "http://localhost"})
+    # Second override replaces it
+    client.post("/api/domains/auditme.com/override-field",
+                 data={"field": "site_html", "value": "abcdefgh"},
+                 headers={"Origin": "http://localhost"})
+    rows = get_audit_log(20)
+    overrides = [r for r in rows if r["action"] == "domain_override"]
+    assert len(overrides) >= 2
+    # Most recent first (get_audit_log orders DESC)
+    second = overrides[0]["detail"]
+    assert "old_len=4" in second
+    assert "new_len=8" in second

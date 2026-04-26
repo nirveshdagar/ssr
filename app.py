@@ -569,12 +569,12 @@ def api_cf_keys_toggle(key_id):
 def cloudflare_page():
     """Dedicated CF management page: list pool keys, add new, edit alias /
     max_domains / is_active, delete unreferenced keys, refresh account IDs.
-    Lifted out of /settings so the CF concerns aren't buried under 30 other
-    settings panels.
 
-    list_cf_keys() omits api_key for security; this route augments each row
-    with its api_key so the page can show a (mask + reveal) for verification.
-    The page is auth-gated like everything else.
+    SECURITY: full api_key values NEVER leave the DB on this page render.
+    We compute a 'first 6 + last 4' preview in SQL so the response bytes
+    contain only the masked version. If you need to copy-paste the original
+    key into another tool, re-add it from the source (CF dashboard) — that
+    flow is one-time and intentional.
     """
     from modules.cf_key_pool import list_cf_keys
     from database import get_db
@@ -582,13 +582,16 @@ def cloudflare_page():
     if cf_keys:
         conn = get_db()
         try:
-            api_keys = {r["id"]: r["api_key"] for r in conn.execute(
-                "SELECT id, api_key FROM cf_keys"
+            previews = {r["id"]: r["preview"] for r in conn.execute(
+                """SELECT id,
+                          substr(api_key, 1, 6) || '...' ||
+                          substr(api_key, length(api_key) - 3) AS preview
+                     FROM cf_keys"""
             ).fetchall()}
         finally:
             conn.close()
         for k in cf_keys:
-            k["api_key"] = api_keys.get(k["id"], "")
+            k["key_preview"] = previews.get(k["id"], "")
     return render_template("cloudflare.html", cf_keys=cf_keys)
 
 
@@ -1133,17 +1136,22 @@ def api_run_from_step(domain, step_num):
 
 
 # Whitelist of domain columns that operators can override via the step
-# console. Anything not here is rejected — prevents accidental writes to
-# server_id (would mis-route subsequent runs), cf_key_id (would corrupt
-# the slot accounting), audit IDs, etc.
+# console, plus per-field byte caps. Anything not in this dict is rejected
+# — prevents accidental writes to server_id (would mis-route subsequent
+# runs), cf_key_id (would corrupt slot accounting), audit IDs, etc.
+#
+# Caps prevent a single bad paste from bloating sqlite + stalling writes.
+# 1 MiB for HTML/PHP, 16 KiB for cert/key PEMs, 1 KiB for everything else.
 _OVERRIDABLE_DOMAIN_COLS = {
-    "site_html",         # step 9 output: paste your own PHP
-    "status",            # any step: nudge the state machine
-    "cf_zone_id",        # step 3 output: bring-your-own zone
-    "cf_nameservers",    # step 3 output: brought-your-own NS
-    "cf_email", "cf_global_key",  # step 2 manual override
-    "current_proxy_ip",  # step 7 output
-    "origin_cert_pem", "origin_key_pem",  # step 8 BYO cert
+    "site_html":         1 * 1024 * 1024,    # step 9 output: paste your own PHP
+    "status":            64,                 # any step: nudge the state machine
+    "cf_zone_id":        128,                # step 3 output: bring-your-own zone
+    "cf_nameservers":    1024,               # step 3 output: brought-your-own NS
+    "cf_email":          255,                # step 2 manual override
+    "cf_global_key":     1024,               # step 2 manual override
+    "current_proxy_ip":  64,                 # step 7 output
+    "origin_cert_pem":   16 * 1024,          # step 8 BYO cert (typical PEM ~2KB)
+    "origin_key_pem":    16 * 1024,          # step 8 BYO key
 }
 
 
@@ -1162,11 +1170,23 @@ def api_override_field(domain):
               + ", ".join(sorted(_OVERRIDABLE_DOMAIN_COLS)),
               "danger")
         return redirect(url_for("domains_page"))
+    cap = _OVERRIDABLE_DOMAIN_COLS[field]
+    if len(value.encode("utf-8")) > cap:
+        flash(
+            f"Value too large for {field}: "
+            f"{len(value.encode('utf-8'))} bytes > {cap}-byte cap. "
+            "Nothing was written.",
+            "danger",
+        )
+        return redirect(url_for("domains_page"))
+    prev = get_domain(domain)
+    prev_len = len((prev[field] if prev and field in prev.keys() else "") or "")
     update_domain(domain, **{field: value})
     audit("domain_override",
           target=domain, actor_ip=request.remote_addr or "",
-          detail=f"field={field} value_len={len(value)}")
-    flash(f"Override saved: {domain}.{field} ({len(value)} chars)", "success")
+          detail=f"field={field} old_len={prev_len} new_len={len(value)}")
+    flash(f"Override saved: {domain}.{field} "
+          f"(prev={prev_len} chars, new={len(value)} chars)", "success")
     return redirect(url_for("domains_page"))
 
 

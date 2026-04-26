@@ -41,15 +41,39 @@ def test_cloudflare_page_renders_keys(client, tmp_db):
     conn.close()
     r = client.get("/cloudflare")
     assert r.status_code == 200
-    # Alias is visible
+    # Alias + email visible
     assert b"CF1" in r.data
-    # Email is visible
     assert b"a@b.c" in r.data
-    # Key is masked by default (first 6 + last 4)
-    assert b"KEYABC" in r.data
-    assert b"1234" in r.data
     # Used / max numbers shown
     assert b"5/20" in r.data
+    # Masked preview shown
+    assert b"KEYABC" in r.data
+    assert b"1234" in r.data
+
+
+def test_cloudflare_page_does_not_leak_full_api_key(client, tmp_db):
+    """SECURITY: full api_key must never appear in the HTML response.
+    Regression guard for the data-full attribute leak.
+    """
+    from database import get_db
+    full_key = "VERYLONGSECRETKEYTHATSHOULDNEVERAPPEAR1234567890"
+    conn = get_db()
+    conn.execute(
+        """INSERT INTO cf_keys (email, api_key, cf_account_id, alias, is_active)
+           VALUES ('x@y.z', ?, 'acct', 'sec', 1)""",
+        (full_key,)
+    )
+    conn.commit()
+    conn.close()
+
+    r = client.get("/cloudflare")
+    assert r.status_code == 200
+    # The middle of the key (skipping mask edges) must not appear anywhere.
+    middle = full_key[8:-6]
+    assert middle.encode() not in r.data, \
+        "full CF api_key leaked into the rendered HTML"
+    # data-full attribute also forbidden — defends against future regressions.
+    assert b"data-full" not in r.data
 
 
 def test_cf_key_edit_updates_alias_and_max(client, tmp_db):
