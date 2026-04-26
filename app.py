@@ -876,6 +876,11 @@ def api_add_domains():
 @app.route("/api/domains/<domain>/delete", methods=["POST"])
 @login_required
 def api_delete_domain(domain):
+    from modules.cf_key_pool import release_cf_key_slot
+    # Release the CF key slot BEFORE deleting the domain row — release_cf_key_slot
+    # reads cf_key_id from the domains row, so once the row is gone the slot
+    # leaks and cf_keys.domains_used drifts up forever.
+    release_cf_key_slot(domain)
     delete_domain(domain)
     flash(f"Deleted {domain} from dashboard", "info")
     return redirect(url_for("domains_page"))
@@ -907,7 +912,9 @@ def api_bulk_delete():
         return redirect(url_for("domains_page"))
 
     if delete_from == "db_only":
+        from modules.cf_key_pool import release_cf_key_slot
         for domain in domains_list:
+            release_cf_key_slot(domain)
             delete_domain(domain)
         flash(f"Deleted {len(domains_list)} domain(s) from dashboard", "info")
     else:
