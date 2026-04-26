@@ -1524,25 +1524,29 @@ def api_domains_sync_from_sa():
         conn.close()
 
     # Build the set of (db_server_id, domain_name) pairs that exist on SA.
+    # If a single server's API call fails (rate limit, network blip, stale
+    # sa_server_id), keep going with the others — one bad server should NOT
+    # block cleanup for the rest of the fleet. Only domains whose server
+    # was successfully queried are eligible for orphan removal; domains
+    # on failed servers are intentionally skipped (we can't tell whether
+    # their SA app exists or not, so leaving them alone is the safe default).
     live_pairs = set()
+    queried_server_ids = set()
     failed_servers = []
     for db_id, sa_id in server_ids_to_check:
         try:
             apps = serveravatar.list_applications(sa_id)
+            queried_server_ids.add(db_id)
             for a in apps:
                 name = (a.get("name") or a.get("primary_domain") or "").lower().strip()
                 if name:
                     live_pairs.add((db_id, name))
         except Exception as e:
-            failed_servers.append(f"sa_id={sa_id}: {e}")
-
-    if failed_servers:
-        flash("SA list failed for: " + "; ".join(failed_servers[:3]),
-              "warning")
-        return redirect(url_for("domains_page"))
+            failed_servers.append(f"sa_id={sa_id}: {type(e).__name__}: {e}")
 
     conn = get_db()
     removed = []
+    skipped_unqueryable = []
     try:
         rows = conn.execute(
             f"SELECT domain, server_id, status FROM domains "
@@ -1551,6 +1555,12 @@ def api_domains_sync_from_sa():
             HOSTED_STATES
         ).fetchall()
         for r in rows:
+            if r["server_id"] not in queried_server_ids:
+                # We couldn't query this server's SA app list, so we don't
+                # know whether the domain still has an app or not. Skip
+                # rather than risk false-positive removal.
+                skipped_unqueryable.append(r["domain"])
+                continue
             pair = (r["server_id"], r["domain"].lower())
             if pair in live_pairs:
                 continue
@@ -1565,13 +1575,24 @@ def api_domains_sync_from_sa():
 
     audit("domains_sync_from_sa",
           actor_ip=request.remote_addr or "",
-          detail=f"removed={len(removed)}")
-    flash(
-        f"Sync done — removed {len(removed)} domain(s) no longer on SA "
-        + (f"({', '.join(removed[:3])}{'...' if len(removed) > 3 else ''})"
-           if removed else ""),
-        "info",
-    )
+          detail=(f"removed={len(removed)} "
+                   f"skipped_unqueryable={len(skipped_unqueryable)} "
+                   f"failed_servers={len(failed_servers)}"))
+    parts = [f"Sync done — removed {len(removed)} domain(s) no longer on SA"]
+    if removed:
+        parts.append(
+            f"({', '.join(removed[:3])}{'...' if len(removed) > 3 else ''})"
+        )
+    if skipped_unqueryable:
+        parts.append(
+            f"; skipped {len(skipped_unqueryable)} on unreachable servers"
+        )
+    if failed_servers:
+        parts.append(
+            f"; SA list failed for: {'; '.join(failed_servers[:3])}"
+        )
+    flash(" ".join(parts),
+          "warning" if (failed_servers or skipped_unqueryable) else "info")
     return redirect(url_for("domains_page"))
 
 

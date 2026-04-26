@@ -172,6 +172,54 @@ def test_sync_from_sa_skips_pre_hosted_states(client, tmp_db, monkeypatch):
     assert n == 1
 
 
+def test_sync_from_sa_continues_when_one_server_fails(client, tmp_db, monkeypatch):
+    """Audit P1 #6 regression: one SA server raising an exception used to
+    abort the entire sync. Now: continue processing other servers, skip
+    domains on the broken server, still remove orphans on working servers.
+    """
+    from database import get_db, add_domain
+    conn = get_db()
+    cur = conn.execute(
+        "INSERT INTO servers (name, ip, sa_server_id, status) VALUES ('broken', '7.7.7.7', 'sa-broken', 'ready')"
+    )
+    broken_id = cur.lastrowid
+    cur = conn.execute(
+        "INSERT INTO servers (name, ip, sa_server_id, status) VALUES ('ok', '8.8.8.8', 'sa-ok', 'ready')"
+    )
+    ok_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    add_domain("on-broken.com")
+    add_domain("alive-on-ok.com")
+    add_domain("orphan-on-ok.com")
+    conn = get_db()
+    conn.execute("UPDATE domains SET server_id=?, status='live' WHERE domain='on-broken.com'", (broken_id,))
+    conn.execute("UPDATE domains SET server_id=?, status='live' WHERE domain='alive-on-ok.com'", (ok_id,))
+    conn.execute("UPDATE domains SET server_id=?, status='live' WHERE domain='orphan-on-ok.com'", (ok_id,))
+    conn.commit()
+    conn.close()
+
+    from modules import serveravatar
+    def fake_list(sa_id):
+        if sa_id == "sa-broken":
+            raise RuntimeError("SA timeout")
+        # sa-ok has only alive-on-ok.com; orphan-on-ok.com is gone
+        return [{"name": "alive-on-ok.com"}]
+    monkeypatch.setattr(serveravatar, "list_applications", fake_list)
+
+    client.post("/api/domains/sync-from-sa",
+                 headers={"Origin": "http://localhost"})
+
+    conn = get_db()
+    domains = sorted(r["domain"] for r in conn.execute("SELECT domain FROM domains"))
+    conn.close()
+    # on-broken.com: server unreachable -> kept (safe default)
+    # alive-on-ok.com: still on SA -> kept
+    # orphan-on-ok.com: SA didn't return it -> removed
+    assert domains == ["alive-on-ok.com", "on-broken.com"]
+
+
 def test_sync_from_sa_releases_cf_slot_on_orphan(client, tmp_db, monkeypatch):
     """Same regression-guard as soft-delete: removed domains must release
     their CF key slot."""
