@@ -115,9 +115,8 @@
         <!-- Run Pipeline -->
         <form action="/api/domains/run-bulk" method="POST" id="bulkForm" class="mb-3">
             <div class="row g-2 align-items-end">
-                <div class="col-auto"><div><div class="form-check form-check-inline"><input type="checkbox" class="form-check-input" name="skip_purchase" id="bS"><label class="form-check-label" for="bS" style="font-size:.82rem;">Skip purchase</label></div><div class="form-check form-check-inline"><input type="checkbox" class="form-check-input" name="skip_cf" id="bC"><label class="form-check-label" for="bC" style="font-size:.82rem;">Skip CF</label></div></div></div>
+                <div class="col-auto"><div class="form-check form-check-inline"><input type="checkbox" class="form-check-input" name="skip_purchase" id="bS"><label class="form-check-label" for="bS" style="font-size:.82rem;">Skip purchase</label></div></div>
                 <div class="col-auto"><select name="server_id" class="form-select form-select-sm"><option value="">Auto server</option>{% for s in servers %}<option value="{{ s.id }}">{{ s.name }} ({{ s.ip }})</option>{% endfor %}</select></div>
-                <div class="col-auto"><input type="text" name="niche" class="form-control form-control-sm" value="general" placeholder="Niche"></div>
                 <div class="col-auto"><button type="submit" class="btn btn-primary-s btn-primary-sm"><i class="bi bi-play-fill me-1"></i>Run Pipeline</button></div>
             </div>
         </form>
@@ -181,10 +180,9 @@
     <div class="modal-header"><h5 class="modal-title">Run Pipeline — <span id="pipeDomain" style="color:var(--primary);"></span></h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
     <form id="pipelineForm" method="POST"><div class="modal-body">
         <div class="alert alert-info py-2 mb-3" style="background:var(--accent-blue-bg);border-color:rgba(9,132,227,.15);color:var(--accent-blue);"><small><i class="bi bi-info-circle me-1"></i><strong>Smart Resume</strong> — auto-detects completed steps.</small></div>
-        <div class="mb-3"><label class="form-label">Skip</label><div class="form-check"><input type="checkbox" class="form-check-input" name="skip_purchase" id="sP"><label class="form-check-label" for="sP">Skip purchase</label></div><div class="form-check"><input type="checkbox" class="form-check-input" name="skip_cf" id="sC"><label class="form-check-label" for="sC">Skip CF signup</label></div></div>
+        <div class="mb-3"><label class="form-label">Skip</label><div class="form-check"><input type="checkbox" class="form-check-input" name="skip_purchase" id="sP"><label class="form-check-label" for="sP">Skip purchase</label></div></div>
         <div class="mb-3"><label class="form-label">Start From</label><select name="start_from" class="form-select"><option value="">Auto-detect</option><option value="1">1 — Buy / Detect Domain</option><option value="2">2 — Assign CF Key</option><option value="3">3 — Create CF Zone</option><option value="4">4 — Set Nameservers</option><option value="5">5 — Wait for Zone Active</option><option value="6">6 — Pick / Provision Server</option><option value="7">7 — Create SA Site</option><option value="8">8 — Issue & Install Origin SSL</option><option value="9">9 — Generate Site Content</option><option value="10">10 — Upload index.php</option></select></div>
         <div class="mb-3"><label class="form-label">Server</label><select name="server_id" class="form-select"><option value="">Auto</option>{% for s in servers %}<option value="{{ s.id }}">{{ s.name }} ({{ s.ip }})</option>{% endfor %}</select></div>
-        <div class="mb-3"><label class="form-label">Niche</label><input type="text" name="niche" class="form-control" value="general"></div>
     </div><div class="modal-footer"><button type="button" class="btn btn-soft" data-bs-dismiss="modal">Cancel</button><button type="submit" class="btn btn-primary-s"><i class="bi bi-play-fill me-1"></i>Start</button></div></form>
 </div></div></div>
 

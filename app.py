@@ -1027,14 +1027,12 @@ def api_cancel_pipeline(domain):
 @login_required
 def api_run_pipeline(domain):
     skip_purchase = request.form.get("skip_purchase") == "on"
-    skip_cf = request.form.get("skip_cf") == "on"
     server_id = request.form.get("server_id")
-    niche = request.form.get("niche", "general")
     start_from = request.form.get("start_from")
     server_id = int(server_id) if server_id else None
     start_from = int(start_from) if start_from else None
-    thread = run_full_pipeline(domain, skip_purchase=skip_purchase, skip_cf=skip_cf,
-                               server_id=server_id, niche=niche, start_from=start_from)
+    thread = run_full_pipeline(domain, skip_purchase=skip_purchase,
+                               server_id=server_id, start_from=start_from)
     if thread is None:
         flash(f"Pipeline for {domain} already running — request ignored", "warning")
     else:
@@ -1047,9 +1045,7 @@ def api_run_pipeline(domain):
 def api_run_bulk():
     domain_ids = request.form.getlist("domain_ids")
     skip_purchase = request.form.get("skip_purchase") == "on"
-    skip_cf = request.form.get("skip_cf") == "on"
     server_id = request.form.get("server_id")
-    niche = request.form.get("niche", "general")
     server_id = int(server_id) if server_id else None
 
     domains_list = []
@@ -1059,7 +1055,7 @@ def api_run_bulk():
 
     if domains_list:
         run_bulk_pipeline(domains_list, skip_purchase=skip_purchase,
-                          skip_cf=skip_cf, server_id=server_id, niche=niche)
+                          server_id=server_id)
         flash(f"Bulk pipeline started for {len(domains_list)} domains", "success")
     return redirect(url_for("domains_page"))
 

@@ -96,12 +96,9 @@ class PipelineCanceled(Exception):
 
 
 def run_full_pipeline(domain, skip_purchase=False, server_id=None,
-                      start_from=None, **_legacy_kwargs):
+                      start_from=None):
     """Kick off the full pipeline in a daemon thread; returns the thread or
     `None` if a pipeline for this domain is already running.
-
-    **_legacy_kwargs silently accepts old v1 params (skip_cf, niche) so existing
-    dashboard calls keep working after the v2 rewrite.
     """
     if not _try_acquire_slot(domain):
         log_pipeline(domain, "pipeline", "warning",
@@ -116,7 +113,7 @@ def run_full_pipeline(domain, skip_purchase=False, server_id=None,
     return thread
 
 
-def run_bulk_pipeline(domains, skip_purchase=False, server_id=None, **_legacy_kwargs):
+def run_bulk_pipeline(domains, skip_purchase=False, server_id=None):
     """Run pipeline for multiple domains sequentially (avoids rate limits)."""
     thread = threading.Thread(
         target=_bulk_worker,
