@@ -195,6 +195,11 @@ def _pipeline_worker(domain, skip_purchase, server_id, start_from):
         with HeartbeatTicker(domain, interval=1.0):
             _pipeline_worker_impl(domain, skip_purchase, server_id, start_from)
     finally:
+        # Always clear the cancel flag on exit so a late-arriving cancel
+        # (set after the last _check_cancel boundary) can't sticky into the
+        # next run and self-cancel it at step 1.
+        try: update_domain(domain, cancel_requested=0)
+        except Exception: pass
         _release_slot(domain)
 
 
