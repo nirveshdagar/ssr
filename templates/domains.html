@@ -251,10 +251,29 @@ document.getElementById('historyModal')?.addEventListener('show.bs.modal',async 
             btn.addEventListener('click',async function(ev){
                 ev.stopPropagation();  // don't open the run detail
                 const dn=this.dataset.domain;
-                if(!confirm('Cancel running pipeline for '+dn+'? Will stop at the next step boundary.'))return;
+                if(!confirm('Cancel running pipeline for '+dn+'? Cancel is GRACEFUL — the worker checks the cancel flag at each step boundary, so a long step (e.g., the 5-15min SA agent install during step 6) finishes before the cancel takes effect.'))return;
+                // Disable the button immediately so a frustrated operator
+                // doesn't double-click while waiting for the boundary check.
+                this.disabled=true;
+                this.innerHTML='<i class="bi bi-hourglass-split"></i> Cancel pending...';
                 const fd=new FormData();
                 const r=await fetch('/api/domains/'+encodeURIComponent(dn)+'/cancel-pipeline',{method:'POST',body:fd,headers:{'Origin':window.location.origin}});
-                if(r.ok||r.redirected)window.location.reload();
+                if(!(r.ok||r.redirected)){
+                    this.disabled=false;
+                    this.innerHTML='<i class="bi bi-stop-fill"></i> Stop';
+                    alert('Cancel request failed — try again.');
+                    return;
+                }
+                // Show inline confirmation in the run row instead of reloading
+                // — full-page reload looks like nothing happened (status still
+                // 'running' until the worker observes the flag).
+                const row=this.closest('.hist-row');
+                if(row){
+                    const banner=document.createElement('div');
+                    banner.style.cssText='font-size:.75rem;color:#d97706;margin-top:.25rem;';
+                    banner.innerHTML='<i class="bi bi-info-circle me-1"></i>Cancel requested. The run will stop at the next step boundary (could take a few minutes for long steps). Refresh the modal to see the updated status.';
+                    row.appendChild(banner);
+                }
             });
         });
         list.querySelectorAll('.hist-row').forEach(row=>{
