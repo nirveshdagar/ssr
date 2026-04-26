@@ -448,7 +448,8 @@ _DOMAIN_COLS = {"status", "cf_email", "cf_global_key", "cf_zone_id", "cf_nameser
                 "cf_a_record_id", "cf_www_record_id",
                 "origin_cert_pem", "origin_key_pem", "content_archive_path",
                 "cancel_requested"}
-_SERVER_COLS = {"name", "ip", "do_droplet_id", "sa_server_id", "sa_org_id", "status"}
+_SERVER_COLS = {"name", "ip", "do_droplet_id", "sa_server_id", "sa_org_id",
+                "status", "max_sites"}
 _PROXY_COLS = {"label", "status", "main_server_ip", "use_count", "last_used"}
 
 

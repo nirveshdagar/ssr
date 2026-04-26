@@ -1719,6 +1719,52 @@ def api_add_existing_server():
     return redirect(url_for("servers_page"))
 
 
+@app.route("/api/servers/<int:server_id>/edit", methods=["POST"])
+@login_required
+def api_edit_server(server_id):
+    """Edit a server's mutable settings: display name + max_sites cap.
+
+    max_sites is the per-server ceiling that step 6 (_find_server) checks
+    against the live sites_count when picking a server for a new domain.
+    Operators set this to spread load — e.g., 30 domains/server when each
+    site is heavy, 100 when they're static. ServerAvatar's apparent ceiling
+    is around 200 apps per server in our experience; we cap at 500 to give
+    headroom without letting a typo create absurd values.
+    """
+    from database import get_db
+
+    name = (request.form.get("name") or "").strip()
+    try:
+        max_sites = int(request.form.get("max_sites") or 0)
+    except ValueError:
+        flash("max_sites must be an integer", "warning")
+        return redirect(url_for("servers_page"))
+
+    if not (1 <= len(name) <= 64):
+        flash("name must be 1-64 characters", "warning")
+        return redirect(url_for("servers_page"))
+    if not (1 <= max_sites <= 500):
+        flash("max_sites must be between 1 and 500", "warning")
+        return redirect(url_for("servers_page"))
+
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT name FROM servers WHERE id=?", (server_id,)).fetchone()
+        if not row:
+            flash("Server not found", "warning")
+            return redirect(url_for("servers_page"))
+    finally:
+        conn.close()
+
+    update_server(server_id, name=name, max_sites=max_sites)
+    audit("server_edit", target=str(server_id),
+          actor_ip=request.remote_addr or "",
+          detail=f"name={name!r} max_sites={max_sites}")
+    flash(f"Server #{server_id} updated (name={name}, max_sites={max_sites})",
+          "success")
+    return redirect(url_for("servers_page"))
+
+
 @app.route("/api/servers/<int:server_id>/db-delete", methods=["POST"])
 @login_required
 def api_db_delete_server(server_id):

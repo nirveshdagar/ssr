@@ -83,6 +83,14 @@
                         </button>
                     </form>
                     {% endif %}
+                    <button class="btn btn-soft btn-soft-info btn-sm edit-server-btn"
+                            data-bs-toggle="modal" data-bs-target="#editServerModal"
+                            data-server-id="{{ s.id }}"
+                            data-name="{{ s.name }}"
+                            data-max="{{ s.max_sites or 60 }}"
+                            title="Edit name + max_sites (how many domains can host here)">
+                        <i class="bi bi-pencil"></i>
+                    </button>
                     <form action="/api/servers/{{ s.id }}/db-delete" method="POST" class="m-0"
                           onsubmit="return confirm('Remove {{ s.name }} from dashboard ONLY? The DO droplet + SA record will keep running.');">
                         <button type="submit" class="btn btn-soft btn-soft-warning btn-sm"
@@ -225,6 +233,38 @@
     </div>
     </form>
 </div></div></div>
+
+<!-- Edit-server modal: rename + adjust max_sites cap -->
+<div class="modal fade" id="editServerModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content">
+    <div class="modal-header"><h5 class="modal-title">Edit Server</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+    <form id="editServerForm" method="POST"><div class="modal-body">
+        <div class="mb-3"><label class="form-label">Name</label><input type="text" id="esName" name="name" class="form-control" maxlength="64" required></div>
+        <div class="mb-3">
+            <label class="form-label">Max sites</label>
+            <input type="number" id="esMax" name="max_sites" class="form-control" min="1" max="500" required>
+            <small class="text-muted">How many domains can be hosted on this server. Step 6 won't pick this server for new pipelines once <code>sites_count &gt;= max_sites</code>. Default 60. Range 1-500.</small>
+        </div>
+    </div>
+    <div class="modal-footer">
+        <button type="button" class="btn btn-soft" data-bs-dismiss="modal">Cancel</button>
+        <button type="submit" class="btn btn-primary-s">Save</button>
+    </div>
+    </form>
+</div></div></div>
+
+<script>
+// Edit-server modal wiring: pre-fill the form with the row's current values
+(function () {
+    const modal = document.getElementById("editServerModal");
+    if (!modal) return;
+    modal.addEventListener("show.bs.modal", (e) => {
+        const b = e.relatedTarget;
+        document.getElementById("editServerForm").action = "/api/servers/" + b.dataset.serverId + "/edit";
+        document.getElementById("esName").value = b.dataset.name || "";
+        document.getElementById("esMax").value = b.dataset.max || "60";
+    });
+})();
+</script>
 
 <script>
 // Migrate-server modal wiring: pre-fill source + hide self-option in target dropdown
