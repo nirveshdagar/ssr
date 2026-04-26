@@ -211,9 +211,12 @@ def _pipeline_worker(domain, skip_purchase, server_id, start_from):
             _pipeline_worker_impl(domain, skip_purchase, server_id, start_from)
     finally:
         # Determine final run outcome from the post-impl domain status.
-        # _pipeline_worker_impl handles its own exceptions and writes the
-        # outcome to domain.status: 'canceled' for explicit cancel,
-        # 'error'/'content_blocked' for failures, anything else for success.
+        # Uses an EXPLICIT allowlist for each outcome — any unrecognized
+        # status falls through to 'failed-implicit'. This catches the
+        # case where a step failure path forgets to set status=*_error
+        # (e.g., step 4 had three return-False paths that left the row
+        # at status='zone_created' from step 3, and the wrapper used to
+        # mark those as 'completed').
         try:
             d = _get_domain(domain)
             ds = d["status"] if d else None
@@ -222,8 +225,18 @@ def _pipeline_worker(domain, skip_purchase, server_id, start_from):
             elif ds in ("error", "retryable_error", "terminal_error",
                          "content_blocked", "cf_pool_full"):
                 end_pipeline_run(run_id, "failed", error=ds)
-            else:
+            elif ds in ("ns_pending_external", "manual_action_required",
+                         "waiting_dns"):
+                end_pipeline_run(run_id, "waiting", error=ds)
+            elif ds in ("hosted", "live", "ssl_installed"):
                 end_pipeline_run(run_id, "completed")
+            else:
+                # Pipeline exited at an intermediate state (e.g.,
+                # zone_created, app_created). A step quit early without
+                # setting a final status. Treat as failed so the audit
+                # trail doesn't lie about what actually happened.
+                end_pipeline_run(run_id, "failed",
+                                  error=f"incomplete: exited at status={ds!r}")
         except Exception: pass
         # Always clear the cancel flag on exit so a late-arriving cancel
         # (set after the last _check_cancel boundary) can't sticky into the
@@ -499,6 +512,7 @@ def _step4_set_nameservers(domain):
     d = get_domain(domain)
     if not d or not d["cf_nameservers"]:
         update_step(domain, 4, "failed", "No cf_nameservers set on domain row")
+        update_domain(domain, status="retryable_error")
         return False
     nameservers = [n.strip() for n in d["cf_nameservers"].split(",") if n.strip()]
 
@@ -515,12 +529,14 @@ def _step4_set_nameservers(domain):
         ok = spaceship.set_nameservers(domain, nameservers)
         if not ok:
             update_step(domain, 4, "failed", "Spaceship set_nameservers returned false")
+            update_domain(domain, status="retryable_error")
             return False
         update_step(domain, 4, "completed", f"NS updated: {', '.join(nameservers)}")
         update_domain(domain, status="ns_set")
         return True
     except Exception as e:
         update_step(domain, 4, "failed", str(e)[:400])
+        update_domain(domain, status="retryable_error")
         return False
 
 

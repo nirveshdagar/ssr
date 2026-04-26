@@ -238,6 +238,58 @@ def test_set_step_artifact_only_targets_running_step(tmp_db):
     assert runs[0]["artifact_json"] is None
 
 
+# ---------------------------------------------------------------------------
+# Worker-wrapper outcome classification (regression for step-4-fail bug)
+# ---------------------------------------------------------------------------
+
+def _drive_worker_with_status(monkeypatch, domain, exit_status):
+    """Helper: run _pipeline_worker with a stub impl that sets domain.status
+    to `exit_status` then returns. Returns the resulting pipeline_runs row."""
+    from database import (
+        add_domain, update_domain, get_domain, list_pipeline_runs,
+    )
+    from modules import pipeline as pl
+    add_domain(domain)
+
+    def fake_impl(d, *_a, **_kw):
+        update_domain(d, status=exit_status)
+    monkeypatch.setattr(pl, "_pipeline_worker_impl", fake_impl)
+    # Acquire slot so _release_slot in finally has something to release.
+    pl._try_acquire_slot(domain)
+    pl._pipeline_worker(domain, False, None, None)
+    runs = list_pipeline_runs(domain)
+    return runs[0]
+
+
+@pytest.mark.parametrize("exit_status,expected_run_status", [
+    ("hosted", "completed"),
+    ("live", "completed"),
+    ("ssl_installed", "completed"),
+    ("canceled", "canceled"),
+    ("error", "failed"),
+    ("retryable_error", "failed"),
+    ("terminal_error", "failed"),
+    ("content_blocked", "failed"),
+    ("cf_pool_full", "failed"),
+    ("ns_pending_external", "waiting"),
+    ("manual_action_required", "waiting"),
+    ("waiting_dns", "waiting"),
+    # Intermediate statuses must NOT be marked completed (regression guard
+    # for step 4 setting status='zone_created' then failing without resetting).
+    ("zone_created", "failed"),
+    ("zone_active", "failed"),
+    ("app_created", "failed"),
+    ("ns_set", "failed"),
+    ("cf_assigned", "failed"),
+])
+def test_pipeline_run_outcome_classification(tmp_db, monkeypatch,
+                                              exit_status, expected_run_status):
+    run = _drive_worker_with_status(monkeypatch,
+                                     f"out-{exit_status}.com", exit_status)
+    assert run["status"] == expected_run_status, \
+        f"status={exit_status!r} expected run.status={expected_run_status!r}"
+
+
 def test_set_step_artifact_no_step_row_yet_is_noop(tmp_db):
     """If update_step hasn't created the step_run row, set_step_artifact
     should be a no-op rather than raising."""

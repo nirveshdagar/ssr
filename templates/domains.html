@@ -241,7 +241,7 @@ document.getElementById('historyModal')?.addEventListener('show.bs.modal',async 
         list.innerHTML=j.runs.map(r=>{
             const started=r.started_at?new Date(r.started_at*1000).toLocaleString():'?';
             const dur=(r.ended_at&&r.started_at)?((r.ended_at-r.started_at).toFixed(1)+'s'):'in progress';
-            const badgeClass='badge-'+(r.status==='running'?'running':r.status==='completed'?'live':r.status==='canceled'?'pending':'error');
+            const badgeClass='badge-'+(r.status==='running'?'running':r.status==='completed'?'live':r.status==='canceled'?'pending':r.status==='waiting'?'waiting_dns':'error');
             const stopBtn=r.status==='running'
                 ?'<button class="btn btn-soft btn-soft-warning btn-sm hist-stop-btn ms-2" data-domain="'+d+'" title="Cancel this running pipeline"><i class="bi bi-stop-fill"></i> Stop</button>'
                 :'';
