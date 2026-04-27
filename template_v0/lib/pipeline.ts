@@ -615,7 +615,11 @@ async function step6GetOrProvisionServer(
     const { serverId, ip, dropletId } = await createDroplet({ name: serverName })
     updateStep(domain, 6, "running",
       `Droplet ${dropletId} up at ${ip} — installing ServerAvatar agent (5-15 min)...`)
-    const saServerId = await installAgentOnDroplet({ dropletIp: ip, serverName })
+    const saServerId = await installAgentOnDroplet({
+      dropletIp: ip,
+      serverName,
+      onProgress: (msg) => updateStep(domain, 6, "running", msg),
+    })
     updateServer(serverId, { sa_server_id: saServerId, status: "ready" })
     updateStep(domain, 6, "completed",
       `Provisioned server #${serverId} ${serverName} (${ip})  sa_id=${saServerId}`)

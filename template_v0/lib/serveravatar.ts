@@ -567,9 +567,15 @@ export async function installAgentOnDroplet(opts: {
   dropletIp: string
   serverName: string
   timeoutInstallMs?: number
+  /** Called with a human-readable status line each time we have new info
+   *  (post-SSH-launch, every poll iteration). The orchestrator wires this
+   *  to updateStep so the watcher shows live progress instead of a frozen
+   *  message during the 5-15 min agent install. */
+  onProgress?: (message: string) => void
 }): Promise<string> {
   const { dropletIp, serverName } = opts
   const timeoutInstallMs = opts.timeoutInstallMs ?? 900_000
+  const onProgress = opts.onProgress ?? (() => { /* no-op */ })
 
   const rootPassword = getSetting("server_root_password") || ""
   if (!rootPassword) throw new Error("server_root_password not set")
@@ -583,29 +589,59 @@ export async function installAgentOnDroplet(opts: {
   try {
     logPipeline(serverName, "sa_install", "running",
       `Running install script on ${dropletIp} (takes 5-15 min)`)
-    // nohup + redirect so we exit SSH immediately and poll SA for completion
+    // Full detach so the SSH channel closes immediately:
+    //   - subshell `( … & )` so the child loses its parent shell
+    //   - redirect stdin from /dev/null (otherwise ssh2 keeps the channel
+    //     open waiting for EOF on the inherited fd)
+    //   - redirect stdout/stderr to install.log
+    //   - setsid when available so the child gets its own session/pgid
     const escaped = `'${cmd.replace(/'/g, "'\\''")}'`
     const asyncCmd =
       "mkdir -p /root/sa_install && " +
       "cd /root/sa_install && " +
       `echo ${escaped} > install.sh && ` +
       "chmod +x install.sh && " +
-      "nohup bash install.sh > install.log 2>&1 & " +
-      "echo $! > install.pid"
-    await ssh.exec(asyncCmd, { timeoutMs: 60_000 })
+      "( setsid nohup bash install.sh < /dev/null > install.log 2>&1 & " +
+      "  echo $! > install.pid ) >/dev/null 2>&1 < /dev/null"
+    try {
+      await ssh.exec(asyncCmd, { timeoutMs: 60_000 })
+    } catch (e) {
+      // If the launcher exec didn't return cleanly we still want to poll
+      // SA — the install may have started on the droplet regardless. The
+      // poll loop below is the authoritative success signal anyway.
+      logPipeline(serverName, "sa_install", "warning",
+        `SSH launcher did not return cleanly (${(e as Error).message.slice(0, 200)}); ` +
+        `polling SA for agent appearance anyway`)
+    }
 
     // Poll SA-side for the server to appear as connected
-    const deadline = Date.now() + timeoutInstallMs
+    const start = Date.now()
+    const deadline = start + timeoutInstallMs
+    const totalMin = Math.round(timeoutInstallMs / 60_000)
     let saServerId: string | null = null
+    let lastSaStatus = "(none)"
+    onProgress(
+      `Installing SA agent on ${dropletIp} — 0m elapsed / ${totalMin}m max · ` +
+      `polling SA every 30s`,
+    )
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 30_000))
       let candidates: SaServer[]
-      try { candidates = await listServers() } catch { continue }
+      try {
+        candidates = await listServers()
+      } catch (e) {
+        onProgress(
+          `SA list-servers failed (${(e as Error).message.slice(0, 80)}); ` +
+          `retrying in 30s`,
+        )
+        continue
+      }
       for (const s of candidates) {
         const sIp = String(s.server_ip ?? s.ip ?? "")
         if (sIp !== dropletIp) continue
         const status = String(s.agent_status ?? s.status ?? "")
         saServerId = String(s.id ?? "")
+        lastSaStatus = status || "(unknown)"
         if (status === "connected" || status === "active" || status === "1") {
           logPipeline(serverName, "sa_install", "completed",
             `SA agent active; sa_server_id=${saServerId}`)
@@ -617,6 +653,7 @@ export async function installAgentOnDroplet(opts: {
         try {
           const info = await getServerInfo(saServerId)
           const status = String(info.agent_status ?? info.status ?? "")
+          lastSaStatus = status || lastSaStatus
           if (status === "connected" || status === "active" || status === "1") {
             logPipeline(serverName, "sa_install", "completed",
               `SA agent active; sa_server_id=${saServerId}`)
@@ -624,6 +661,12 @@ export async function installAgentOnDroplet(opts: {
           }
         } catch { /* keep polling */ }
       }
+      const elapsedMin = Math.round((Date.now() - start) / 60_000)
+      onProgress(
+        `Installing SA agent on ${dropletIp} — ${elapsedMin}m / ${totalMin}m · ` +
+        `SA status: ${lastSaStatus}` +
+        (saServerId ? ` (sa_id=${saServerId})` : " (not yet visible to SA)"),
+      )
     }
 
     // Timeout — read install.log tail for diagnosis
