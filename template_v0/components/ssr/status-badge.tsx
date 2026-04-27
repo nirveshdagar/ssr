@@ -1,7 +1,7 @@
 import { cn } from "@/lib/utils"
 import type { PipelineStatus } from "@/lib/ssr/mock-data"
 
-type StatusKey = PipelineStatus | "healthy" | "warning" | "exhausted" | "active" | "dead" | "migrating" | "provisioning" | "info" | "success" | "error" | "debug"
+type StatusKey = PipelineStatus | "healthy" | "warning" | "exhausted" | "paused" | "active" | "dead" | "migrating" | "provisioning" | "info" | "success" | "error" | "debug"
 
 const STATUS_CONFIG: Record<string, { label: string; dotClass: string; textClass: string; bgClass: string; pulse?: boolean }> = {
   // Pipeline statuses
@@ -18,6 +18,7 @@ const STATUS_CONFIG: Record<string, { label: string; dotClass: string; textClass
   healthy:          { label: "Healthy",        dotClass: "bg-[color:var(--warning)]", textClass: "text-[color:color-mix(in_oklch,var(--warning)_70%,var(--foreground))]", bgClass: "bg-[color:color-mix(in_oklch,var(--warning)_18%,transparent)]" },
   warning:          { label: "Warning",        dotClass: "bg-status-waiting",   textClass: "text-status-waiting",   bgClass: "bg-status-waiting/10" },
   exhausted:        { label: "Exhausted",      dotClass: "bg-status-terminal",  textClass: "text-status-terminal",  bgClass: "bg-status-terminal/10" },
+  paused:           { label: "Paused",         dotClass: "bg-status-canceled",  textClass: "text-status-canceled",  bgClass: "bg-status-canceled/10" },
   active:           { label: "Active",         dotClass: "bg-status-completed", textClass: "text-status-completed", bgClass: "bg-status-completed/10" },
   dead:             { label: "Dead",           dotClass: "bg-status-terminal",  textClass: "text-status-terminal",  bgClass: "bg-status-terminal/10" },
   migrating:        { label: "Migrating",      dotClass: "bg-status-running",   textClass: "text-status-running",   bgClass: "bg-status-running/10",   pulse: true },

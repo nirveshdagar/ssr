@@ -1,5 +1,6 @@
 import * as React from "react"
 import { ArrowDownRight, ArrowUpRight, type LucideIcon } from "lucide-react"
+import { Skeleton } from "@/components/ui/skeleton"
 import { cn } from "@/lib/utils"
 
 interface KpiTileProps {
@@ -74,6 +75,27 @@ export function KpiTile({ label, value, change, icon: Icon, hint, accent = "defa
           <span className="text-muted-foreground">&nbsp;</span>
         )}
         {hint && <span className="truncate text-muted-foreground">{hint}</span>}
+      </div>
+    </div>
+  )
+}
+
+/** Skeleton placeholder matching the KpiTile shape — same height/spacing
+ *  so the layout doesn't jump when real data arrives. Use during initial
+ *  SWR fetches. */
+export function KpiTileSkeleton() {
+  return (
+    <div className="relative overflow-hidden rounded-md border border-border bg-card p-4 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
+      <span className="absolute inset-y-0 left-0 w-0.5 bg-border" aria-hidden />
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex flex-col gap-1 min-w-0">
+          <Skeleton className="h-3 w-20" />
+          <Skeleton className="h-7 w-16 mt-1" />
+        </div>
+        <Skeleton className="h-7 w-7 rounded-md" />
+      </div>
+      <div className="mt-3">
+        <Skeleton className="h-3 w-28" />
       </div>
     </div>
   )

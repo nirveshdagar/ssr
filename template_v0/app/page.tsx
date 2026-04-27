@@ -1,3 +1,5 @@
+"use client"
+
 import {
   Globe,
   Server as ServerIcon,
@@ -9,7 +11,7 @@ import {
   RefreshCw,
 } from "lucide-react"
 import { AppShell } from "@/components/ssr/app-shell"
-import { KpiTile } from "@/components/ssr/kpi-tile"
+import { KpiTile, KpiTileSkeleton } from "@/components/ssr/kpi-tile"
 import { StatusBadge } from "@/components/ssr/status-badge"
 import { PipelineProgress } from "@/components/ssr/pipeline-progress"
 import { Button } from "@/components/ui/button"
@@ -22,11 +24,47 @@ import {
   DataTableCell,
   MonoCode,
 } from "@/components/ssr/data-table"
-import { ACTIVITY_FEED, DOMAINS } from "@/lib/ssr/mock-data"
+import { useDomains } from "@/hooks/use-domains"
+import { useAudit } from "@/hooks/use-audit"
+import { useServers } from "@/hooks/use-servers"
+import { useCfKeys } from "@/hooks/use-cf-keys"
+import { useStatus } from "@/hooks/use-status"
+import { domainActions } from "@/lib/api-actions"
 import { cn } from "@/lib/utils"
 
 export default function DashboardPage() {
-  const activeRuns = DOMAINS.filter((d) => d.status === "running" || d.status === "waiting").slice(0, 3)
+  const { rows: DOMAINS, isLoading: domainsLoading } = useDomains()
+  const { rows: auditRows } = useAudit({ page: 1 })
+  const { rows: SERVERS } = useServers()
+  const { rows: CF_KEYS } = useCfKeys()
+  const { status: liveStatus } = useStatus(5000)
+  // First-paint guard for the KPI tiles — show skeletons while the four
+  // primary fetches are still warming up so the layout doesn't pop in.
+  const dataWarming = domainsLoading || (DOMAINS.length === 0 && SERVERS.length === 0 && !liveStatus)
+  const activeWatchers = liveStatus?.active_watchers ?? []
+  // An "active run" is any domain whose worker has heart-beat in the last 5s.
+  // Falls back to in-flight statuses while live data warms up.
+  const activeRuns = DOMAINS.filter(
+    (d) => activeWatchers.includes(d.name) || d.status === "running" || d.status === "waiting",
+  ).slice(0, 3)
+  const liveCount = DOMAINS.filter((d) => d.status === "live").length
+  const errorCount24h = auditRows.filter(
+    (a) => /fail|error|blocked/i.test(a.action) && Date.parse(a.ts) > Date.now() - 24 * 3600 * 1000,
+  ).length
+  const healthyServers = SERVERS.filter((s) => s.status === "active").length
+  const deadServers = SERVERS.filter((s) => s.status === "dead").length
+  // Derive a small activity feed from the most recent audit rows so the
+  // dashboard stays alive even without a dedicated /api/activity endpoint.
+  const ACTIVITY_FEED = auditRows.slice(0, 8).map((a) => ({
+    id: a.id,
+    ts: a.ts.split(" ")[1]?.slice(0, 5) ?? "",
+    text: `${a.action}${a.target ? " — " + a.target : ""}${a.detail ? ": " + a.detail : ""}`,
+    kind: (a.action.includes("delete") || a.action.includes("fail")
+      ? "error"
+      : a.action.includes("login_ok") || a.action.includes("create")
+      ? "success"
+      : "info") as "info" | "success" | "error" | "warning",
+  }))
 
   return (
     <AppShell
@@ -35,47 +73,106 @@ export default function DashboardPage() {
       accent="dashboard"
       actions={
         <>
-          <Button variant="outline" size="sm" className="gap-1.5 hidden sm:inline-flex btn-soft-info">
+          <Button
+            variant="outline" size="sm"
+            className="gap-1.5 hidden sm:inline-flex btn-soft-info"
+            onClick={() => window.location.reload()}
+          >
             <RefreshCw className="h-3.5 w-3.5" /> Sync
           </Button>
-          <Button size="sm" className="gap-1.5 btn-success">
+          <Button
+            size="sm" className="gap-1.5 btn-success"
+            onClick={async () => {
+              const v = window.prompt("Domain to run pipeline on:")?.trim()
+              if (!v) return
+              const r = await domainActions.runPipeline(v)
+              window.alert(r.message ?? r.error ?? "submitted")
+            }}
+          >
             <Plus className="h-3.5 w-3.5" /> New pipeline
           </Button>
         </>
       }
     >
       <div className="flex flex-col gap-5">
+        {/* Quick Actions card — 5 nav shortcuts. Mirrors templates/dashboard.html lines 31-44. */}
+        <section
+          aria-label="Quick actions"
+          className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2"
+        >
+          {[
+            { href: "/domains",    label: "Domains",    Icon: Globe,       color: "var(--page-domains)" },
+            { href: "/servers",    label: "Servers",    Icon: ServerIcon,  color: "var(--page-servers)" },
+            { href: "/cloudflare", label: "Cloudflare", Icon: Cloud,       color: "var(--page-cloudflare)" },
+            { href: "/watcher",    label: "Watcher",    Icon: Activity,    color: "var(--page-watcher)" },
+            { href: "/logs",       label: "Logs",       Icon: AlertTriangle, color: "var(--page-logs)" },
+          ].map(({ href, label, Icon, color }) => (
+            <a
+              key={href}
+              href={href}
+              className="group flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2.5 transition-colors hover:border-foreground/20"
+            >
+              <span
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md transition-colors"
+                style={{
+                  backgroundColor: `color-mix(in oklch, ${color} 12%, transparent)`,
+                  color,
+                }}
+              >
+                <Icon className="h-4 w-4" aria-hidden />
+              </span>
+              <span className="flex flex-col leading-tight min-w-0">
+                <span className="text-[13px] font-semibold tracking-tight">{label}</span>
+                <span className="text-micro text-muted-foreground">Open {label.toLowerCase()}</span>
+              </span>
+            </a>
+          ))}
+        </section>
+
         {/* KPI grid */}
         <section aria-label="Key metrics" className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+          {dataWarming ? (
+            <>
+              <KpiTileSkeleton />
+              <KpiTileSkeleton />
+              <KpiTileSkeleton />
+              <KpiTileSkeleton />
+            </>
+          ) : <>
           <KpiTile
             label="Live domains"
-            value="248"
-            change={{ value: "+12 this week", direction: "up", positive: true }}
+            value={String(liveCount)}
+            change={{ value: `${DOMAINS.length} total`, direction: "flat" }}
             icon={Globe}
             accent="success"
           />
           <KpiTile
             label="Active pipelines"
-            value="3"
-            change={{ value: "12 queued", direction: "flat" }}
+            value={String(activeWatchers.length)}
+            change={{ value: `${DOMAINS.filter((d) => d.status === "waiting").length} waiting`, direction: "flat" }}
             icon={Activity}
-            hint="avg 4m 12s"
             accent="info"
           />
           <KpiTile
             label="Healthy servers"
-            value="13 / 14"
-            change={{ value: "1 dead", direction: "down", positive: false }}
+            value={`${healthyServers} / ${SERVERS.length}`}
+            change={{
+              value: deadServers > 0 ? `${deadServers} dead` : "all active",
+              direction: deadServers > 0 ? "down" : "flat",
+              positive: deadServers === 0,
+            }}
             icon={ServerIcon}
-            accent="warning"
+            // Yellow when healthy, escalates to destructive orange-red on dead-flip.
+            accent={deadServers > 0 ? "danger" : "warning"}
           />
           <KpiTile
             label="Errors (24h)"
-            value="7"
-            change={{ value: "−3 vs yesterday", direction: "down", positive: true }}
+            value={String(errorCount24h)}
+            change={{ value: errorCount24h === 0 ? "none" : "from audit log", direction: "flat" }}
             icon={AlertTriangle}
-            accent="danger"
+            accent={errorCount24h > 0 ? "danger" : "success"}
           />
+          </>}
         </section>
 
         {/* Two-up: active runs + activity */}
@@ -168,21 +265,22 @@ export default function DashboardPage() {
               <ServerIcon className="h-4 w-4 text-muted-foreground" />
             </div>
             <div className="mt-4 space-y-2.5">
-              {[
-                { name: "do-nyc3-01", region: "NYC3", used: 18, max: 25 },
-                { name: "do-nyc3-02", region: "NYC3", used: 22, max: 25 },
-                { name: "do-sfo3-01", region: "SFO3", used: 25, max: 25 },
-                { name: "do-fra1-01", region: "FRA1", used: 14, max: 25 },
-                { name: "do-sgp1-01", region: "SGP1", used: 9,  max: 25 },
-              ].map((s) => {
-                const pct = Math.round((s.used / s.max) * 100)
-                const danger = pct >= 95
+              {SERVERS.length === 0 && (
+                <div className="text-micro text-muted-foreground py-2">
+                  No servers yet. Add one from the Servers page.
+                </div>
+              )}
+              {SERVERS.slice(0, 8).map((s) => {
+                const pct = s.capacity > 0 ? Math.round((s.domains / s.capacity) * 100) : 0
+                const danger = pct >= 95 || s.status === "dead"
                 const warn = pct >= 75
                 return (
-                  <div key={s.name} className="flex items-center gap-3">
+                  <div key={s.id} className="flex items-center gap-3">
                     <div className="w-28 min-w-0">
                       <div className="truncate text-[12px] font-medium">{s.name}</div>
-                      <div className="text-micro text-muted-foreground">{s.region}</div>
+                      <div className="text-micro text-muted-foreground">
+                        {s.region}{s.status === "dead" ? " · dead" : ""}
+                      </div>
                     </div>
                     <div className="relative h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
                       <div
@@ -194,7 +292,7 @@ export default function DashboardPage() {
                       />
                     </div>
                     <div className="w-16 shrink-0 text-right font-mono text-micro tabular-nums text-muted-foreground">
-                      {s.used}/{s.max}
+                      {s.domains}/{s.capacity}
                     </div>
                   </div>
                 )
@@ -213,17 +311,16 @@ export default function DashboardPage() {
               <Cloud className="h-4 w-4 text-muted-foreground" />
             </div>
             <div className="mt-4 space-y-2.5">
-              {[
-                { id: "cf-pool-01", used: 38, status: "healthy" as const },
-                { id: "cf-pool-02", used: 71, status: "warning" as const },
-                { id: "cf-pool-03", used: 22, status: "healthy" as const },
-                { id: "cf-pool-04", used: 44, status: "healthy" as const },
-                { id: "cf-pool-05", used: 92, status: "exhausted" as const },
-                { id: "cf-pool-06", used: 18, status: "healthy" as const },
-              ].map((k) => (
+              {CF_KEYS.length === 0 && (
+                <div className="text-micro text-muted-foreground py-2">
+                  No CF keys yet. Add one from the Cloudflare page.
+                </div>
+              )}
+              {CF_KEYS.slice(0, 8).map((k) => (
                 <div key={k.id} className="flex items-center gap-3">
-                  <div className="w-28">
-                    <code className="font-mono text-[12px] font-medium">{k.id}</code>
+                  <div className="w-28 min-w-0">
+                    <div className="truncate text-[12px] font-medium">{k.label}</div>
+                    <div className="text-micro text-muted-foreground">cf-{k.id}</div>
                   </div>
                   <div className="relative h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
                     <div
@@ -233,10 +330,12 @@ export default function DashboardPage() {
                         k.status === "warning" && "bg-status-waiting",
                         k.status === "healthy" && "bg-primary",
                       )}
-                      style={{ width: `${k.used}%` }}
+                      style={{ width: `${k.rateLimitUsed}%` }}
                     />
                   </div>
-                  <div className="w-12 text-right font-mono text-micro tabular-nums text-muted-foreground">{k.used}%</div>
+                  <div className="w-12 text-right font-mono text-micro tabular-nums text-muted-foreground">
+                    {k.rateLimitUsed}%
+                  </div>
                   <StatusBadge status={k.status} />
                 </div>
               ))}
@@ -265,7 +364,7 @@ export default function DashboardPage() {
                   <DataTableHeaderCell>Status</DataTableHeaderCell>
                   <DataTableHeaderCell>Step</DataTableHeaderCell>
                   <DataTableHeaderCell>Server</DataTableHeaderCell>
-                  <DataTableHeaderCell>IP</DataTableHeaderCell>
+                  <DataTableHeaderCell>A-record</DataTableHeaderCell>
                   <DataTableHeaderCell align="right">Created</DataTableHeaderCell>
                 </DataTableRow>
               </DataTableHead>

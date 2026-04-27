@@ -4,10 +4,13 @@ import Link from "next/link"
 import { usePathname } from "next/navigation"
 import { cn } from "@/lib/utils"
 import { NAV_ITEMS } from "@/lib/ssr/nav"
+import { useStatus } from "@/hooks/use-status"
 import { Server } from "lucide-react"
 
 export function AppSidebar() {
   const pathname = usePathname()
+  const { status } = useStatus(5000)
+  const counts = status?.counts
 
   return (
     <aside
@@ -32,6 +35,10 @@ export function AppSidebar() {
             const active = item.href === "/" ? pathname === "/" : pathname.startsWith(item.href)
             const Icon = item.icon
             const accentVar = `var(--page-${item.accent})`
+            // Resolve runtime badge from the live status response.
+            const badgeValue = item.badgeKey
+              ? (counts ? counts[item.badgeKey] : undefined)
+              : item.badge
             return (
               <li key={item.href}>
                 <Link
@@ -57,7 +64,7 @@ export function AppSidebar() {
                     style={active ? { color: accentVar } : undefined}
                   />
                   <span className="flex-1 truncate">{item.label}</span>
-                  {item.badge !== undefined && (
+                  {badgeValue !== undefined && (
                     <span
                       className={cn(
                         "ml-auto rounded px-1.5 py-px text-micro font-medium tabular-nums",
@@ -66,7 +73,7 @@ export function AppSidebar() {
                           : "bg-muted text-muted-foreground group-hover:bg-background",
                       )}
                     >
-                      {item.badge}
+                      {badgeValue}
                     </span>
                   )}
                 </Link>
@@ -80,11 +87,11 @@ export function AppSidebar() {
           <div className="mt-2 flex items-center justify-between rounded-md border border-sidebar-border bg-card px-2.5 py-2">
             <div className="flex flex-col">
               <span className="text-micro text-muted-foreground">Active jobs</span>
-              <span className="text-[13px] font-semibold tabular-nums">3</span>
+              <span className="text-[13px] font-semibold tabular-nums">{counts?.active_jobs ?? "—"}</span>
             </div>
             <div className="flex flex-col items-end">
               <span className="text-micro text-muted-foreground">Queued</span>
-              <span className="text-[13px] font-semibold tabular-nums">12</span>
+              <span className="text-[13px] font-semibold tabular-nums">{counts?.queued_jobs ?? "—"}</span>
             </div>
           </div>
         </div>

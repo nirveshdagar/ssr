@@ -7,6 +7,7 @@ import {
   Filter,
   Play,
   Eye,
+  EyeOff,
   History,
   Ban,
   Trash2,
@@ -15,6 +16,12 @@ import {
   Download,
   Upload,
   X,
+  RefreshCw,
+  StopCircle,
+  Cloud,
+  Server as ServerIcon,
+  FileUp,
+  Info,
 } from "lucide-react"
 import { AppShell } from "@/components/ssr/app-shell"
 import { StatusBadge } from "@/components/ssr/status-badge"
@@ -41,9 +48,22 @@ import {
   MonoCode,
 } from "@/components/ssr/data-table"
 import { type PipelineStatus } from "@/lib/ssr/mock-data"
+import { useRouter, useSearchParams, usePathname } from "next/navigation"
 import { useDomains } from "@/hooks/use-domains"
+import { useServers } from "@/hooks/use-servers"
+import { useCfKeys } from "@/hooks/use-cf-keys"
+import { domainActions } from "@/lib/api-actions"
+import {
+  Select, SelectTrigger, SelectValue, SelectContent, SelectGroup, SelectLabel, SelectItem,
+} from "@/components/ui/select"
+import { OperatorDialog } from "@/components/ssr/operator-dialog"
+import { Field, FieldLabel, FieldDescription } from "@/components/ui/field"
+import { Textarea } from "@/components/ui/textarea"
+import { PIPELINE_STEPS } from "@/lib/status-taxonomy"
+import { RAW_STATUSES, RAW_STATUS_GROUPS } from "@/lib/ssr/domain-statuses"
 import { cn } from "@/lib/utils"
 
+// Coarse "chip" filters — match the 7 most common buckets.
 const STATUS_FILTERS: { key: PipelineStatus | "all"; label: string }[] = [
   { key: "all", label: "All" },
   { key: "live", label: "Live" },
@@ -55,15 +75,348 @@ const STATUS_FILTERS: { key: PipelineStatus | "all"; label: string }[] = [
 ]
 
 export default function DomainsPage() {
-  const [filter, setFilter] = React.useState<PipelineStatus | "all">("all")
-  const [query, setQuery] = React.useState("")
+  return (
+    <React.Suspense fallback={null}>
+      <DomainsPageInner />
+    </React.Suspense>
+  )
+}
+
+function DomainsPageInner() {
+  // Filters live in URL search params so the view is shareable + bookmarkable.
+  // Initial state hydrates from `?status=…&raw=…&q=…`; mutations push back via
+  // router.replace so reload + back/forward both round-trip cleanly.
+  const router = useRouter()
+  const pathname = usePathname()
+  const sp = useSearchParams()
+  const initialFilter = (sp.get("status") as PipelineStatus | "all" | null) ?? "all"
+  const initialRaw = sp.get("raw")
+  const initialQuery = sp.get("q") ?? ""
+  const [filter, setFilter] = React.useState<PipelineStatus | "all">(initialFilter)
+  /** When non-null, takes precedence over the chip filter — this is the
+   *  fine-grained 22-status dropdown matching Flask's domains.html. */
+  const [rawStatusFilter, setRawStatusFilter] = React.useState<string | null>(initialRaw)
+  const [query, setQuery] = React.useState(initialQuery)
   const [selected, setSelected] = React.useState<Set<string>>(new Set())
 
-  const { rows: DOMAINS, isLoading } = useDomains()
+  // Push filter state to URL. Throttle the search box via a tiny debounce so
+  // every keystroke doesn't flood router.replace (it's cheap, but cleaner).
+  React.useEffect(() => {
+    const params = new URLSearchParams()
+    if (filter !== "all") params.set("status", filter)
+    if (rawStatusFilter) params.set("raw", rawStatusFilter)
+    if (query.trim()) params.set("q", query)
+    const qs = params.toString()
+    const target = qs ? `${pathname}?${qs}` : pathname
+    const id = window.setTimeout(() => {
+      router.replace(target, { scroll: false })
+    }, 250)
+    return () => window.clearTimeout(id)
+  }, [filter, rawStatusFilter, query, pathname, router])
+
+  const { rows: DOMAINS, isLoading, refresh } = useDomains()
+  const { rows: SERVERS } = useServers()
+  const { rows: CF_KEYS } = useCfKeys()
+  const [busy, setBusy] = React.useState<string | null>(null)
+  const [flash, setFlash] = React.useState<{ kind: "ok" | "err"; text: string } | null>(null)
+
+  // Lookup tables for the row rendering — match Flask's `cf_keys_by_id` /
+  // `servers_by_id` so we can show "alias + email" in the CF column and
+  // "ip · name · region" in the Server column instead of "cf-N" / "srv-N".
+  const cfKeysById = React.useMemo(
+    () => Object.fromEntries(CF_KEYS.map((k) => [Number(k.id), k] as const)),
+    [CF_KEYS],
+  )
+  const serversById = React.useMemo(
+    () => Object.fromEntries(SERVERS.map((s) => [Number(s.id), s] as const)),
+    [SERVERS],
+  )
+
+  // Add Domains dialog (replaces the old window.prompt chain)
+  const [addOpen, setAddOpen] = React.useState(false)
+  const [addText, setAddText] = React.useState("")
+  const [addResult, setAddResult] = React.useState<{ kind: "ok" | "err"; text: string } | null>(null)
+
+  // Import CSV dialog (Flask shows a hint about optional cf_email/cf_global_key/cf_zone_id columns)
+  const [importOpen, setImportOpen] = React.useState(false)
+  const [importFile, setImportFile] = React.useState<File | null>(null)
+  const [importResult, setImportResult] = React.useState<{ kind: "ok" | "err"; text: string } | null>(null)
+
+  // Bulk-run options (Flask's bulk form has skip_purchase + server picker)
+  const [bulkSkipPurchase, setBulkSkipPurchase] = React.useState(false)
+  const [bulkServerId, setBulkServerId] = React.useState<string>("")
+
+  // CF credentials password show/hide (Flask has the eye toggle)
+  const [cfShowKey, setCfShowKey] = React.useState(false)
+
+  // Pipeline Run modal state — replaces window.prompt for the per-row "Run"
+  // button. Supports skip_purchase, start_from (auto + 1..10), server_id,
+  // and an inline preflight panel that calls /api/preflight/[domain].
+  const [runModalDomain, setRunModalDomain] = React.useState<string | null>(null)
+  const [runOpts, setRunOpts] = React.useState<{
+    skipPurchase: boolean; startFrom: string; serverId: string
+  }>({ skipPurchase: false, startFrom: "", serverId: "" })
+  const [preflightResult, setPreflightResult] = React.useState<
+    { ok: boolean; checks: Record<string, { ok: boolean; message: string }> } | null
+  >(null)
+  const [runResult, setRunResult] = React.useState<{ kind: "ok" | "err"; text: string } | null>(null)
+
+  function openRunModal(domain: string) {
+    setRunModalDomain(domain)
+    setRunOpts({ skipPurchase: false, startFrom: "", serverId: "" })
+    setPreflightResult(null)
+    setRunResult(null)
+  }
+  async function runPreflight() {
+    if (!runModalDomain) return
+    const r = await domainActions.preflight(runModalDomain, runOpts.skipPurchase)
+    if (r.ok && r.data) {
+      setPreflightResult(r.data as typeof preflightResult)
+    } else {
+      setRunResult({ kind: "err", text: r.error ?? "Preflight failed" })
+    }
+  }
+  async function submitRunPipeline() {
+    if (!runModalDomain) return
+    const opts: { skipPurchase?: boolean; serverId?: number; startFrom?: number } = {
+      skipPurchase: runOpts.skipPurchase,
+    }
+    if (runOpts.serverId) opts.serverId = Number(runOpts.serverId)
+    if (runOpts.startFrom) opts.startFrom = Number(runOpts.startFrom)
+    const r = await domainActions.runPipeline(runModalDomain, opts)
+    if (r.ok) {
+      setRunModalDomain(null)
+      show("ok", r.message ?? "Pipeline started")
+      await refresh()
+    } else {
+      setRunResult({ kind: "err", text: r.error ?? r.message ?? "run failed" })
+    }
+  }
+
+  // Run History modal state — shows /api/domains/[domain]/runs list, with
+  // drill-down to /api/runs/[id] for per-step detail.
+  const [historyDomain, setHistoryDomain] = React.useState<string | null>(null)
+  const [historyRuns, setHistoryRuns] = React.useState<Array<{
+    id: number; status: string; started_at: number | null; ended_at: number | null;
+    error: string | null; params_json: string | null
+  }> | null>(null)
+  const [historyDetail, setHistoryDetail] = React.useState<{
+    runId: number
+    steps: Array<{ step_num: number; status: string; message: string | null;
+      started_at: number | null; ended_at: number | null;
+      artifact_json: string | null }>
+  } | null>(null)
+
+  async function openHistoryModal(domain: string) {
+    setHistoryDomain(domain)
+    setHistoryRuns(null)
+    setHistoryDetail(null)
+    const r = await fetch(`/api/domains/${domain}/runs?limit=20`, { credentials: "same-origin" })
+    if (r.ok) {
+      const j = (await r.json()) as { runs: typeof historyRuns }
+      setHistoryRuns(j.runs ?? [])
+    }
+  }
+  async function openRunDetail(runId: number) {
+    setHistoryDetail({ runId, steps: [] })
+    const r = await fetch(`/api/runs/${runId}`, { credentials: "same-origin" })
+    if (r.ok) {
+      type Step = NonNullable<typeof historyDetail>["steps"][number]
+      const j = (await r.json()) as { run: unknown; steps: Step[] }
+      setHistoryDetail({ runId, steps: j.steps ?? [] })
+    }
+  }
+  async function retryFromStep(domain: string, step: number) {
+    const r = await domainActions.runFromStep(domain, step)
+    show(r.ok ? "ok" : "err", r.message ?? r.error ?? "")
+    if (r.ok) setHistoryDomain(null)
+    await refresh()
+  }
+
+  // CF Credentials modal — edit cf_email/cf_global_key/cf_zone_id per domain.
+  const [cfModalDomain, setCfModalDomain] = React.useState<string | null>(null)
+  const [cfFields, setCfFields] = React.useState<{ email: string; key: string; zone: string }>(
+    { email: "", key: "", zone: "" },
+  )
+  const [cfResult, setCfResult] = React.useState<{ kind: "ok" | "err"; text: string } | null>(null)
+  function openCfModal(domain: string) {
+    setCfModalDomain(domain)
+    setCfFields({ email: "", key: "", zone: "" })
+    setCfResult(null)
+  }
+  async function submitCfUpdate() {
+    if (!cfModalDomain) return
+    const r = await domainActions.updateCf(cfModalDomain, {
+      cf_email: cfFields.email || undefined,
+      cf_global_key: cfFields.key || undefined,
+      cf_zone_id: cfFields.zone || undefined,
+    })
+    if (r.ok) {
+      setCfModalDomain(null); show("ok", r.message ?? "CF credentials updated")
+      await refresh()
+    } else {
+      setCfResult({ kind: "err", text: r.error ?? r.message ?? "update failed" })
+    }
+  }
+
+  const eligibleServers = SERVERS.filter((s) => s.status === "active" && s.id)
+
+  function show(kind: "ok" | "err", text: string) {
+    setFlash({ kind, text })
+    window.setTimeout(() => setFlash(null), 4500)
+  }
+
+  async function runOne(name: string) {
+    setBusy(name)
+    const r = await domainActions.runPipeline(name)
+    show(r.ok ? "ok" : "err", r.message ?? r.error ?? "")
+    await refresh(); setBusy(null)
+  }
+  async function cancelOne(name: string) {
+    if (!confirm(
+      `Cancel pipeline for ${name}?\n\n` +
+      `Cancel is GRACEFUL — the worker checks the cancel flag at each step boundary, ` +
+      `so a long step (e.g., the 5–15 min SA agent install during step 6) finishes ` +
+      `before the cancel takes effect.`,
+    )) return
+    setBusy(name)
+    const r = await domainActions.cancelPipeline(name)
+    show(r.ok ? "ok" : "err", r.message ?? r.error ?? "")
+    await refresh(); setBusy(null)
+  }
+  async function softDeleteOne(name: string) {
+    if (!confirm(
+      `Remove ${name} from dashboard ONLY?\n\n` +
+      `The SA app, CF zone, and Spaceship record stay intact. ` +
+      `The CF key pool slot is released so the next domain can claim it.`,
+    )) return
+    setBusy(name)
+    const r = await domainActions.delete(name)
+    show(r.ok ? "ok" : "err", r.message ?? r.error ?? "")
+    await refresh(); setBusy(null)
+  }
+  async function hardDeleteOne(name: string) {
+    if (!confirm(
+      `FULL DELETE ${name}?\n\n` +
+      `Removes from: SA, CF, Spaceship, DB.\n` +
+      `Cannot be undone!`,
+    )) return
+    setBusy(name)
+    const r = await domainActions.fullDelete(name)
+    show(r.ok ? "ok" : "err", r.message ?? r.error ?? "")
+    await refresh(); setBusy(null)
+  }
+  async function bulkRun() {
+    setBusy("bulk")
+    const opts: { skipPurchase?: boolean; serverId?: number } = {}
+    if (bulkSkipPurchase) opts.skipPurchase = true
+    if (bulkServerId) opts.serverId = Number(bulkServerId)
+    const r = await domainActions.runBulk([...selected], opts) as { ok?: boolean; message?: string; error?: string }
+    show(r.ok ? "ok" : "err", String(r.message ?? r.error ?? ""))
+    setSelected(new Set()); setBulkSkipPurchase(false); setBulkServerId("")
+    await refresh(); setBusy(null)
+  }
+  async function bulkSoftDelete() {
+    if (!confirm(
+      `Remove ${selected.size} domain(s) from dashboard ONLY?\n\n` +
+      `SA apps, CF zones, and Spaceship records stay intact. CF pool slots are released.`,
+    )) return
+    setBusy("bulk")
+    const r = await domainActions.bulkDelete([...selected], "db_only") as { ok?: boolean; message?: string; error?: string }
+    show(r.ok ? "ok" : "err", String(r.message ?? r.error ?? ""))
+    setSelected(new Set()); await refresh(); setBusy(null)
+  }
+  async function bulkHardDelete() {
+    if (!confirm(
+      `FULL DELETE ${selected.size} domain(s)?\n\n` +
+      `Removes from: SA, CF, Spaceship, DB.\n` +
+      `Cannot be undone!`,
+    )) return
+    setBusy("bulk")
+    const r = await domainActions.bulkDelete([...selected], "all") as { ok?: boolean; message?: string; error?: string }
+    show(r.ok ? "ok" : "err", String(r.message ?? r.error ?? ""))
+    setSelected(new Set()); await refresh(); setBusy(null)
+  }
+  async function bulkCancel() {
+    if (!confirm(
+      `Request cancel on ${selected.size} pipeline(s)?\n\n` +
+      `Cancel is GRACEFUL — each worker checks the cancel flag at step boundaries. ` +
+      `A long step (e.g., the 5–15 min SA agent install) finishes before stop takes effect.`,
+    )) return
+    setBusy("bulk")
+    const sel = [...selected]
+    const names = DOMAINS.filter((d) => selected.has(d.id)).map((d) => d.name)
+    let okCount = 0
+    for (const n of names) {
+      const r = await domainActions.cancelPipeline(n)
+      if (r.ok) okCount++
+    }
+    show("ok", `Cancel requested on ${okCount}/${sel.length}`)
+    setSelected(new Set()); await refresh(); setBusy(null)
+  }
+  function openAddDialog() {
+    setAddText("")
+    setAddResult(null)
+    setAddOpen(true)
+  }
+  async function submitAdd() {
+    const list = addText.replace(/,/g, "\n").split("\n").map((s) => s.trim()).filter(Boolean)
+    if (!list.length) {
+      setAddResult({ kind: "err", text: "Paste at least one domain (one per line)" }); return
+    }
+    const fd = new FormData()
+    fd.set("domains", list.join("\n"))
+    const r = await fetch("/api/domains", { method: "POST", body: fd, credentials: "same-origin" })
+    const j = (await r.json().catch(() => ({}))) as { ok?: boolean; count?: number; skipped?: number; error?: string }
+    if (j.ok) {
+      setAddOpen(false)
+      show("ok", `Added ${j.count ?? 0}${j.skipped ? `, skipped ${j.skipped}` : ""}`)
+      await refresh()
+    } else {
+      setAddResult({ kind: "err", text: j.error ?? "Add failed" })
+    }
+  }
+
+  function openImportDialog() {
+    setImportFile(null)
+    setImportResult(null)
+    setImportOpen(true)
+  }
+  async function submitImport() {
+    if (!importFile) {
+      setImportResult({ kind: "err", text: "Pick a .csv file first" }); return
+    }
+    const fd = new FormData()
+    fd.set("csv_file", importFile)
+    const r = await fetch("/api/domains/import", { method: "POST", body: fd, credentials: "same-origin" })
+    const j = (await r.json().catch(() => ({}))) as { ok?: boolean; count?: number; error?: string }
+    if (j.ok) {
+      setImportOpen(false)
+      show("ok", `Imported ${j.count ?? 0} rows`)
+      await refresh()
+    } else {
+      setImportResult({ kind: "err", text: j.error ?? "Import failed" })
+    }
+  }
+
+  // Multi-domain exact-match mode: paste a CSV/newline list to filter for those
+  // exact domain names. Otherwise fall back to substring match across name.
+  const queryTokens = query.split(/[,\n]/).map((t) => t.trim()).filter(Boolean)
+  const isBulkListMode = queryTokens.length > 1
+  const tokenSet = new Set(queryTokens.map((t) => t.toLowerCase()))
 
   const filtered = DOMAINS.filter((d) => {
-    if (filter !== "all" && d.status !== filter) return false
-    if (query && !d.name.toLowerCase().includes(query.toLowerCase())) return false
+    // Raw-status dropdown wins over the coarse chip when both are set
+    if (rawStatusFilter) {
+      if (d.rawStatus !== rawStatusFilter) return false
+    } else if (filter !== "all" && d.status !== filter) {
+      return false
+    }
+    if (isBulkListMode) {
+      if (!tokenSet.has(d.name.toLowerCase())) return false
+    } else if (query.trim()) {
+      if (!d.name.toLowerCase().includes(query.toLowerCase().trim())) return false
+    }
     return true
   })
 
@@ -92,81 +445,221 @@ export default function DomainsPage() {
       accent="domains"
       actions={
         <>
-          <Button variant="outline" size="sm" className="gap-1.5 hidden sm:inline-flex">
-            <Download className="h-3.5 w-3.5" /> Export
+          {/* Check NS (bulk) — green soft, matches Flask */}
+          <Button
+            variant="outline" size="sm"
+            className="gap-1.5 hidden md:inline-flex btn-soft-success"
+            onClick={async () => {
+              setBusy("check-ns"); show("ok", "Checking NS for every domain with CF creds…")
+              const r = await domainActions.checkAllNs() as { ok?: boolean; active?: number; pending?: number; errors?: number }
+              show(r.ok ? "ok" : "err",
+                r.ok ? `NS check: ${r.active ?? 0} active · ${r.pending ?? 0} pending · ${r.errors ?? 0} errors`
+                     : "NS check failed")
+              setBusy(null); await refresh()
+            }}
+            disabled={busy === "check-ns"}
+          >
+            <Filter className="h-3.5 w-3.5" /> Check NS
           </Button>
-          <Button variant="outline" size="sm" className="gap-1.5 hidden sm:inline-flex btn-soft-info">
+          {/* Export CSV — neutral */}
+          <a href="/api/domains/export" download="ssr_domains.csv">
+            <Button
+              variant="outline" size="sm" className="gap-1.5 hidden md:inline-flex"
+              title="Download every domain row as a CSV (preserves cf_* + server_id)"
+            >
+              <Download className="h-3.5 w-3.5" /> Export
+            </Button>
+          </a>
+          {/* Import CSV — neutral, opens dialog with column hint */}
+          <Button
+            variant="outline" size="sm"
+            className="gap-1.5 hidden md:inline-flex"
+            onClick={openImportDialog}
+            title="Import a CSV — bulk-add domains and optionally restore CF credentials"
+          >
             <Upload className="h-3.5 w-3.5" /> Import CSV
           </Button>
-          <Button size="sm" className="gap-1.5 btn-info">
-            <Plus className="h-3.5 w-3.5" /> Add domain
+          {/* Import from ServerAvatar — blue soft, matches Flask */}
+          <Button
+            variant="outline" size="sm"
+            className="gap-1.5 hidden md:inline-flex btn-soft-info"
+            onClick={async () => {
+              if (!confirm("Import only the domains hosted as apps on your ServerAvatar servers? (Ignores un-hosted Spaceship domains.)")) return
+              setBusy("import-sa")
+              const r = await domainActions.importFromSa()
+              show(r.ok ? "ok" : "err", r.message ?? r.error ?? "")
+              setBusy(null); await refresh()
+            }}
+            disabled={busy === "import-sa"}
+            title="Pull every domain hosted on SA + auto-create missing server rows"
+          >
+            <Plus className="h-3.5 w-3.5" /> Import from SA
+          </Button>
+          {/* Sync from ServerAvatar — amber soft, matches Flask */}
+          <Button
+            variant="outline" size="sm"
+            className="gap-1.5 hidden md:inline-flex btn-soft-warning"
+            onClick={async () => {
+              if (!confirm("Remove dashboard rows whose SA app no longer exists upstream? Only touches hosted/live domains.")) return
+              setBusy("sync-sa")
+              const r = await domainActions.syncFromSa()
+              show(r.ok ? "ok" : "err", r.message ?? r.error ?? "")
+              setBusy(null); await refresh()
+            }}
+            disabled={busy === "sync-sa"}
+            title="Drop dashboard rows whose SA app was deleted elsewhere"
+          >
+            <RefreshCw className="h-3.5 w-3.5" /> Sync from SA
+          </Button>
+          {/* Run pipeline on currently filtered domains — bulk runner */}
+          <Button
+            variant="outline" size="sm"
+            className="gap-1.5 hidden lg:inline-flex btn-soft-success"
+            onClick={async () => {
+              const ids = filtered.map((d) => d.id)
+              if (!ids.length) { show("err", "No domains in current filter"); return }
+              if (!confirm(`Run pipeline on ${ids.length} ${filter === "all" && !query ? "" : "filtered "}domain(s)?`)) return
+              setBusy("run-all")
+              const r = await domainActions.runBulk(ids) as { ok?: boolean; message?: string; error?: string; count?: number }
+              show(r.ok ? "ok" : "err", String(r.message ?? r.error ?? ""))
+              setBusy(null); await refresh()
+            }}
+            disabled={busy === "run-all" || filtered.length === 0}
+            title="Run the pipeline on every domain currently shown — respects search + status filters"
+          >
+            <Play className="h-3.5 w-3.5" /> Run all ({filtered.length})
+          </Button>
+          {/* Primary CTA — opens the multi-line Add Domains dialog */}
+          <Button
+            size="sm" className="gap-1.5 btn-info"
+            onClick={openAddDialog}
+            title="Add one or many domains — paste one per line, or comma-separated"
+          >
+            <Plus className="h-3.5 w-3.5" /> Add
           </Button>
         </>
       }
     >
       <div className="flex flex-col gap-3">
-        {/* Status filter chips */}
-        <div className="flex flex-wrap items-center gap-1">
-          {STATUS_FILTERS.map((f) => {
-            const count =
-              f.key === "all" ? DOMAINS.length : DOMAINS.filter((d) => d.status === f.key).length
-            const active = filter === f.key
-            return (
-              <button
-                key={f.key}
-                onClick={() => setFilter(f.key)}
-                className={cn(
-                  "inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-small font-medium transition-colors",
-                  active
-                    ? "border-foreground/20 bg-foreground text-background"
-                    : "border-border bg-card text-muted-foreground hover:bg-muted hover:text-foreground",
-                )}
-              >
-                {f.label}
-                <span
+        {flash && (
+          <div
+            role="status"
+            className={cn(
+              "rounded-md border px-3 py-2 text-small",
+              flash.kind === "ok"
+                ? "border-status-completed/40 bg-status-completed/10 text-status-completed"
+                : "border-status-terminal/40 bg-status-terminal/10 text-status-terminal",
+            )}
+          >
+            {flash.text}
+          </div>
+        )}
+        <span className="hidden">{isLoading ? 1 : 0}</span>
+        {/* Status filter — coarse chips for the 7 buckets, plus a fine-grained
+            22-status dropdown matching Flask's domains.html. Setting the
+            dropdown overrides the chip filter; "All exact statuses" clears it. */}
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex flex-wrap items-center gap-1">
+            {STATUS_FILTERS.map((f) => {
+              const count =
+                f.key === "all" ? DOMAINS.length : DOMAINS.filter((d) => d.status === f.key).length
+              const active = !rawStatusFilter && filter === f.key
+              return (
+                <button
+                  key={f.key}
+                  onClick={() => { setRawStatusFilter(null); setFilter(f.key) }}
+                  title={f.key === "all"
+                    ? "Show every domain regardless of status"
+                    : `Show only ${f.label.toLowerCase()} domains (coarse bucket — combines several raw statuses)`}
                   className={cn(
-                    "rounded px-1 py-px text-micro tabular-nums",
-                    active ? "bg-background/15 text-background" : "bg-muted text-muted-foreground",
+                    "inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-small font-medium transition-colors",
+                    active
+                      ? "border-foreground/20 bg-foreground text-background"
+                      : "border-border bg-card text-muted-foreground hover:bg-muted hover:text-foreground",
                   )}
                 >
-                  {count}
-                </span>
+                  {f.label}
+                  <span
+                    className={cn(
+                      "rounded px-1 py-px text-micro tabular-nums",
+                      active ? "bg-background/15 text-background" : "bg-muted text-muted-foreground",
+                    )}
+                  >
+                    {count}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+          <div className="ml-auto flex items-center gap-2">
+            <Select
+              value={rawStatusFilter ?? "__all__"}
+              onValueChange={(v) => setRawStatusFilter(v === "__all__" ? null : v)}
+            >
+              <SelectTrigger size="sm" className="h-8 min-w-[200px] text-small">
+                <SelectValue placeholder="Exact status — All" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__all__">All exact statuses</SelectItem>
+                {(["ok","in-flight","waiting","ready","error","other"] as const).map((g) => {
+                  const items = RAW_STATUSES.filter((s) => s.group === g)
+                  if (items.length === 0) return null
+                  return (
+                    <SelectGroup key={g}>
+                      <SelectLabel>{RAW_STATUS_GROUPS[g]}</SelectLabel>
+                      {items.map((s) => {
+                        const n = DOMAINS.filter((d) => d.rawStatus === s.value).length
+                        return (
+                          <SelectItem key={s.value} value={s.value}>
+                            <span className="font-mono text-micro">{s.value}</span>
+                            <span className="ml-2 text-muted-foreground">{s.label}</span>
+                            <span className="ml-auto pl-3 tabular-nums text-muted-foreground">{n}</span>
+                          </SelectItem>
+                        )
+                      })}
+                    </SelectGroup>
+                  )
+                })}
+              </SelectContent>
+            </Select>
+            {rawStatusFilter && (
+              <button
+                onClick={() => setRawStatusFilter(null)}
+                className="text-micro text-muted-foreground hover:text-foreground"
+                aria-label="Clear exact-status filter"
+              >
+                Clear
               </button>
-            )
-          })}
+            )}
+          </div>
         </div>
 
         <DataTableShell>
           <DataTableToolbar>
-            <div className="relative flex-1 min-w-[200px] max-w-md">
-              <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-              <Input
+            <div className="relative flex-1 min-w-[260px] max-w-md">
+              <Search className="absolute left-2.5 top-2 h-3.5 w-3.5 text-muted-foreground" />
+              <Textarea
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search domains…"
-                className="h-8 pl-8 text-small"
+                placeholder="Search single (domain/email/IP), or paste comma/newline-separated list for exact-match"
+                rows={1}
+                className="min-h-[32px] max-h-[120px] pl-8 py-1.5 text-small font-mono resize-y"
               />
+              {query.includes(",") || query.includes("\n") ? (
+                <span className="absolute right-2 top-2 text-micro text-muted-foreground bg-card px-1.5 py-px rounded border border-border/60">
+                  exact-match list mode
+                </span>
+              ) : null}
             </div>
-            <Button variant="outline" size="sm" className="gap-1.5">
-              <Filter className="h-3.5 w-3.5" /> Filter
-              <span className="rounded bg-muted px-1 py-px text-micro text-muted-foreground">2</span>
-            </Button>
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button variant="outline" size="sm" className="gap-1.5">
-                  Sort
-                  <ChevronDown className="h-3.5 w-3.5" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-44">
-                <DropdownMenuLabel>Sort by</DropdownMenuLabel>
-                <DropdownMenuItem>Newest first</DropdownMenuItem>
-                <DropdownMenuItem>Oldest first</DropdownMenuItem>
-                <DropdownMenuItem>Name (A–Z)</DropdownMenuItem>
-                <DropdownMenuItem>Status</DropdownMenuItem>
-                <DropdownMenuItem>Step number</DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
+            {(query || filter !== "all" || rawStatusFilter) && (
+              <Button
+                variant="outline" size="sm" className="gap-1.5"
+                onClick={() => { setQuery(""); setFilter("all"); setRawStatusFilter(null) }}
+                title="Clear search, status chip, and exact-status filter"
+              >
+                <X className="h-3.5 w-3.5" /> Clear filters
+              </Button>
+            )}
             <div className="ml-auto text-micro text-muted-foreground">
               {filtered.length} of {DOMAINS.length}
             </div>
@@ -187,7 +680,7 @@ export default function DomainsPage() {
                 <DataTableHeaderCell>Step</DataTableHeaderCell>
                 <DataTableHeaderCell>Server</DataTableHeaderCell>
                 <DataTableHeaderCell>CF key</DataTableHeaderCell>
-                <DataTableHeaderCell>IP</DataTableHeaderCell>
+                <DataTableHeaderCell>A-record</DataTableHeaderCell>
                 <DataTableHeaderCell align="right">Created</DataTableHeaderCell>
                 <DataTableHeaderCell align="right">Actions</DataTableHeaderCell>
               </DataTableRow>
@@ -204,7 +697,13 @@ export default function DomainsPage() {
                   </DataTableCell>
                   <DataTableCell>
                     <div className="flex items-center gap-2">
-                      <span className="font-medium">{d.name}</span>
+                      <a
+                        href={`/domains/${encodeURIComponent(d.name)}`}
+                        className="font-medium hover:underline underline-offset-2"
+                        title={`Open detail page for ${d.name}`}
+                      >
+                        {d.name}
+                      </a>
                       {d.registrar === "Imported" && (
                         <span className="rounded bg-muted px-1.5 py-0.5 text-micro font-medium text-muted-foreground">
                           imported
@@ -219,10 +718,47 @@ export default function DomainsPage() {
                     <span className="font-mono tabular-nums text-muted-foreground">{d.step}/10</span>
                   </DataTableCell>
                   <DataTableCell>
-                    <MonoCode>{d.server}</MonoCode>
+                    {(() => {
+                      const s = d.serverId ? serversById[d.serverId] : undefined
+                      if (!s) return <span className="text-muted-foreground">—</span>
+                      return (
+                        <div className="flex flex-col leading-tight">
+                          <MonoCode>{s.ip}</MonoCode>
+                          <span className="text-micro text-muted-foreground">
+                            {s.name}{s.region ? ` · ${s.region}` : ""}
+                          </span>
+                        </div>
+                      )
+                    })()}
                   </DataTableCell>
                   <DataTableCell>
-                    <MonoCode>{d.cfKey}</MonoCode>
+                    {(() => {
+                      const k = d.cfKeyId ? cfKeysById[d.cfKeyId] : undefined
+                      if (k) {
+                        return (
+                          <div className="flex flex-col leading-tight">
+                            <span
+                              className="rounded bg-muted px-1.5 py-0.5 text-micro font-medium text-foreground/80 w-fit"
+                              title={`CF key pool entry #${k.id}`}
+                            >
+                              {k.alias || `CF#${k.id}`}
+                            </span>
+                            {d.cfEmail && (
+                              <span className="text-micro text-muted-foreground mt-0.5">{d.cfEmail}</span>
+                            )}
+                          </div>
+                        )
+                      }
+                      if (d.cfEmail) {
+                        return (
+                          <div className="flex flex-col leading-tight">
+                            <span className="text-micro text-muted-foreground">{d.cfEmail}</span>
+                            <span className="text-micro text-muted-foreground/70">(no pool key)</span>
+                          </div>
+                        )
+                      }
+                      return <span className="text-muted-foreground">—</span>
+                    })()}
                   </DataTableCell>
                   <DataTableCell>
                     <MonoCode>{d.ip}</MonoCode>
@@ -233,42 +769,61 @@ export default function DomainsPage() {
                   <DataTableCell align="right">
                     <ButtonGroup className="justify-end">
                       <Button
-                        variant="ghost"
-                        size="icon"
+                        variant="ghost" size="icon"
                         className="h-7 w-7 text-[color:var(--success)] hover:bg-[color:color-mix(in_oklch,var(--success)_14%,transparent)] hover:text-[color:var(--success)]"
                         aria-label="Run pipeline"
-                        title="Run pipeline"
+                        title={`Run pipeline for ${d.name} — opens the start dialog (skip-purchase, server, preflight)`}
+                        disabled={busy === d.name}
+                        onClick={() => openRunModal(d.name)}
                       >
                         <Play className="h-3.5 w-3.5" />
                       </Button>
+                      <a href={`/watcher?domain=${encodeURIComponent(d.name)}`} title={`Watch live step progress for ${d.name}`}>
+                        <Button
+                          variant="ghost" size="icon"
+                          className="h-7 w-7 text-[color:var(--info)] hover:bg-[color:color-mix(in_oklch,var(--info)_14%,transparent)] hover:text-[color:var(--info)]"
+                          aria-label="Watch steps"
+                          title={`Watch live step progress for ${d.name}`}
+                        >
+                          <Eye className="h-3.5 w-3.5" />
+                        </Button>
+                      </a>
                       <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-7 w-7 text-[color:var(--info)] hover:bg-[color:color-mix(in_oklch,var(--info)_14%,transparent)] hover:text-[color:var(--info)]"
-                        aria-label="Watch steps"
-                        title="Watch steps"
+                        variant="ghost" size="icon" className="h-7 w-7"
+                        aria-label="Run history"
+                        title={`Run history for ${d.name} — view past runs, retry/skip/override per step`}
+                        onClick={() => openHistoryModal(d.name)}
                       >
-                        <Eye className="h-3.5 w-3.5" />
-                      </Button>
-                      <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="History" title="History">
                         <History className="h-3.5 w-3.5" />
                       </Button>
                       <ButtonGroupSeparator />
                       <DropdownMenu>
                         <DropdownMenuTrigger asChild>
-                          <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="More actions">
+                          <Button
+                            variant="ghost" size="icon" className="h-7 w-7"
+                            aria-label="More actions" title="More actions — Cancel · Check NS · CF credentials · Delete"
+                          >
                             <ChevronDown className="h-3.5 w-3.5" />
                           </Button>
                         </DropdownMenuTrigger>
-                        <DropdownMenuContent align="end" className="w-44">
-                          <DropdownMenuItem>
-                            <Ban className="mr-2 h-3.5 w-3.5" /> Cancel
+                        <DropdownMenuContent align="end" className="w-48">
+                          <DropdownMenuItem onClick={() => cancelOne(d.name)}>
+                            <Ban className="mr-2 h-3.5 w-3.5" /> Cancel pipeline
                           </DropdownMenuItem>
-                          <DropdownMenuItem>
-                            <Archive className="mr-2 h-3.5 w-3.5" /> Soft delete
+                          <DropdownMenuItem onClick={async () => {
+                            const r = await domainActions.checkNs(d.name)
+                            show(r.ok ? "ok" : "err", r.message ?? r.error ?? "")
+                          }}>
+                            <Filter className="mr-2 h-3.5 w-3.5" /> Check NS
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => openCfModal(d.name)}>
+                            <Upload className="mr-2 h-3.5 w-3.5" /> CF credentials
                           </DropdownMenuItem>
                           <DropdownMenuSeparator />
-                          <DropdownMenuItem variant="destructive">
+                          <DropdownMenuItem onClick={() => softDeleteOne(d.name)}>
+                            <Archive className="mr-2 h-3.5 w-3.5" /> Soft delete
+                          </DropdownMenuItem>
+                          <DropdownMenuItem variant="destructive" onClick={() => hardDeleteOne(d.name)}>
                             <Trash2 className="mr-2 h-3.5 w-3.5" /> Hard delete
                           </DropdownMenuItem>
                         </DropdownMenuContent>
@@ -297,17 +852,18 @@ export default function DomainsPage() {
           </div>
         </DataTableShell>
 
-        {/* Bulk action bar */}
+        {/* Bulk action bar — gains Flask's Skip-purchase + Server picker so a
+            bulk run can be aimed at one specific server (or auto round-robin). */}
         {selected.size > 0 && (
           <div
             role="toolbar"
             aria-label="Bulk actions"
-            className="sticky bottom-4 mx-auto flex w-full max-w-3xl items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 shadow-lg"
+            className="sticky bottom-4 mx-auto flex w-full max-w-4xl flex-wrap items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 shadow-lg"
           >
             <button
               onClick={() => setSelected(new Set())}
               className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
-              aria-label="Clear selection"
+              aria-label="Clear selection" title="Clear selection"
             >
               <X className="h-3.5 w-3.5" />
             </button>
@@ -315,25 +871,464 @@ export default function DomainsPage() {
               {selected.size} {selected.size === 1 ? "domain" : "domains"} selected
             </span>
             <span className="mx-1 h-4 w-px bg-border" aria-hidden />
+
+            <label
+              className="inline-flex items-center gap-1.5 text-small"
+              title="Skip Spaceship purchase in step 1 — assume each domain is already owned (BYO)"
+            >
+              <Checkbox
+                checked={bulkSkipPurchase}
+                onCheckedChange={(v) => setBulkSkipPurchase(Boolean(v))}
+              />
+              Skip purchase
+            </label>
+            <Select value={bulkServerId || "__auto__"} onValueChange={(v) => setBulkServerId(v === "__auto__" ? "" : v)}>
+              <SelectTrigger size="sm" className="h-8 min-w-[180px] text-small"
+                title="Pin all selected runs to one server, or leave on Auto for round-robin">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__auto__">Auto server (round-robin)</SelectItem>
+                {eligibleServers.map((s) => (
+                  <SelectItem key={s.id} value={s.id}>
+                    {s.name} ({s.ip}) · {s.domains}/{s.capacity}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
             <ButtonGroup>
-              <Button size="sm" variant="outline" className="gap-1.5 btn-soft-success">
+              <Button
+                size="sm" variant="outline"
+                className="gap-1.5 btn-soft-success"
+                onClick={bulkRun} disabled={busy === "bulk"}
+                title="Run the pipeline on every selected domain — honors Skip-purchase + Server above"
+              >
                 <Play className="h-3.5 w-3.5" /> Run pipeline
               </Button>
-              <Button size="sm" variant="outline" className="gap-1.5 btn-soft-warning">
+              <Button
+                size="sm" variant="outline"
+                className="gap-1.5 btn-soft-warning"
+                onClick={bulkCancel} disabled={busy === "bulk"}
+                title="Request graceful cancel on every selected running pipeline"
+              >
                 <Ban className="h-3.5 w-3.5" /> Cancel
               </Button>
-              <Button size="sm" variant="outline" className="gap-1.5 btn-soft-destructive">
-                <Archive className="h-3.5 w-3.5" /> Soft delete
-              </Button>
-            </ButtonGroup>
-            <ButtonGroup className="ml-auto">
-              <Button size="sm" variant="outline" className="gap-1.5 text-status-terminal hover:text-status-terminal">
-                <Trash2 className="h-3.5 w-3.5" /> Hard delete
-              </Button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    size="sm" variant="outline"
+                    className="gap-1.5 btn-soft-destructive"
+                    disabled={busy === "bulk"}
+                    title="Delete the selected domains — pick dashboard-only or full teardown"
+                  >
+                    <Archive className="h-3.5 w-3.5" /> Delete… <ChevronDown className="h-3 w-3" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-64">
+                  <DropdownMenuLabel>Delete mode</DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onClick={bulkSoftDelete}>
+                    <Archive className="mr-2 h-3.5 w-3.5" />
+                    <div className="flex flex-col">
+                      <span>Dashboard only</span>
+                      <span className="text-micro text-muted-foreground">Drops rows · keeps SA + CF zone + Spaceship</span>
+                    </div>
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem variant="destructive" onClick={bulkHardDelete}>
+                    <Trash2 className="mr-2 h-3.5 w-3.5" />
+                    <div className="flex flex-col">
+                      <span>Full delete (SA + CF + Spaceship + DB)</span>
+                      <span className="text-micro">Tears down everything — irreversible</span>
+                    </div>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
             </ButtonGroup>
           </div>
         )}
       </div>
+
+      {/* === Pipeline Run modal — replaces Flask's #pipelineModal === */}
+      <OperatorDialog
+        open={runModalDomain !== null}
+        onOpenChange={(o) => { if (!o) setRunModalDomain(null) }}
+        title={`Run pipeline — ${runModalDomain ?? ""}`}
+        description="Smart resume: the worker auto-detects completed steps. Override with Start From if you want to force a specific step."
+        submitLabel="Start"
+        onSubmit={submitRunPipeline}
+        resultMessage={runResult?.text ?? null}
+        resultKind={runResult?.kind ?? null}
+      >
+        <Field>
+          <FieldLabel>
+            <span className="inline-flex items-center gap-2">
+              <Checkbox
+                checked={runOpts.skipPurchase}
+                onCheckedChange={(v) => setRunOpts((o) => ({ ...o, skipPurchase: Boolean(v) }))}
+              />
+              Skip purchase (BYO domain)
+            </span>
+          </FieldLabel>
+          <FieldDescription>Skips Spaceship purchase in step 1; assumes you already own the domain.</FieldDescription>
+        </Field>
+        <Field>
+          <FieldLabel>Start from step</FieldLabel>
+          <Select
+            value={runOpts.startFrom || "__auto__"}
+            onValueChange={(v) => setRunOpts((o) => ({ ...o, startFrom: v === "__auto__" ? "" : v }))}
+          >
+            <SelectTrigger size="sm" className="h-8 text-small"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__auto__">Auto-detect (recommended)</SelectItem>
+              {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
+                <SelectItem key={n} value={String(n)}>
+                  {n} — {PIPELINE_STEPS[n]}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </Field>
+        <Field>
+          <FieldLabel>Server</FieldLabel>
+          <Select
+            value={runOpts.serverId || "__auto__"}
+            onValueChange={(v) => setRunOpts((o) => ({ ...o, serverId: v === "__auto__" ? "" : v }))}
+          >
+            <SelectTrigger size="sm" className="h-8 text-small"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__auto__">Auto (round-robin across ready servers)</SelectItem>
+              {eligibleServers.map((s) => (
+                <SelectItem key={s.id} value={s.id}>
+                  {s.name} ({s.ip}) · {s.domains}/{s.capacity}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </Field>
+        <div className="rounded-md border border-border/60 p-3">
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <div className="text-[13px] font-medium">Preflight</div>
+              <p className="text-micro text-muted-foreground mt-0.5">
+                Run the 7 preflight checks (CF pool, DO token, SA auth, etc.) before kicking off.
+              </p>
+            </div>
+            <Button variant="outline" size="sm" onClick={runPreflight}>Run preflight</Button>
+          </div>
+          {preflightResult && (
+            <ul className="mt-2 flex flex-col gap-1 text-micro font-mono">
+              {Object.entries(preflightResult.checks).map(([name, c]) => (
+                <li key={name} className={c.ok ? "text-status-completed" : "text-status-terminal"}>
+                  {c.ok ? "✓" : "✗"} {name}: {c.message}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </OperatorDialog>
+
+      {/* === Run History modal — list /api/domains/[domain]/runs + drill into /api/runs/[id] === */}
+      <OperatorDialog
+        open={historyDomain !== null}
+        onOpenChange={(o) => { if (!o) { setHistoryDomain(null); setHistoryDetail(null) } }}
+        title={`Run history — ${historyDomain ?? ""}`}
+        submitLabel="Close"
+        onSubmit={() => { setHistoryDomain(null); setHistoryDetail(null) }}
+      >
+        {!historyDetail ? (
+          <div className="flex flex-col gap-1.5 max-h-[60vh] overflow-y-auto">
+            {historyRuns === null && <span className="text-muted-foreground text-micro">Loading…</span>}
+            {historyRuns?.length === 0 && (
+              <span className="text-muted-foreground text-micro">No runs yet for this domain.</span>
+            )}
+            {historyRuns?.map((r) => {
+              const start = r.started_at ? new Date(r.started_at * 1000).toLocaleString() : "—"
+              const dur = r.started_at && r.ended_at ? `${Math.round(r.ended_at - r.started_at)}s` : "running"
+              const isRunning = r.status === "running"
+              return (
+                <div
+                  key={r.id}
+                  className="rounded border border-border/60 p-2 hover:bg-muted text-small"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 flex-1 min-w-0">
+                      <button
+                        onClick={() => openRunDetail(r.id)}
+                        className="text-left font-mono"
+                        title="Open per-step detail for this run inline"
+                      >
+                        run #{r.id}
+                      </button>
+                      <a
+                        href={`/watcher/${r.id}`}
+                        target="_blank" rel="noopener noreferrer"
+                        className="text-micro text-muted-foreground hover:text-foreground"
+                        title="Open this run on its own page (bookmarkable, shareable)"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        ↗
+                      </a>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className={cn(
+                        "text-micro font-medium",
+                        r.status === "completed" && "text-status-completed",
+                        r.status === "failed" && "text-status-terminal",
+                        r.status === "waiting" && "text-status-waiting",
+                        r.status === "running" && "text-status-running",
+                      )}>
+                        {r.status}
+                      </span>
+                      {isRunning && historyDomain && (
+                        <Button
+                          variant="outline" size="sm" className="h-6 gap-1 btn-soft-warning"
+                          onClick={async (e) => {
+                            e.stopPropagation()
+                            if (!confirm(
+                              `Cancel running pipeline for ${historyDomain}?\n\n` +
+                              `Cancel is GRACEFUL — the worker checks the cancel flag at each step boundary, ` +
+                              `so a long step (e.g., the 5–15 min SA agent install during step 6) finishes ` +
+                              `before the cancel takes effect.`,
+                            )) return
+                            const res = await domainActions.cancelPipeline(historyDomain)
+                            show(res.ok ? "ok" : "err", res.message ?? res.error ?? "Cancel requested")
+                          }}
+                          title="Cancel this running pipeline (graceful — stops at next step boundary)"
+                        >
+                          <StopCircle className="h-3 w-3" /> Stop
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => openRunDetail(r.id)}
+                    className="text-left text-micro text-muted-foreground mt-0.5 block"
+                  >
+                    {start} · {dur}
+                    {r.error && <span className="text-status-terminal"> · {r.error}</span>}
+                  </button>
+                </div>
+              )
+            })}
+          </div>
+        ) : (
+          <div className="flex flex-col gap-2 max-h-[60vh] overflow-y-auto">
+            <div className="flex items-center justify-between">
+              <div className="text-small font-mono">run #{historyDetail.runId}</div>
+              <button onClick={() => setHistoryDetail(null)} className="text-micro text-muted-foreground hover:text-foreground">
+                ← back to list
+              </button>
+            </div>
+            <ol className="flex flex-col gap-1.5">
+              {historyDetail.steps.map((s) => {
+                const dur = s.started_at && s.ended_at ? `${Math.round(s.ended_at - s.started_at)}s` : "—"
+                return (
+                  <li key={s.step_num} className="rounded border border-border/60 p-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-mono text-micro">
+                        {s.step_num}. {PIPELINE_STEPS[s.step_num]}
+                      </span>
+                      <span className={cn(
+                        "text-micro font-medium",
+                        s.status === "completed" && "text-status-completed",
+                        s.status === "failed" && "text-status-terminal",
+                        s.status === "warning" && "text-status-waiting",
+                        s.status === "running" && "text-status-running",
+                      )}>{s.status} · {dur}</span>
+                    </div>
+                    {s.message && <div className="text-micro text-muted-foreground mt-1 break-words">{s.message}</div>}
+                    {s.artifact_json && (
+                      <pre className="mt-1 max-h-32 overflow-auto rounded bg-muted p-1.5 text-[10px] leading-tight">
+                        {s.artifact_json}
+                      </pre>
+                    )}
+                    {historyDomain && (s.status === "failed" || s.status === "warning" || s.status === "completed") && (
+                      <div className="mt-1.5 flex gap-1.5 flex-wrap">
+                        {(s.status === "failed" || s.status === "warning") && (
+                          <Button
+                            variant="outline" size="sm" className="h-7 gap-1"
+                            onClick={() => retryFromStep(historyDomain, s.step_num)}
+                            title={`Re-run pipeline starting at step ${s.step_num}`}
+                          >
+                            <Play className="h-3 w-3" /> Retry from {s.step_num}
+                          </Button>
+                        )}
+                        <Button
+                          variant="outline" size="sm" className="h-7 gap-1"
+                          disabled={s.step_num >= 10}
+                          onClick={() => retryFromStep(historyDomain, s.step_num + 1)}
+                          title={s.step_num >= 10 ? "Already at the last step" : `Skip step ${s.step_num} — start at step ${s.step_num + 1}`}
+                        >
+                          Skip → {s.step_num + 1}
+                        </Button>
+                        <Button
+                          variant="outline" size="sm" className="h-7 gap-1"
+                          onClick={() => {
+                            // Per-step field hint (Flask parity) so the operator
+                            // doesn't have to remember which DB column each
+                            // pipeline step writes to. Falls back to site_html.
+                            const FIELD_HINT: Record<number, string> = {
+                              1: "status",
+                              2: "cf_email",
+                              3: "cf_zone_id",
+                              4: "cf_nameservers",
+                              7: "current_proxy_ip",
+                              8: "origin_cert_pem",
+                              9: "site_html",
+                            }
+                            const hint = FIELD_HINT[s.step_num] ?? "site_html"
+                            const field = window.prompt(
+                              `Override which field for ${historyDomain}?\n\n` +
+                              `Allowed: site_html, status, cf_zone_id, cf_nameservers, ` +
+                              `cf_email, cf_global_key, current_proxy_ip, origin_cert_pem, origin_key_pem`,
+                              hint,
+                            )?.trim()
+                            if (!field) return
+                            const value = window.prompt(`New value for ${field}:`) ?? ""
+                            void domainActions.override(historyDomain, field, value).then((r) => {
+                              show(r.ok ? "ok" : "err", r.message ?? r.error ?? "")
+                              setHistoryDomain(null)
+                            })
+                          }}
+                          title={`Manually override one whitelisted domain column (step ${s.step_num} suggests its primary field)`}
+                        >
+                          Override field
+                        </Button>
+                      </div>
+                    )}
+                  </li>
+                )
+              })}
+            </ol>
+          </div>
+        )}
+      </OperatorDialog>
+
+      {/* === CF Credentials modal — replaces Flask's #cfModal === */}
+      <OperatorDialog
+        open={cfModalDomain !== null}
+        onOpenChange={(o) => { if (!o) { setCfModalDomain(null); setCfShowKey(false) } }}
+        title={`CF credentials — ${cfModalDomain ?? ""}`}
+        description="Manual override. Fields you leave blank stay unchanged. Normally these are populated by the CF key pool — only edit when something is broken."
+        submitLabel="Save"
+        onSubmit={submitCfUpdate}
+        resultMessage={cfResult?.text ?? null}
+        resultKind={cfResult?.kind ?? null}
+      >
+        <Field>
+          <FieldLabel>cf_email</FieldLabel>
+          <Input
+            type="email"
+            value={cfFields.email}
+            onChange={(e) => setCfFields((s) => ({ ...s, email: e.target.value }))}
+            placeholder="(leave blank to keep)"
+          />
+        </Field>
+        <Field>
+          <FieldLabel>cf_global_key</FieldLabel>
+          <div className="relative">
+            <Input
+              type={cfShowKey ? "text" : "password"}
+              value={cfFields.key}
+              onChange={(e) => setCfFields((s) => ({ ...s, key: e.target.value }))}
+              className="pr-9 font-mono text-small"
+              placeholder="(leave blank to keep)"
+            />
+            <button
+              type="button"
+              onClick={() => setCfShowKey((v) => !v)}
+              className="absolute right-2 top-1/2 -translate-y-1/2 h-6 w-6 inline-flex items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+              aria-label={cfShowKey ? "Hide API key" : "Show API key"}
+              title={cfShowKey ? "Hide API key" : "Show API key"}
+              tabIndex={-1}
+            >
+              {cfShowKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+            </button>
+          </div>
+        </Field>
+        <Field>
+          <FieldLabel>cf_zone_id</FieldLabel>
+          <Input
+            value={cfFields.zone}
+            onChange={(e) => setCfFields((s) => ({ ...s, zone: e.target.value }))}
+            placeholder="(leave blank to keep)"
+            className="font-mono text-small"
+          />
+        </Field>
+      </OperatorDialog>
+
+      {/* === Add Domains modal — replaces window.prompt chain === */}
+      <OperatorDialog
+        open={addOpen}
+        onOpenChange={(o) => { if (!o) setAddOpen(false) }}
+        title="Add Domains"
+        description="Paste one per line, or comma-separated. Each row inserts as status=pending — the pipeline will run only if you trigger it from the row Run action."
+        submitLabel="Add"
+        onSubmit={submitAdd}
+        resultMessage={addResult?.text ?? null}
+        resultKind={addResult?.kind ?? null}
+      >
+        <Field>
+          <FieldLabel>Domains</FieldLabel>
+          <Textarea
+            value={addText}
+            onChange={(e) => setAddText(e.target.value)}
+            rows={8}
+            className="font-mono text-small"
+            placeholder={"example1.com\nexample2.site\nexample3.net"}
+            autoFocus
+          />
+          <FieldDescription>Invalid lines are silently skipped — the response shows added/skipped counts.</FieldDescription>
+        </Field>
+      </OperatorDialog>
+
+      {/* === Import CSV modal — replaces silent file picker === */}
+      <OperatorDialog
+        open={importOpen}
+        onOpenChange={(o) => { if (!o) setImportOpen(false) }}
+        title="Import Domains from CSV"
+        description="Bulk-add domains; optionally restore CF credentials in the same shot."
+        submitLabel="Import"
+        onSubmit={submitImport}
+        resultMessage={importResult?.text ?? null}
+        resultKind={importResult?.kind ?? null}
+      >
+        <div className="rounded-md border border-status-running/30 bg-status-running/8 px-3 py-2 text-small text-status-running flex items-start gap-2">
+          <Info className="h-4 w-4 mt-0.5 shrink-0" aria-hidden />
+          <div>
+            CSV must have a <code className="font-mono">domain</code> column. Optional columns:{" "}
+            <code className="font-mono">cf_email</code>,{" "}
+            <code className="font-mono">cf_global_key</code>,{" "}
+            <code className="font-mono">cf_zone_id</code>,{" "}
+            <code className="font-mono">cf_nameservers</code> — to restore credentials when re-importing.
+          </div>
+        </div>
+        <Field>
+          <FieldLabel>CSV File</FieldLabel>
+          <label className="flex items-center gap-2 cursor-pointer rounded-md border border-dashed border-border bg-muted/30 px-3 py-2 hover:bg-muted/50 text-small">
+            <FileUp className="h-4 w-4 text-muted-foreground" aria-hidden />
+            <span className="text-muted-foreground">
+              {importFile ? importFile.name : "Click to choose a .csv file"}
+            </span>
+            <input
+              type="file" accept=".csv,text/csv" className="hidden"
+              onChange={(e) => setImportFile(e.target.files?.[0] ?? null)}
+            />
+            {importFile && (
+              <button
+                type="button"
+                onClick={(e) => { e.preventDefault(); setImportFile(null) }}
+                className="ml-auto text-micro text-muted-foreground hover:text-foreground"
+                title="Clear chosen file"
+              >
+                clear
+              </button>
+            )}
+          </label>
+        </Field>
+      </OperatorDialog>
     </AppShell>
   )
 }

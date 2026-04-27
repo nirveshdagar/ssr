@@ -1,6 +1,7 @@
 import * as React from "react"
 import { AppSidebar } from "./app-sidebar"
 import { TopBar } from "./top-bar"
+import { CommandPalette } from "./command-palette"
 
 export type PageAccent =
   | "dashboard"
@@ -29,6 +30,9 @@ export function AppShell({ title, description, breadcrumbs, actions, accent, chi
         <TopBar title={title} description={description} breadcrumbs={breadcrumbs} actions={actions} accent={accent} />
         <main className="flex-1 px-4 lg:px-6 py-5 lg:py-6">{children}</main>
       </div>
+      {/* Mounted once at the shell root so every route shares the same ⌘K
+          handler + SWR cache for resource lookups. */}
+      <CommandPalette />
     </div>
   )
 }

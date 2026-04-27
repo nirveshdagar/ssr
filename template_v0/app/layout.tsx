@@ -24,10 +24,13 @@ export const metadata: Metadata = {
   robots: { index: false, follow: false },
 }
 
+// Browser chrome theme color — must be sRGB hex (PWA spec doesn't accept
+// CSS vars), so these stay as literals. Kept in sync with --background:
+// SaaSflow cool-gray #f5f7fb in light, navy-tinted near-black in dark.
 export const viewport: Viewport = {
   themeColor: [
-    { media: "(prefers-color-scheme: light)", color: "#FAFBFC" },
-    { media: "(prefers-color-scheme: dark)", color: "#0E0F12" },
+    { media: "(prefers-color-scheme: light)", color: "#f5f7fb" },
+    { media: "(prefers-color-scheme: dark)", color: "#0c1224" },
   ],
 }
 

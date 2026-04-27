@@ -15,10 +15,19 @@ const fetcher = (url: string) => fetch(url).then((r) => {
 export interface DomainRow {
   id: string
   name: string
+  /** Normalized to PipelineStatus for badge/chip rendering. */
   status: PipelineStatus
+  /** Raw DB status (e.g. "ns_pending_external", "ssl_installed") — exposed
+   *  so the page can filter against the 22 fine-grained Flask statuses. */
+  rawStatus: string
   step: number
   server: string
   cfKey: string
+  cfEmail: string
+  cfZoneId: string
+  cfGlobalKey: string
+  serverId: number | null
+  cfKeyId: number | null
   ip: string
   createdAt: string
   registrar: "Spaceship" | "Imported"
@@ -30,6 +39,9 @@ interface ApiDomain {
   status: string
   server_id: number | null
   cf_key_id: number | null
+  cf_email: string | null
+  cf_global_key: string | null
+  cf_zone_id: string | null
   current_proxy_ip: string | null
   created_at: string
 }
@@ -70,9 +82,15 @@ export function useDomains() {
     id: String(d.id),
     name: d.domain,
     status: NORMALIZE_STATUS[d.status] ?? "pending",
+    rawStatus: d.status || "pending",
     step: 0, // step_tracker is per-domain; not joined here yet
     server: d.server_id ? `srv-${d.server_id}` : "—",
     cfKey: d.cf_key_id ? `cf-${d.cf_key_id}` : "—",
+    cfEmail: d.cf_email ?? "",
+    cfZoneId: d.cf_zone_id ?? "",
+    cfGlobalKey: d.cf_global_key ?? "",
+    serverId: d.server_id,
+    cfKeyId: d.cf_key_id,
     ip: d.current_proxy_ip ?? "—",
     createdAt: d.created_at,
     registrar: "Spaceship",

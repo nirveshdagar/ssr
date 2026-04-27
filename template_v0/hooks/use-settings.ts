@@ -1,0 +1,90 @@
+"use client"
+import useSWR from "swr"
+
+export interface SettingsValues {
+  // strings
+  spaceship_api_key: string
+  spaceship_api_secret: string
+  registrant_first_name: string
+  registrant_last_name: string
+  registrant_email: string
+  registrant_phone: string
+  registrant_address: string
+  registrant_city: string
+  registrant_state: string
+  registrant_zip: string
+  registrant_country: string
+  do_api_token: string
+  do_api_token_backup: string
+  serveravatar_api_key: string
+  serveravatar_org_id: string
+  sa_dashboard_email: string
+  sa_dashboard_password: string
+  llm_provider: string
+  llm_api_key: string
+  llm_model: string
+  llm_api_key_anthropic: string
+  llm_api_key_openai: string
+  llm_api_key_gemini: string
+  llm_api_key_openrouter: string
+  smtp_server: string
+  smtp_port: string
+  smtp_email: string
+  smtp_password: string
+  notify_email: string
+  telegram_bot_token: string
+  telegram_chat_id: string
+  whatsapp_provider: string
+  whatsapp_phone: string
+  whatsapp_apikey: string
+  greenapi_instance_id: string
+  greenapi_api_token: string
+  greenapi_host: string
+  twilio_account_sid: string
+  twilio_auth_token: string
+  twilio_from_number: string
+  sms_to_number: string
+  server_root_password: string
+  live_check_interval_s: string
+  dead_server_threshold_ticks: string
+  max_droplets_per_hour: string
+  // booleans
+  auto_migrate_enabled: boolean
+  do_use_backup_first: boolean
+  notifications_enabled: boolean
+  email_enabled: boolean
+  telegram_enabled: boolean
+  whatsapp_enabled: boolean
+  sms_enabled: boolean
+  migrate_always_provision_new: boolean
+  // info / read-only
+  has_password: boolean
+  /** "primary" | "backup" | "" — set by runtime when a DO probe succeeds. */
+  do_last_working_token: string
+  // write-only — never returned by GET, only sent on save
+  dashboard_password?: string
+}
+
+const fetcher = async (url: string): Promise<{ settings: SettingsValues }> => {
+  const r = await fetch(url, { credentials: "same-origin" })
+  if (!r.ok) throw new Error(`HTTP ${r.status}`)
+  return r.json()
+}
+
+export function useSettings() {
+  const { data, error, isLoading, mutate } = useSWR<{ settings: SettingsValues }>(
+    "/api/settings", fetcher, { revalidateOnFocus: false },
+  )
+  return { settings: data?.settings, error, isLoading, mutate }
+}
+
+export async function saveSettings(patch: Partial<SettingsValues>): Promise<{ ok: boolean; count: number }> {
+  const r = await fetch("/api/settings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify(patch),
+  })
+  if (!r.ok) throw new Error(`save HTTP ${r.status}`)
+  return r.json()
+}

@@ -6,6 +6,26 @@ import { Moon, Sun, Search, Command, Bell, ChevronRight } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 
+/**
+ * Detect whether we're running in production. The Node side tags `NODE_ENV`
+ * as a build-time `NEXT_PUBLIC_NODE_ENV` (set in next.config) OR we infer
+ * from the host: localhost / 127.0.0.1 / 0.0.0.0 / *.local → LOCAL, else PROD.
+ *
+ * Mirrors Flask base.html semantics: LOCAL is green, PROD is red — flagging
+ * production at a glance so an operator doesn't accidentally run destructive
+ * commands on the wrong dashboard.
+ */
+function detectEnv(): "LOCAL" | "PROD" {
+  if (typeof window === "undefined") return "PROD"
+  const h = window.location.hostname
+  if (
+    h === "localhost" || h === "127.0.0.1" || h === "0.0.0.0" ||
+    h.endsWith(".local") || h.endsWith(".localhost") ||
+    /^10\./.test(h) || /^192\.168\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h)
+  ) return "LOCAL"
+  return "PROD"
+}
+
 type Accent =
   | "dashboard"
   | "domains"
@@ -38,7 +58,9 @@ const ACCENT_CLASS: Record<Accent, string> = {
 export function TopBar({ title, description, breadcrumbs, actions, accent }: TopBarProps) {
   const { resolvedTheme, setTheme } = useTheme()
   const [mounted, setMounted] = React.useState(false)
-  React.useEffect(() => setMounted(true), [])
+  const [env, setEnv] = React.useState<"LOCAL" | "PROD">("PROD")
+  React.useEffect(() => { setMounted(true); setEnv(detectEnv()) }, [])
+  const accentVar = accent ? `var(--page-${accent})` : undefined
 
   return (
     <header
@@ -47,6 +69,15 @@ export function TopBar({ title, description, breadcrumbs, actions, accent }: Top
         accent && ACCENT_CLASS[accent],
       )}
     >
+      {/* 2px accent strip — matches Flask base.html ::before. The color
+          tracks the per-page accent so each section is visually distinct. */}
+      {accentVar && (
+        <div
+          className="h-[2px] w-full"
+          style={{ backgroundColor: accentVar }}
+          aria-hidden
+        />
+      )}
       <div className="flex h-14 items-center gap-3 px-4 lg:px-6">
         <div className="flex min-w-0 flex-1 items-center gap-2">
           {breadcrumbs && breadcrumbs.length > 0 ? (
@@ -66,10 +97,15 @@ export function TopBar({ title, description, breadcrumbs, actions, accent }: Top
           )}
         </div>
 
-        {/* Center search */}
+        {/* Center search — opens the global command palette (⌘K). The
+            keyboard shortcut is handled inside <CommandPalette/> directly;
+            this button just dispatches a custom event so a click reaches the
+            same UI without prop-drilling state through the whole shell. */}
         <div className="hidden lg:flex flex-1 max-w-md justify-center">
           <button
             type="button"
+            onClick={() => window.dispatchEvent(new Event("ssr:open-palette"))}
+            title="Open the command palette — search domains, servers, CF keys + run actions"
             className="group flex h-8 w-full items-center gap-2 rounded-md border border-input bg-card px-2.5 text-small text-muted-foreground transition-colors hover:border-ring/40"
           >
             <Search className="h-3.5 w-3.5" aria-hidden />
@@ -81,14 +117,28 @@ export function TopBar({ title, description, breadcrumbs, actions, accent }: Top
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Env badge — colored to flag production at a glance */}
-          <span
-            className="hidden sm:inline-flex items-center gap-1.5 rounded-md border border-[color:color-mix(in_oklch,var(--destructive)_30%,transparent)] bg-[color:color-mix(in_oklch,var(--destructive)_10%,transparent)] px-2 py-1 text-micro font-medium tabular-nums text-[color:var(--destructive)]"
-            title="Current environment: production"
-          >
-            <span className="h-1.5 w-1.5 rounded-full bg-destructive animate-status-pulse" aria-hidden />
-            <span className="font-mono uppercase tracking-wider">PROD</span>
-          </span>
+          {/* Env badge — green for LOCAL, red for PROD. Detected from the
+              browser's hostname; flags accidental clicks on the wrong env. */}
+          {mounted && (
+            <span
+              className={cn(
+                "hidden sm:inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-micro font-medium tabular-nums",
+                env === "LOCAL"
+                  ? "border-[color:color-mix(in_oklch,var(--success)_30%,transparent)] bg-[color:color-mix(in_oklch,var(--success)_10%,transparent)] text-[color:var(--success)]"
+                  : "border-[color:color-mix(in_oklch,var(--destructive)_30%,transparent)] bg-[color:color-mix(in_oklch,var(--destructive)_10%,transparent)] text-[color:var(--destructive)]",
+              )}
+              title={`Current environment: ${env === "LOCAL" ? "local development" : "production"}`}
+            >
+              <span
+                className={cn(
+                  "h-1.5 w-1.5 rounded-full animate-status-pulse",
+                  env === "LOCAL" ? "bg-[color:var(--success)]" : "bg-destructive",
+                )}
+                aria-hidden
+              />
+              <span className="font-mono uppercase tracking-wider">{env}</span>
+            </span>
+          )}
 
           {actions}
 
