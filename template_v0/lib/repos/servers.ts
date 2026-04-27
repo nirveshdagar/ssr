@@ -16,7 +16,8 @@ export interface ServerRow {
 }
 
 const SERVER_COLS = new Set<keyof ServerRow>([
-  "name", "ip", "do_droplet_id", "sa_server_id", "sa_org_id", "status", "max_sites",
+  "name", "ip", "do_droplet_id", "sa_server_id", "sa_org_id", "status",
+  "region", "size_slug", "max_sites",
 ])
 
 export function listServers(): ServerRow[] {
@@ -48,6 +49,14 @@ export function updateServer(id: number, updates: Partial<ServerRow>): void {
 
 export function deleteServerRow(id: number): void {
   run("DELETE FROM servers WHERE id = ?", id)
+}
+
+export function addServer(name: string, ip: string, doDropletId?: string | null): number {
+  const r = run(
+    `INSERT INTO servers(name, ip, do_droplet_id, status) VALUES(?, ?, ?, 'creating')`,
+    name, ip, doDropletId ?? null,
+  )
+  return Number(r.lastInsertRowid)
 }
 
 export function countDomainsOnServer(serverId: number): number {

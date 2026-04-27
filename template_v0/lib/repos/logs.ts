@@ -1,4 +1,14 @@
-import { all } from "../db"
+import { all, run } from "../db"
+
+export function logPipeline(domain: string, step: string, status: string, message = ""): void {
+  run(
+    "INSERT INTO pipeline_log(domain,step,status,message) VALUES(?,?,?,?)",
+    domain,
+    step,
+    status,
+    message,
+  )
+}
 
 export interface PipelineLogRow {
   id: number
@@ -24,20 +34,5 @@ export function listPipelineLogs(opts: { domain?: string | null; limit?: number 
   )
 }
 
-export interface StepTrackerRow {
-  id: number
-  domain: string
-  step_num: number
-  step_name: string
-  status: string
-  message: string
-  started_at: string | null
-  finished_at: string | null
-}
-
-export function getSteps(domain: string): StepTrackerRow[] {
-  return all<StepTrackerRow>(
-    `SELECT * FROM step_tracker WHERE domain = ? ORDER BY step_num ASC`,
-    domain,
-  )
-}
+// step_tracker types and helpers live in repos/steps.ts (see getSteps,
+// StepTrackerRow there). They moved when watcher helpers were consolidated.
