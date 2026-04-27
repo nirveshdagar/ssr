@@ -14,6 +14,7 @@ const PUBLIC_PATHS = new Set<string>([
   "/login",
   "/api/auth/login",
   "/api/health",
+  "/healthz",
   "/favicon.ico",
 ])
 
@@ -39,5 +40,11 @@ export async function middleware(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!.*\\..*).*)", "/"],
+  // Always run middleware on /api (domain names contain dots, so the bare
+  // "no path with a dot" pattern accidentally lets /api/domains/x.y.com/... through),
+  // and run on every other path that isn't a Next.js static asset.
+  matcher: [
+    "/api/:path*",
+    "/((?!_next/static|_next/image|favicon\\.ico|icon|apple-icon|placeholder).*)",
+  ],
 }
