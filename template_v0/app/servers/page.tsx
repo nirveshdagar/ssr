@@ -16,6 +16,7 @@ import {
   AlertTriangle,
   X,
   ServerOff,
+  Link2,
 } from "lucide-react"
 import { AppShell } from "@/components/ssr/app-shell"
 import { StatusBadge } from "@/components/ssr/status-badge"
@@ -192,6 +193,29 @@ export default function ServersPage() {
     }
     await refresh(); setBusy(null)
   }
+  async function reconcileSa() {
+    if (!confirm(
+      "Walk ServerAvatar and link any orphaned dashboard rows by IP?\n\n" +
+      "Only rows with status≠'ready' or no sa_server_id are touched. " +
+      "Use this to recover droplets where step 6 finished installing in SA " +
+      "after the Node side aborted (SSH timeout, worker restart, etc).",
+    )) return
+    setBusy("reconcile-sa")
+    const r = await serverActions.reconcileFromSa() as {
+      ok?: boolean
+      claimed?: { id: number; ip: string | null; sa_server_id: string }[]
+      still_orphaned?: { id: number; ip: string | null; reason: string }[]
+      already_ok?: number
+      message?: string
+      error?: string
+    }
+    if (r.ok) {
+      show("ok", r.message ?? `Reconciled ${r.claimed?.length ?? 0} server(s)`)
+    } else {
+      show("err", r.error ?? "Reconcile failed")
+    }
+    await refresh(); setBusy(null)
+  }
 
   // Hard-delete dialog — typed-name confirm, lists what will be destroyed.
   const [destroyServer, setDestroyServer] = React.useState<
@@ -308,6 +332,16 @@ export default function ServersPage() {
             title="Drop dashboard rows whose DO droplet no longer exists upstream"
           >
             <RefreshCw className={cn("h-3.5 w-3.5", busy === "sync-do" && "animate-spin")} /> Sync from DO
+          </Button>
+          {/* Reconcile-from-SA — claim orphans whose SA agent finished installing
+              after the Node side aborted (SSH timeout, worker restart, etc). */}
+          <Button
+            variant="outline" size="sm"
+            className="gap-1.5 hidden sm:inline-flex btn-soft-success"
+            onClick={reconcileSa} disabled={busy === "reconcile-sa"}
+            title="Walk SA + link orphaned rows by IP — recovers servers where the agent installed after Node aborted"
+          >
+            <Link2 className={cn("h-3.5 w-3.5", busy === "reconcile-sa" && "animate-spin")} /> Reconcile from SA
           </Button>
           <Button
             variant="outline" size="sm"

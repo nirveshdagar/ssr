@@ -140,6 +140,14 @@ export const serverActions = {
     postForm("/api/servers/destroy-all", { confirm_phrase: confirmPhrase }),
   syncFromDo: () => postForm("/api/servers/sync-from-do"),
   importFromDo: () => postForm("/api/servers/import-from-do"),
+  /**
+   * Walk SA, match each connected SA server to a DB row by IP, and back-fill
+   * sa_server_id + status='ready' on rows that lost their link (e.g. SSH
+   * timeout aborted a step-6 install before the sa_server_id was written).
+   * Pass `dryRun=true` to preview without writing.
+   */
+  reconcileFromSa: (dryRun = false) =>
+    postForm("/api/servers/reconcile-from-sa", { dry_run: dryRun ? "on" : undefined }),
   /** Hard delete — destroys DO droplet + SA server + DB row. Requires typed-name match. */
   delete: (id: number, confirmName: string) =>
     postForm(`/api/servers/${id}/delete`, { confirm_name: confirmName }),
