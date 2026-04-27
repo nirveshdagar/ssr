@@ -126,17 +126,24 @@ export interface PipelineFullPayload {
   skip_purchase?: boolean
   server_id?: number | null
   start_from?: number | null
+  force_new_server?: boolean
 }
 
 export interface PipelineBulkPayload {
   domains: string[]
   skip_purchase?: boolean
   server_id?: number | null
+  force_new_server?: boolean
 }
 
 export function runFullPipeline(
   domain: string,
-  opts: { skipPurchase?: boolean; serverId?: number | null; startFrom?: number | null } = {},
+  opts: {
+    skipPurchase?: boolean
+    serverId?: number | null
+    startFrom?: number | null
+    forceNewServer?: boolean
+  } = {},
 ): number | null {
   if (!tryAcquireSlot(domain)) {
     logPipeline(domain, "pipeline", "warning",
@@ -148,6 +155,7 @@ export function runFullPipeline(
     skip_purchase: opts.skipPurchase ?? false,
     server_id: opts.serverId ?? null,
     start_from: opts.startFrom ?? null,
+    force_new_server: opts.forceNewServer ?? false,
   })
 }
 
@@ -174,7 +182,11 @@ export interface BulkRunResult {
  */
 export function runBulkPipeline(
   domains: string[],
-  opts: { skipPurchase?: boolean; serverId?: number | null } = {},
+  opts: {
+    skipPurchase?: boolean
+    serverId?: number | null
+    forceNewServer?: boolean
+  } = {},
 ): BulkRunResult {
   const eligible: string[] = []
   let skipped = 0
@@ -193,6 +205,7 @@ export function runBulkPipeline(
       skip_purchase: opts.skipPurchase ?? false,
       server_id: opts.serverId ?? null,
       start_from: null,
+      force_new_server: opts.forceNewServer ?? false,
     }),
   )
   return {
@@ -209,14 +222,20 @@ export function runBulkPipeline(
 
 async function pipelineFullHandler(payload: Record<string, unknown>): Promise<void> {
   const p = payload as unknown as PipelineFullPayload
-  await pipelineWorker(p.domain, p.skip_purchase ?? false, p.server_id ?? null, p.start_from ?? null)
+  await pipelineWorker(
+    p.domain, p.skip_purchase ?? false, p.server_id ?? null,
+    p.start_from ?? null, p.force_new_server ?? false,
+  )
 }
 
 async function pipelineBulkHandler(payload: Record<string, unknown>): Promise<void> {
   const p = payload as unknown as PipelineBulkPayload
   for (const d of p.domains) {
     try {
-      await pipelineWorker(d, p.skip_purchase ?? false, p.server_id ?? null, null)
+      await pipelineWorker(
+        d, p.skip_purchase ?? false, p.server_id ?? null,
+        null, p.force_new_server ?? false,
+      )
     } catch (e) {
       logPipeline(d, "pipeline", "failed",
         `Bulk-worker exception escaped: ${(e as Error).name}: ${(e as Error).message}`)
@@ -234,7 +253,8 @@ export function registerPipelineHandlers(): void {
 // ---------------------------------------------------------------------------
 
 async function pipelineWorker(
-  domain: string, skipPurchase: boolean, serverId: number | null, startFrom: number | null,
+  domain: string, skipPurchase: boolean, serverId: number | null,
+  startFrom: number | null, forceNewServer: boolean,
 ): Promise<void> {
   const runId = startPipelineRun(domain, {
     skip_purchase: skipPurchase,
@@ -243,7 +263,7 @@ async function pipelineWorker(
   })
   const ticker = startHeartbeat(domain, 1000)
   try {
-    await pipelineWorkerImpl(domain, skipPurchase, serverId, startFrom)
+    await pipelineWorkerImpl(domain, skipPurchase, serverId, startFrom, forceNewServer)
   } finally {
     ticker.stop()
     // Determine final outcome from the post-run domain status. Order matters:
@@ -272,6 +292,7 @@ async function pipelineWorker(
 
 async function pipelineWorkerImpl(
   domain: string, skipPurchase: boolean, serverId: number | null, startFrom: number | null,
+  forceNewServer: boolean,
 ): Promise<void> {
   try {
     addDomain(domain)
@@ -308,7 +329,7 @@ async function pipelineWorkerImpl(
     checkCancel(domain)
     let server: ServerRow | null
     if (startFrom == null || startFrom <= 6) {
-      server = await step6GetOrProvisionServer(domain, serverId)
+      server = await step6GetOrProvisionServer(domain, serverId, forceNewServer)
       if (!server) return
     } else {
       const resumeId = serverId ?? getDomain(domain)?.server_id ?? null
@@ -568,22 +589,27 @@ async function step5WaitZoneActive(domain: string, timeoutMs = 600_000, pollMs =
 }
 
 async function step6GetOrProvisionServer(
-  domain: string, explicitServerId: number | null,
+  domain: string, explicitServerId: number | null, forceNew = false,
 ): Promise<ServerRow | null> {
-  const existing = findServer(explicitServerId)
-  if (existing) {
-    updateStep(domain, 6, "completed",
-      `Using existing server #${existing.id} ${existing.name} (${existing.ip})  ` +
-      `sites=${existing.sites_count}/${existing.max_sites}`)
-    setStepArtifact(domain, 6, {
-      source: "existing", server_id: existing.id,
-      server_name: existing.name, server_ip: existing.ip,
-      sa_server_id: existing.sa_server_id,
-    })
-    return existing
+  if (!forceNew) {
+    const existing = findServer(explicitServerId)
+    if (existing) {
+      updateStep(domain, 6, "completed",
+        `Using existing server #${existing.id} ${existing.name} (${existing.ip})  ` +
+        `sites=${existing.sites_count}/${existing.max_sites}`)
+      setStepArtifact(domain, 6, {
+        source: "existing", server_id: existing.id,
+        server_name: existing.name, server_ip: existing.ip,
+        sa_server_id: existing.sa_server_id,
+      })
+      return existing
+    }
   }
 
-  updateStep(domain, 6, "running", "No server with capacity — provisioning new DO droplet...")
+  updateStep(domain, 6, "running",
+    forceNew
+      ? "Operator requested new server — provisioning DO droplet..."
+      : "No server with capacity — provisioning new DO droplet...")
   try {
     const serverName = `ssr-${Math.floor(Date.now() / 1000)}-${Math.floor(Math.random() * 9000) + 1000}`
     const { serverId, ip, dropletId } = await createDroplet({ name: serverName })

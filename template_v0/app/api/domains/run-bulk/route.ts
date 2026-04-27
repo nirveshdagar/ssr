@@ -11,6 +11,7 @@ export async function POST(req: NextRequest): Promise<Response> {
   const skipPurchase = ((form?.get("skip_purchase") as string | null) || "") === "on"
   const serverIdRaw = ((form?.get("server_id") as string | null) || "").trim()
   const serverId = serverIdRaw ? Number.parseInt(serverIdRaw, 10) : null
+  const forceNewServer = ((form?.get("force_new_server") as string | null) || "") === "on"
   const idSet = new Set(domainIds)
   const domainsList = listDomains()
     .filter((d) => idSet.has(String(d.id)))
@@ -18,7 +19,7 @@ export async function POST(req: NextRequest): Promise<Response> {
   if (!domainsList.length) {
     return NextResponse.json({ ok: false, error: "No matching domains" }, { status: 400 })
   }
-  const result = runBulkPipeline(domainsList, { skipPurchase, serverId })
+  const result = runBulkPipeline(domainsList, { skipPurchase, serverId, forceNewServer })
   if (result.enqueued === 0) {
     return NextResponse.json({
       ok: false,

@@ -6,9 +6,10 @@ export const runtime = "nodejs"
 
 /**
  * Kick off a full pipeline run for `domain`. Optional form params:
- *   skip_purchase=on  — skip step 1 purchase (BYO domain)
- *   server_id=N       — pin to a specific server (else round-robin)
- *   start_from=N      — resume from step N (1-10)
+ *   skip_purchase=on     — skip step 1 purchase (BYO domain)
+ *   server_id=N          — pin to a specific server (else round-robin)
+ *   start_from=N         — resume from step N (1-10)
+ *   force_new_server=on  — bypass round-robin and always provision a fresh droplet
  */
 export async function POST(
   req: NextRequest,
@@ -25,9 +26,10 @@ export async function POST(
   const skipPurchase = ((form?.get("skip_purchase") as string | null) || "") === "on"
   const serverIdRaw = ((form?.get("server_id") as string | null) || "").trim()
   const startFromRaw = ((form?.get("start_from") as string | null) || "").trim()
+  const forceNewServer = ((form?.get("force_new_server") as string | null) || "") === "on"
   const serverId = serverIdRaw ? Number.parseInt(serverIdRaw, 10) : null
   const startFrom = startFromRaw ? Number.parseInt(startFromRaw, 10) : null
-  const jobId = runFullPipeline(domain, { skipPurchase, serverId, startFrom })
+  const jobId = runFullPipeline(domain, { skipPurchase, serverId, startFrom, forceNewServer })
   if (jobId == null) {
     return NextResponse.json({
       ok: false,

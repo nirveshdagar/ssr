@@ -178,10 +178,16 @@ function DomainsPageInner() {
   }
   async function submitRunPipeline() {
     if (!runModalDomain) return
-    const opts: { skipPurchase?: boolean; serverId?: number; startFrom?: number } = {
+    const opts: {
+      skipPurchase?: boolean
+      serverId?: number
+      startFrom?: number
+      forceNewServer?: boolean
+    } = {
       skipPurchase: runOpts.skipPurchase,
     }
-    if (runOpts.serverId) opts.serverId = Number(runOpts.serverId)
+    if (runOpts.serverId === "__new__") opts.forceNewServer = true
+    else if (runOpts.serverId) opts.serverId = Number(runOpts.serverId)
     if (runOpts.startFrom) opts.startFrom = Number(runOpts.startFrom)
     const r = await domainActions.runPipeline(runModalDomain, opts)
     if (r.ok) {
@@ -308,9 +314,10 @@ function DomainsPageInner() {
   }
   async function bulkRun() {
     setBusy("bulk")
-    const opts: { skipPurchase?: boolean; serverId?: number } = {}
+    const opts: { skipPurchase?: boolean; serverId?: number; forceNewServer?: boolean } = {}
     if (bulkSkipPurchase) opts.skipPurchase = true
-    if (bulkServerId) opts.serverId = Number(bulkServerId)
+    if (bulkServerId === "__new__") opts.forceNewServer = true
+    else if (bulkServerId) opts.serverId = Number(bulkServerId)
     const r = await domainActions.runBulk([...selected], opts) as { ok?: boolean; message?: string; error?: string }
     show(r.ok ? "ok" : "err", String(r.message ?? r.error ?? ""))
     setSelected(new Set()); setBulkSkipPurchase(false); setBulkServerId("")
@@ -889,6 +896,7 @@ function DomainsPageInner() {
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="__auto__">Auto server (round-robin)</SelectItem>
+                <SelectItem value="__new__">Provision new server (fresh DO droplet)</SelectItem>
                 {eligibleServers.map((s) => (
                   <SelectItem key={s.id} value={s.id}>
                     {s.name} ({s.ip}) · {s.domains}/{s.capacity}
@@ -999,6 +1007,7 @@ function DomainsPageInner() {
             <SelectTrigger size="sm" className="h-8 text-small"><SelectValue /></SelectTrigger>
             <SelectContent>
               <SelectItem value="__auto__">Auto (round-robin across ready servers)</SelectItem>
+              <SelectItem value="__new__">Provision new server (fresh DO droplet)</SelectItem>
               {eligibleServers.map((s) => (
                 <SelectItem key={s.id} value={s.id}>
                   {s.name} ({s.ip}) · {s.domains}/{s.capacity}

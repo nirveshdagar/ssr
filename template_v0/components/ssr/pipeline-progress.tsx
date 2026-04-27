@@ -1,6 +1,11 @@
 import { Check, Loader2 } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { PIPELINE_STEPS, type PipelineStatus } from "@/lib/ssr/mock-data"
+import { PIPELINE_STEPS } from "@/lib/status-taxonomy"
+import type { PipelineStatus } from "@/lib/ssr/mock-data"
+
+const STEP_ENTRIES = Object.entries(PIPELINE_STEPS)
+  .map(([num, label]) => ({ id: Number(num), label }))
+  .sort((a, b) => a.id - b.id)
 
 interface PipelineProgressProps {
   currentStep: number
@@ -16,7 +21,7 @@ export function PipelineProgress({ currentStep, status, className, compact = fal
   return (
     <div className={cn("w-full", className)}>
       <ol className="flex items-stretch gap-1.5 overflow-x-auto" role="list">
-        {PIPELINE_STEPS.map((step) => {
+        {STEP_ENTRIES.map((step) => {
           const isCompleted = step.id < currentStep || status === "live"
           const isCurrent = step.id === currentStep && !canceled && status !== "live"
           const isPending = step.id > currentStep

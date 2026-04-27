@@ -68,21 +68,31 @@ export const domainActions = {
   cancelPipeline: (domain: string) => postForm(`/api/domains/${domain}/cancel-pipeline`),
   runPipeline: (
     domain: string,
-    opts: { skipPurchase?: boolean; serverId?: number; startFrom?: number } = {},
+    opts: {
+      skipPurchase?: boolean
+      serverId?: number
+      startFrom?: number
+      forceNewServer?: boolean
+    } = {},
   ) => postForm(`/api/domains/${domain}/run-pipeline`, {
     skip_purchase: opts.skipPurchase ? "on" : undefined,
     server_id: opts.serverId != null ? String(opts.serverId) : undefined,
     start_from: opts.startFrom != null ? String(opts.startFrom) : undefined,
+    force_new_server: opts.forceNewServer ? "on" : undefined,
   }),
   runFromStep: (domain: string, step: number, skipPurchase = false) =>
     postForm(`/api/domains/${domain}/run-from/${step}`, {
       skip_purchase: skipPurchase ? "on" : undefined,
     }),
-  runBulk: (domainIds: string[], opts: { skipPurchase?: boolean; serverId?: number } = {}) => {
+  runBulk: (
+    domainIds: string[],
+    opts: { skipPurchase?: boolean; serverId?: number; forceNewServer?: boolean } = {},
+  ) => {
     const fd = new FormData()
     for (const id of domainIds) fd.append("domain_ids", id)
     if (opts.skipPurchase) fd.set("skip_purchase", "on")
     if (opts.serverId != null) fd.set("server_id", String(opts.serverId))
+    if (opts.forceNewServer) fd.set("force_new_server", "on")
     return fetch("/api/domains/run-bulk", { method: "POST", body: fd, credentials: "same-origin" })
       .then(async (r) => ({ ok: r.ok, ...((await r.json()) as Record<string, unknown>) }))
   },
