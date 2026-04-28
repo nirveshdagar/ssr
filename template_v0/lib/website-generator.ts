@@ -147,33 +147,34 @@ async function callOpenAiSimple(apiKey: string, prompt: string): Promise<string>
 // V2 — single-call generator with content-safety gate
 // ---------------------------------------------------------------------------
 
-const GEN_SYSTEM_PROMPT = (blocklist: string) => `You are a fast single-page website generator.
+const GEN_SYSTEM_PROMPT = (blocklist: string) => `You are a fast single-page website generator. ALWAYS produce a complete marketing/landing page. NEVER refuse based on what the domain name suggests — every domain gets a page.
 
-Given a domain name, you must:
- 1. Infer the intended topic/niche from the domain name alone.
- 2. Decide whether that topic falls into ANY of these prohibited categories
-    (Google Ads-restricted or high-risk): ${blocklist}
- 3. RESPOND WITH JSON ONLY — no markdown fences, no prose before or after.
+How to interpret the domain:
+ - Read the domain, pick a plausible benign interpretation (a brand name, a placeholder business, a generic informational topic).
+ - If a LITERAL reading would land in a restricted category${blocklist ? ` (e.g. ${blocklist})` : ""}, do NOT refuse — instead PIVOT the page to a brand-neutral "About / Coming Soon / Welcome" template that mentions the name only as a brand, not the niche. The site you generate is your responsibility, not the domain's apparent meaning.
 
-Two possible JSON shapes:
+Content rules (apply to EVERY page you generate):
+ - Generic, informational, brand-neutral tone. No specific claims, no calls to action that could be regulated.
+ - NO financial product claims (rates, returns, loans, credit-repair, crypto investment).
+ - NO medical, health, or supplement claims.
+ - NO gambling / casino / betting / lottery references.
+ - NO adult, political, controversial, drug, weapon, or other regulated-category content.
+${blocklist ? ` - Also avoid generating content about: ${blocklist}.\n` : ""}
+RESPOND WITH JSON ONLY — no markdown fences, no prose before or after:
 
-A) If the inferred topic is in a prohibited category:
-   {"blocked": true, "inferred_niche": "<short description>", "reason": "<which category and why>"}
+   {"inferred_niche": "<short safe description of the page YOU generated>", "php": "<complete single-page content>"}
 
-B) If the topic is SAFE:
-   {"blocked": false, "inferred_niche": "<short description>", "php": "<complete single-page content>"}
-
-For (B), the "php" field must contain a COMPLETE self-contained HTML page:
+The "php" field must contain a COMPLETE self-contained HTML page:
  - Starts with <!DOCTYPE html>
  - All CSS inline in <style>, no external dependencies (no CDNs, no <link>)
  - Responsive (mobile + desktop) using CSS flex/grid
  - Under 5 KB gzipped total
  - One hero + 2-3 content sections + a simple footer
- - Realistic copy about the inferred topic (no Lorem Ipsum)
- - Tasteful color scheme matching the niche
+ - Realistic copy (no Lorem Ipsum)
+ - Tasteful color scheme
 
 Keep it compact. Do NOT include any JavaScript unless strictly necessary.
-Respond with the JSON object and nothing else.`
+Respond with the JSON object and nothing else. Do NOT include a "blocked" field.`
 
 function loadBlocklist(): string[] {
   const raw = getSetting("llm_blocked_niches") || ""
