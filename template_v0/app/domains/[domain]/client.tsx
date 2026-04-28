@@ -412,7 +412,7 @@ export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, i
                         {elapsed && (
                           <span className="font-mono text-xs tabular-nums text-muted-foreground">{elapsed}</span>
                         )}
-                        {st !== "running" && (
+                        {(st === "failed" || st === "warning") && (
                           <Button
                             variant="ghost"
                             size="sm"

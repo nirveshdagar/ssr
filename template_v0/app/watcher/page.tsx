@@ -444,14 +444,11 @@ export default function WatcherPage() {
                           <div className="flex items-center gap-2">
                             <StatusBadge status={badge} />
                             <span className="font-mono text-micro tabular-nums text-muted-foreground">{elapsed}</span>
-                            {/* Per-step "Run from here" — visible whenever the step
-                                isn't currently running. Lets operators restart
-                                the pipeline at any failed / warning / completed
-                                / skipped / pending boundary. The endpoint just
-                                enqueues pipeline.full with start_from=N; the
-                                pipeline's per-step skip logic handles upstream
-                                completed work. */}
-                            {!isRunning && active.domain !== "No active runs" && (
+                            {/* Per-step "Run from here" — only on FAILED or WARNING
+                                steps. Operators wanted retry-on-failure surface
+                                area, not a button on every successful step too —
+                                that just adds visual noise to a healthy pipeline. */}
+                            {(isFailed || isWarning) && active.domain !== "No active runs" && (
                               <Button
                                 variant="ghost"
                                 size="sm"
