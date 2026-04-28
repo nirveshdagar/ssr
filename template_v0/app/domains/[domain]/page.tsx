@@ -27,17 +27,24 @@ interface PageProps {
 export default async function DomainDetailPage({ params }: PageProps) {
   const { domain: rawDomain } = await params
   const domain = decodeURIComponent(rawDomain)
-  const row = getDomain(domain)
-  if (!row) notFound()
+  const rowRaw = getDomain(domain)
+  if (!rowRaw) notFound()
 
-  const server = row.server_id
+  // node:sqlite hands back null-prototype rows, which Next.js 16's RSC
+  // serializer rejects across the server→client boundary. Shallow-clone
+  // every row that crosses into the client island to make them plain
+  // {} objects.
+  const row = { ...rowRaw }
+  const serverRaw = row.server_id
     ? listServers().find((s) => s.id === row.server_id) ?? null
     : null
-  const cfKey = row.cf_key_id
+  const server = serverRaw ? { ...serverRaw } : null
+  const cfKeyRaw = row.cf_key_id
     ? listCfKeysWithPreview().find((k) => k.id === row.cf_key_id) ?? null
     : null
-  const steps = getSteps(domain)
-  const recentLogs = listPipelineLogs({ domain, limit: 50 })
+  const cfKey = cfKeyRaw ? { ...cfKeyRaw } : null
+  const steps = getSteps(domain).map((s) => ({ ...s }))
+  const recentLogs = listPipelineLogs({ domain, limit: 50 }).map((l) => ({ ...l }))
 
   return (
     <AppShell

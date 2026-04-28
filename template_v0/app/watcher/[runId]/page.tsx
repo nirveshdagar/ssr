@@ -23,9 +23,13 @@ export default async function RunDetailPage({ params }: PageProps) {
   const { runId } = await params
   const id = Number.parseInt(runId, 10)
   if (!Number.isFinite(id) || id <= 0) notFound()
-  const run = getPipelineRun(id)
-  if (!run) notFound()
-  const steps = getStepRuns(id)
+  // node:sqlite returns rows with a NULL prototype. Next.js 16's stricter
+  // RSC serializer rejects those across the server→client boundary, so we
+  // shallow-clone into plain objects before passing as props.
+  const runRaw = getPipelineRun(id)
+  if (!runRaw) notFound()
+  const run = { ...runRaw }
+  const steps = getStepRuns(id).map((s) => ({ ...s }))
 
   const startedHuman = run.started_at
     ? new Date(run.started_at * 1000).toLocaleString()
