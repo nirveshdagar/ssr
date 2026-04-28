@@ -44,25 +44,32 @@ export function OperatorDialog({
   }
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
+      {/* Three-zone flex layout caps the dialog at 90vh of the viewport.
+          Header + footer stay pinned; the middle children-area scrolls when
+          content (e.g. a long code paste in a Textarea) exceeds the
+          available space — operators always see Cancel + the primary
+          submit button regardless of body height. */}
+      <DialogContent className="flex max-h-[90vh] flex-col p-0 sm:max-w-2xl">
+        <DialogHeader className="shrink-0 px-6 pt-6 pb-2">
           <DialogTitle>{title}</DialogTitle>
           {description && <DialogDescription>{description}</DialogDescription>}
         </DialogHeader>
-        <div className="flex flex-col gap-3">{children}</div>
-        {resultMessage && (
-          <div
-            className={
-              "rounded-md border px-3 py-2 text-small " +
-              (resultKind === "ok"
-                ? "border-status-completed/40 bg-status-completed/10 text-status-completed"
-                : "border-status-terminal/40 bg-status-terminal/10 text-status-terminal")
-            }
-          >
-            {resultMessage}
-          </div>
-        )}
-        <DialogFooter>
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 py-3">
+          <div className="flex flex-col gap-3">{children}</div>
+          {resultMessage && (
+            <div
+              className={
+                "mt-3 rounded-md border px-3 py-2 text-small " +
+                (resultKind === "ok"
+                  ? "border-status-completed/40 bg-status-completed/10 text-status-completed"
+                  : "border-status-terminal/40 bg-status-terminal/10 text-status-terminal")
+              }
+            >
+              {resultMessage}
+            </div>
+          )}
+        </div>
+        <DialogFooter className="shrink-0 border-t border-border bg-background/95 px-6 py-3">
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
             Cancel
           </Button>
