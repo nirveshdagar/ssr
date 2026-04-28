@@ -52,7 +52,7 @@ import {
 } from "./spaceship"
 import {
   createZoneForDomain, getZoneStatus, fetchOriginCaCert, setupDomainDns,
-  setDnsARecord, setDnsARecordWww, OriginCaZoneNotActiveError,
+  setDnsARecord, setDnsARecordWww, purgeZoneCache, OriginCaZoneNotActiveError,
 } from "./cloudflare"
 import {
   createApplication, findAppId, installCustomSsl, uploadIndexPhp,
@@ -65,6 +65,7 @@ import {
 import { assignCfKeyToDomain, CFKeyPoolExhausted } from "./cf-key-pool"
 import { isErrorStatus, isWaitingStatus, isSuccessStatus } from "./status-taxonomy"
 import { createHash } from "node:crypto"
+import { one } from "./db"
 
 // ---------------------------------------------------------------------------
 // Per-domain slot lock (in-process; pipelines run within one Node process)
@@ -822,10 +823,19 @@ async function step7CreateAppAndDns(domain: string, server: ServerRow): Promise<
 }
 
 async function step8IssueAndInstallSsl(domain: string, server: ServerRow): Promise<boolean> {
-  const d = getDomain(domain)
-  if (d && (d.status === "ssl_installed" || d.status === "live")) {
-    // Idempotent: SSL already installed (step 8 ran successfully before).
-    updateStep(domain, 8, "skipped", "SSL already installed")
+  // Idempotency check: only skip if step_tracker explicitly says step 8
+  // completed before. Don't trust domain.status alone — status='live' just
+  // means CF returns 200 to a probe, which can be true even when origin
+  // HTTPS is broken (CF's Universal SSL handles visitor↔CF; if origin
+  // SSL never installed, CF falls back to SA's default HTTPS vhost and
+  // serves the SA welcome page with a 200 status). Only step_tracker
+  // proves the cert was actually installed.
+  const stepRow = one<{ status: string }>(
+    "SELECT status FROM step_tracker WHERE domain = ? AND step_num = 8",
+    domain,
+  )
+  if (stepRow?.status === "completed") {
+    updateStep(domain, 8, "skipped", "SSL already installed (step_tracker confirms)")
     return true
   }
 
@@ -904,6 +914,10 @@ async function step8IssueAndInstallSsl(domain: string, server: ServerRow): Promi
     updateStep(domain, 8, "completed", `SSL installed (${installMsg})`)
     updateDomain(domain, { status: "ssl_installed" })
     setStepArtifact(domain, 8, { cert_id: bundle.id, expires_on: bundle.expires_on })
+    // Purge CF cache. Origin SSL just changed — any cached "SA welcome"
+    // response from CF's earlier fetch through the broken HTTPS vhost
+    // would otherwise persist for hours.
+    void purgeZoneCache(domain).catch(() => { /* logged inside */ })
     return true
   }
   updateStep(domain, 8, "warning",
@@ -968,6 +982,10 @@ async function step10UploadIndexPhp(
     setStepArtifact(domain, 10, {
       server_ip: server.ip, server_id: server.id, byte_size: php.length,
     })
+    // Purge CF cache so visitors immediately see the new content. Without
+    // this, CF can keep serving the SA welcome page (cached during step 7)
+    // for hours. Best-effort — content is on origin either way.
+    void purgeZoneCache(domain).catch(() => { /* logged inside */ })
     return true
   } catch (e) {
     updateStep(domain, 10, "failed", (e as Error).message)

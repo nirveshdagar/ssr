@@ -302,6 +302,61 @@ export function autoRetryRetryable(): RetryResult {
 }
 
 // ---------------------------------------------------------------------------
+// 5. Re-fire step 8 for domains that are nominally live/hosted but step 8
+//    never actually completed in step_tracker. Catches the failure mode:
+//      - step 8 fails (e.g., 1010 zone-pending), pipeline continues
+//      - step 9/10 succeed, status flips to hosted
+//      - live-checker probes via CF, gets 200 (CF returns SA welcome from
+//        origin's default HTTPS vhost), flips status to live
+//      - dashboard looks healthy but origin SSL is broken; visitors get
+//        the SA welcome page until step 8 actually runs
+//
+//    Without this, 50 fan-out domains hitting the same race would all be
+//    silently broken with no auto-recovery path.
+// ---------------------------------------------------------------------------
+
+export interface BrokenSslResult {
+  reissued: { domain: string; job_id: number | null }[]
+  skipped: { domain: string; reason: string }[]
+}
+
+export function autoFixBrokenSsl(): BrokenSslResult {
+  const reissued: BrokenSslResult["reissued"] = []
+  const skipped: BrokenSslResult["skipped"] = []
+
+  // Domains where step 8 either never ran OR didn't complete. Excludes:
+  //  - non-success-status domains (those have other recovery paths)
+  //  - domains currently mid-pipeline (slot lock would reject anyway)
+  // The step-tracker LEFT JOIN catches both "no row" (pipeline failed
+  // before step 8) and "row but not completed" (step 8 ran and failed).
+  const candidates = all<{ domain: string }>(
+    `SELECT d.domain
+       FROM domains d
+       LEFT JOIN step_tracker s
+         ON s.domain = d.domain AND s.step_num = 8
+      WHERE d.status IN ('live', 'hosted', 'completed')
+        AND (s.status IS NULL OR s.status != 'completed')`,
+  )
+
+  for (const c of candidates) {
+    if (isPipelineRunning(c.domain)) {
+      skipped.push({ domain: c.domain, reason: "already running" })
+      continue
+    }
+    const jobId = runFullPipeline(c.domain, { startFrom: 8 })
+    if (jobId == null) {
+      skipped.push({ domain: c.domain, reason: "slot lock rejected" })
+      continue
+    }
+    logPipeline(c.domain, "auto_heal", "running",
+      `Auto-fix broken SSL: domain status is live/hosted but step 8 never ` +
+      `completed in step_tracker. Re-firing pipeline.full with start_from=8.`)
+    reissued.push({ domain: c.domain, job_id: jobId })
+  }
+  return { reissued, skipped }
+}
+
+// ---------------------------------------------------------------------------
 // One tick of the background loop
 // ---------------------------------------------------------------------------
 
@@ -310,6 +365,7 @@ export interface AutoHealTickResult {
   resume: ResumeResult | { error: string }
   ns: NsCheckResult | { error: string }
   retry: RetryResult | { error: string }
+  brokenSsl: BrokenSslResult | { error: string }
   ranAt: string
 }
 
@@ -347,20 +403,29 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
     retry = { error: (e as Error).message }
   }
 
+  let brokenSsl: BrokenSslResult | { error: string }
+  try {
+    brokenSsl = autoFixBrokenSsl()
+  } catch (e) {
+    brokenSsl = { error: (e as Error).message }
+  }
+
   // Only audit-log when something actually happened — avoids audit spam.
   const claimedN = "claimed" in reconcile ? reconcile.claimed.length : 0
   const resumedN = "resumed" in resume ? resume.resumed.length : 0
   const nsResumedN = "resumed" in ns ? ns.resumed.length : 0
   const retriedN = "retried" in retry ? retry.retried.length : 0
-  if (claimedN + resumedN + nsResumedN + retriedN > 0) {
+  const sslReissuedN = "reissued" in brokenSsl ? brokenSsl.reissued.length : 0
+  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN > 0) {
     appendAudit(
       "auto_heal_tick", "",
-      `claimed=${claimedN} resumed=${resumedN} ns_resumed=${nsResumedN} retried=${retriedN}`,
+      `claimed=${claimedN} resumed=${resumedN} ns_resumed=${nsResumedN} ` +
+      `retried=${retriedN} ssl_reissued=${sslReissuedN}`,
       null,
     )
   }
 
-  return { reconcile, resume, ns, retry, ranAt }
+  return { reconcile, resume, ns, retry, brokenSsl, ranAt }
 }
 
 // ---------------------------------------------------------------------------

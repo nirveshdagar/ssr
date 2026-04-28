@@ -517,6 +517,35 @@ export async function createZoneForDomain(domain: string): Promise<CreateZoneRes
 }
 
 // ----------------------------------------------------------------------------
+// Cache purge — clears CF's edge cache for a domain after content changes.
+// Critical after step 10 (or migration content upload) because CF often
+// caches the origin's earlier "default SA welcome page" response and would
+// keep serving it for ~4 hours otherwise. Best-effort — the site still
+// works without purge, just shows stale content until TTL expires.
+// ----------------------------------------------------------------------------
+
+export async function purgeZoneCache(domain: string): Promise<{ ok: boolean; message: string }> {
+  try {
+    const creds = loadCreds(domain)
+    const zoneId = await getZoneId(domain)
+    await cfRequest<{ id: string }>(
+      "POST",
+      `${CF_API}/zones/${zoneId}/purge_cache`,
+      creds,
+      { purge_everything: true },
+    )
+    logPipeline(domain, "cf_purge_cache", "completed",
+      `CF cache purged for zone ${zoneId.slice(0, 12)}…`)
+    return { ok: true, message: "Cache purged" }
+  } catch (e) {
+    const msg = (e as Error).message
+    logPipeline(domain, "cf_purge_cache", "warning",
+      `Cache purge failed (non-fatal): ${msg}`)
+    return { ok: false, message: msg }
+  }
+}
+
+// ----------------------------------------------------------------------------
 // Zone delete
 // ----------------------------------------------------------------------------
 

@@ -481,6 +481,16 @@ export async function migrateDomain(
       status: "hosted",
     })
 
+    // Purge CF cache so visitors immediately see content from the new
+    // server — without this, CF keeps serving cached responses from the
+    // OLD origin until TTL expires, defeating the point of migrating.
+    try {
+      await cf.purgeZoneCache(domain)
+    } catch (e) {
+      logPipeline(domain, "migrate", "warning",
+        `CF cache purge after migration failed (non-fatal): ${(e as Error).message}`)
+    }
+
     // 6. Best-effort delete on old server
     if (oldServerId && oldServerId !== newIdNum) {
       const old = listServers().find((s) => s.id === oldServerId)
