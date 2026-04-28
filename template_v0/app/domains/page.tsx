@@ -314,12 +314,35 @@ function DomainsPageInner() {
     await refresh(); setBusy(null)
   }
   async function bulkRun() {
+    if (!confirm(
+      `Run pipeline on ${selected.size} domain(s) IN PARALLEL?\n\n` +
+      `Up to SSR_JOB_WORKERS (default 4, configurable) run at the same time. ` +
+      `Best when domains are spread across multiple CF keys / servers.`,
+    )) return
     setBusy("bulk")
     const opts: { skipPurchase?: boolean; serverId?: number; forceNewServer?: boolean } = {}
     if (bulkSkipPurchase) opts.skipPurchase = true
     if (bulkServerId === "__new__") opts.forceNewServer = true
     else if (bulkServerId) opts.serverId = Number(bulkServerId)
     const r = await domainActions.runBulk([...selected], opts) as { ok?: boolean; message?: string; error?: string }
+    show(r.ok ? "ok" : "err", String(r.message ?? r.error ?? ""))
+    setSelected(new Set()); setBulkSkipPurchase(false); setBulkServerId("")
+    await refresh(); setBusy(null)
+  }
+  async function bulkRunSequential() {
+    if (!confirm(
+      `Run pipeline on ${selected.size} domain(s) ONE BY ONE?\n\n` +
+      `Domains process in order — the next starts only after the previous ` +
+      `finishes (or fails). Smallest blast radius on external APIs; longest ` +
+      `total wall-time. Good for small batches (5–10) or when you want a ` +
+      `predictable order.`,
+    )) return
+    setBusy("bulk")
+    const opts: { skipPurchase?: boolean; serverId?: number; forceNewServer?: boolean } = {}
+    if (bulkSkipPurchase) opts.skipPurchase = true
+    if (bulkServerId === "__new__") opts.forceNewServer = true
+    else if (bulkServerId) opts.serverId = Number(bulkServerId)
+    const r = await domainActions.runBulkSequential([...selected], opts) as { ok?: boolean; message?: string; error?: string }
     show(r.ok ? "ok" : "err", String(r.message ?? r.error ?? ""))
     setSelected(new Set()); setBulkSkipPurchase(false); setBulkServerId("")
     await refresh(); setBusy(null)
@@ -363,12 +386,27 @@ function DomainsPageInner() {
   }
   async function bulkHardDelete() {
     if (!confirm(
-      `FULL DELETE ${selected.size} domain(s)?\n\n` +
+      `FULL DELETE ${selected.size} domain(s) — ONE BY ONE?\n\n` +
       `Removes from: SA, CF, Spaceship, DB.\n` +
-      `Cannot be undone!`,
+      `Runs sequentially in a single worker (~10–15 s per domain). ` +
+      `Smallest external-API blast radius. Cannot be undone!`,
     )) return
     setBusy("bulk")
     const r = await domainActions.bulkDelete([...selected], "all") as { ok?: boolean; message?: string; error?: string }
+    show(r.ok ? "ok" : "err", String(r.message ?? r.error ?? ""))
+    setSelected(new Set()); await refresh(); setBusy(null)
+  }
+  async function bulkHardDeleteParallel() {
+    if (!confirm(
+      `FULL DELETE ${selected.size} domain(s) — IN PARALLEL?\n\n` +
+      `Removes from: SA, CF, Spaceship, DB.\n` +
+      `Runs up to SSR_JOB_WORKERS teardowns at a time (default 4). ` +
+      `Per-CF-key semaphore (5/key) + Spaceship throttle still apply, ` +
+      `so per-key burst stays bounded. Total wall-time drops by ~Nx. ` +
+      `Cannot be undone!`,
+    )) return
+    setBusy("bulk")
+    const r = await domainActions.bulkDelete([...selected], "all_parallel") as { ok?: boolean; message?: string; error?: string }
     show(r.ok ? "ok" : "err", String(r.message ?? r.error ?? ""))
     setSelected(new Set()); await refresh(); setBusy(null)
   }
@@ -938,9 +976,17 @@ function DomainsPageInner() {
                 size="sm" variant="outline"
                 className="gap-1.5 btn-soft-success"
                 onClick={bulkRun} disabled={busy === "bulk"}
-                title="Run the pipeline on every selected domain — honors Skip-purchase + Server above"
+                title="PARALLEL — runs up to SSR_JOB_WORKERS pipelines at the same time. Fastest. Honors Skip-purchase + Server above."
               >
-                <Play className="h-3.5 w-3.5" /> Run pipeline
+                <Play className="h-3.5 w-3.5" /> Run all (parallel)
+              </Button>
+              <Button
+                size="sm" variant="outline"
+                className="gap-1.5 btn-soft-success"
+                onClick={bulkRunSequential} disabled={busy === "bulk"}
+                title="SEQUENTIAL — pipelines run ONE BY ONE in a single worker. Each domain starts only after the previous finishes. Smaller external-API blast radius; total wall-time is the sum of each pipeline. Good for small batches (5–10) or when you want predictable ordering."
+              >
+                <Play className="h-3.5 w-3.5" /> Run one-by-one
               </Button>
               <Button
                 size="sm" variant="outline"
@@ -969,7 +1015,7 @@ function DomainsPageInner() {
                     <Archive className="h-3.5 w-3.5" /> Delete… <ChevronDown className="h-3 w-3" />
                   </Button>
                 </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="w-64">
+                <DropdownMenuContent align="end" className="w-72">
                   <DropdownMenuLabel>Delete mode</DropdownMenuLabel>
                   <DropdownMenuSeparator />
                   <DropdownMenuItem onClick={bulkSoftDelete}>
@@ -983,8 +1029,15 @@ function DomainsPageInner() {
                   <DropdownMenuItem variant="destructive" onClick={bulkHardDelete}>
                     <Trash2 className="mr-2 h-3.5 w-3.5" />
                     <div className="flex flex-col">
-                      <span>Full delete (SA + CF + Spaceship + DB)</span>
-                      <span className="text-micro">Tears down everything — irreversible</span>
+                      <span>Full delete — one by one</span>
+                      <span className="text-micro">Sequential · ~10–15 s per domain · safest</span>
+                    </div>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem variant="destructive" onClick={bulkHardDeleteParallel}>
+                    <Trash2 className="mr-2 h-3.5 w-3.5" />
+                    <div className="flex flex-col">
+                      <span>Full delete — parallel</span>
+                      <span className="text-micro">Up to SSR_JOB_WORKERS at once · ~Nx faster · semaphored</span>
                     </div>
                   </DropdownMenuItem>
                 </DropdownMenuContent>

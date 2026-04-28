@@ -63,7 +63,10 @@ async function getJson<T = unknown>(url: string): Promise<ActionResult<T>> {
 export const domainActions = {
   delete: (domain: string) => postForm(`/api/domains/${domain}/delete`),
   fullDelete: (domain: string) => postForm(`/api/domains/${domain}/full-delete`),
-  bulkDelete: (domainIds: string[], deleteFrom: "db_only" | "all" = "all") => {
+  bulkDelete: (
+    domainIds: string[],
+    deleteFrom: "db_only" | "all" | "all_parallel" = "all",
+  ) => {
     const fd = new FormData()
     for (const id of domainIds) fd.append("domain_ids", id)
     fd.set("delete_from", deleteFrom)
@@ -99,6 +102,24 @@ export const domainActions = {
     if (opts.serverId != null) fd.set("server_id", String(opts.serverId))
     if (opts.forceNewServer) fd.set("force_new_server", "on")
     return fetch("/api/domains/run-bulk", { method: "POST", body: fd, credentials: "same-origin" })
+      .then(async (r) => ({ ok: r.ok, ...((await r.json()) as Record<string, unknown>) }))
+  },
+  /**
+   * Sequential variant — same input shape as runBulk but the backend
+   * enqueues a single pipeline.bulk job that walks the selected domains
+   * one-at-a-time in one worker. Smaller external-API blast radius;
+   * total wall-time = sum of per-domain durations.
+   */
+  runBulkSequential: (
+    domainIds: string[],
+    opts: { skipPurchase?: boolean; serverId?: number; forceNewServer?: boolean } = {},
+  ) => {
+    const fd = new FormData()
+    for (const id of domainIds) fd.append("domain_ids", id)
+    if (opts.skipPurchase) fd.set("skip_purchase", "on")
+    if (opts.serverId != null) fd.set("server_id", String(opts.serverId))
+    if (opts.forceNewServer) fd.set("force_new_server", "on")
+    return fetch("/api/domains/run-bulk-sequential", { method: "POST", body: fd, credentials: "same-origin" })
       .then(async (r) => ({ ok: r.ok, ...((await r.json()) as Record<string, unknown>) }))
   },
   /**
