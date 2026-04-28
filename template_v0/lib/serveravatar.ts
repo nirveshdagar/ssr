@@ -1190,6 +1190,7 @@ export async function uploadIndexPhpViaSftp(
     ssh = await SshSession.connect({
       host: ip, username: "root", password: rootPass, port: 22, readyTimeout: 30_000,
     })
+    // Try the hardcoded candidates first (fast path).
     for (const pub of candidates) {
       const exists = await ssh.sftpStat(pub)
       if (!exists) continue
@@ -1203,8 +1204,36 @@ export async function uploadIndexPhpViaSftp(
         `index.php written to ${pub} via SFTP (index.html removed)`)
       return true
     }
+    // Fallback: the candidates didn't match. SA's layout occasionally
+    // diverges (most common cause: when this app reused an existing
+    // sys user from another app, sysUserFor() locally computes a
+    // different name than SA actually used). Find any public_html
+    // dir mentioning this app's name OR domain and use that.
+    const find = await ssh.exec(
+      `find /home /var/www -maxdepth 6 -type d -name public_html ` +
+      `\\( -path '*${appName}*' -o -path '*${domain}*' \\) 2>/dev/null | head -3`,
+      { timeoutMs: 15_000 },
+    )
+    const found = find.stdout.split("\n").map((l) => l.trim()).filter(Boolean)
+    if (found.length > 0) {
+      const pub = found[0]
+      try { await ssh.sftpRemoveFile(`${pub}/index.html`) } catch { /* may not exist */ }
+      await ssh.sftpWriteFile(`${pub}/index.php`, phpContent)
+      // chown — extract owner of the public_html dir; sysUser may be wrong.
+      const stat = await ssh.exec(`stat -c '%U' ${pub}`, { timeoutMs: 5000 })
+      const realUser = stat.stdout.trim() || sysUser
+      await ssh.exec(
+        `chown ${realUser}:${realUser} ${pub}/index.php 2>/dev/null; chmod 644 ${pub}/index.php`,
+        { timeoutMs: 10_000 },
+      )
+      logPipeline(domain, "upload_index_php", "completed",
+        `index.php written to ${pub} via SFTP fallback (owner=${realUser}; ` +
+        `local sysUser=${sysUser} didn't match — likely an existing-user reuse)`)
+      return true
+    }
     throw new Error(
-      `Could not find a valid public_html under /home/${sysUser}/… — SA layout may have changed`,
+      `Could not find any public_html for ${appName} (or ${domain}) under /home or /var/www — ` +
+      `SA layout may have changed; manual SSH inspection needed`,
     )
   } finally {
     ssh?.close()
