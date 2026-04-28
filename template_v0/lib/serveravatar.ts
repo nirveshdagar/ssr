@@ -1080,12 +1080,23 @@ export async function uploadIndexPhp(
 }
 
 async function overwriteIndexHtmlViaApi(
-  basePath: string, phpContent: string,
+  basePath: string, _phpContent: string,
 ): Promise<void> {
+  // Last-resort fallback when both SA-API and SSH delete failed: replace
+  // the content with a benign redirect. We deliberately do NOT overwrite
+  // with phpContent (the prior implementation did) because Apache serves
+  // .html as static text — that would leak the entire generated PHP page
+  // as source on direct GET /index.html. The redirect keeps the file
+  // present (so Apache's DirectoryIndex still resolves) but bounces any
+  // visitor who hits /index.html to /index.php.
+  const redirect =
+    `<!DOCTYPE html>\n` +
+    `<meta http-equiv="refresh" content="0; url=/index.php">\n` +
+    `<title>Redirecting…</title>\n`
   try {
     await saRequest(`${basePath}/file`, {
       method: "PATCH", json: true,
-      body: JSON.stringify({ filename: "index.html", path: "/public_html/", body: phpContent }),
+      body: JSON.stringify({ filename: "index.html", path: "/public_html/", body: redirect }),
     })
   } catch { /* best-effort */ }
 }
@@ -1122,7 +1133,30 @@ export async function deleteIndexHtmlViaSsh(domain: string, serverIp?: string): 
     const oneLiner = candidates
       .map((p) => `(test -f ${p}/index.html && rm -f ${p}/index.html && echo REMOVED:${p})`)
       .join(" || ")
-    await ssh.exec(`${oneLiner} || true`, { timeoutMs: 20_000 })
+    const r = await ssh.exec(`${oneLiner} || echo NO_CANDIDATE_HIT`, { timeoutMs: 20_000 })
+    if (/REMOVED:/.test(r.stdout)) return
+
+    // Fallback: SA's layout occasionally diverges from our candidate list
+    // (e.g. when sysUserFor() computed locally doesn't match SA's chosen
+    // username, or when SA's path scheme changes between versions). Find
+    // any index.html anywhere under a public_html directory and rm it.
+    const find = await ssh.exec(
+      `find /home /var/www -maxdepth 6 -name index.html -path '*/public_html/*' 2>/dev/null | head -5`,
+      { timeoutMs: 15_000 },
+    )
+    const paths = find.stdout.split("\n").map((l) => l.trim()).filter(Boolean)
+    if (paths.length === 0) {
+      // Genuinely absent — could be a re-run after a successful prior delete.
+      return
+    }
+    const rmCmd = paths.map((p) => `rm -f '${p}'`).join(" && ") + " && echo REMOVED_ALL"
+    const r2 = await ssh.exec(rmCmd, { timeoutMs: 15_000 })
+    if (!/REMOVED_ALL/.test(r2.stdout)) {
+      throw new Error(
+        `Found ${paths.length} index.html via fallback find but rm did not confirm: ` +
+        `${r2.stderr.slice(0, 200)}`,
+      )
+    }
   } finally {
     ssh?.close()
   }
