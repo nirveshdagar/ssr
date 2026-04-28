@@ -209,12 +209,21 @@ export default function DashboardPage() {
                   </div>
                   <div className="mt-3">
                     <PipelineProgress currentStep={d.step} status={d.status} compact completedAt={d.createdAt} />
-                    <div className="mt-2 flex items-center justify-between text-micro text-muted-foreground">
-                      <span>
-                        Step {d.step} of 10 · started {d.createdAt.split(" ")[1]}
+                    <div className="mt-2 flex items-center justify-between gap-2 text-micro text-muted-foreground">
+                      <span className="shrink-0">
+                        Step {d.step}/10
+                        {d.stepName ? ` · ${d.stepName}` : ""}
+                        {d.stepStatus === "running" && <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-status-running animate-pulse align-middle" />}
                       </span>
-                      <span>p_{Math.floor(8800 + parseInt(d.id.replace("d_", "")))}</span>
+                      <span className="text-right text-muted-foreground/80">
+                        started {d.createdAt.split(" ")[1]}
+                      </span>
                     </div>
+                    {d.stepMessage && (
+                      <div className="mt-1.5 truncate font-mono text-[11px] leading-relaxed text-foreground/70" title={d.stepMessage}>
+                        {d.stepMessage}
+                      </div>
+                    )}
                   </div>
                 </li>
               ))}

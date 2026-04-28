@@ -21,6 +21,14 @@ export interface DomainRow {
    *  so the page can filter against the 22 fine-grained Flask statuses. */
   rawStatus: string
   step: number
+  /** step_tracker.status of the current step ("running"/"completed"/"failed"/etc) */
+  stepStatus: string | null
+  /** Human-readable step name like "buy_domain" / "create_zone" */
+  stepName: string | null
+  /** Latest message from step_tracker for the current step — what's
+   *  actually happening right now. Surfaced on the dashboard so the
+   *  progress card isn't blank when a pipeline is mid-flight. */
+  stepMessage: string | null
   server: string
   cfKey: string
   cfEmail: string
@@ -44,6 +52,10 @@ interface ApiDomain {
   cf_zone_id: string | null
   current_proxy_ip: string | null
   created_at: string
+  current_step: number
+  current_step_status: string | null
+  current_step_name: string | null
+  current_step_message: string | null
 }
 
 const NORMALIZE_STATUS: Record<string, PipelineStatus> = {
@@ -83,7 +95,10 @@ export function useDomains() {
     name: d.domain,
     status: NORMALIZE_STATUS[d.status] ?? "pending",
     rawStatus: d.status || "pending",
-    step: 0, // step_tracker is per-domain; not joined here yet
+    step: d.current_step ?? 0,
+    stepStatus: d.current_step_status ?? null,
+    stepName: d.current_step_name ?? null,
+    stepMessage: d.current_step_message ?? null,
     server: d.server_id ? `srv-${d.server_id}` : "—",
     cfKey: d.cf_key_id ? `cf-${d.cf_key_id}` : "—",
     cfEmail: d.cf_email ?? "",
