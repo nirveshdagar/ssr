@@ -126,6 +126,12 @@ export function scheduleBootHooks(): void {
   // settings reads have settled before we hit external APIs.
   setTimeout(() => { void recoverGreyCloudOnce() }, 5000).unref?.()
   setTimeout(() => { void orphanDropletSweepOnce() }, 8000).unref?.()
+  // Auto-heal sweeper — reconcile SA orphans + auto-resume stuck pipelines
+  // every SSR_AUTOHEAL_INTERVAL_MS (default 5 min). Self-skips in tests
+  // and when SSR_AUTOHEAL=0.
+  void import("./auto-heal").then(({ startAutoHeal }) => startAutoHeal()).catch(() => {
+    /* boot is best-effort — never wedge the server */
+  })
 }
 
 // Exported for tests

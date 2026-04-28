@@ -148,6 +148,13 @@ export const serverActions = {
    */
   reconcileFromSa: (dryRun = false) =>
     postForm("/api/servers/reconcile-from-sa", { dry_run: dryRun ? "on" : undefined }),
+  /**
+   * Manually fire one auto-heal sweep — same logic that runs every
+   * SSR_AUTOHEAL_INTERVAL_MS in the background. Reconciles orphans + resumes
+   * any pipelines that were waiting on them + advances NS-pending domains
+   * whose CF zones have gone active.
+   */
+  autoHealTick: () => postForm("/api/system/auto-heal-tick"),
   /** Hard delete — destroys DO droplet + SA server + DB row. Requires typed-name match. */
   delete: (id: number, confirmName: string) =>
     postForm(`/api/servers/${id}/delete`, { confirm_name: confirmName }),
