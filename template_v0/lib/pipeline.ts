@@ -52,7 +52,7 @@ import {
 } from "./spaceship"
 import {
   createZoneForDomain, getZoneStatus, fetchOriginCaCert, setupDomainDns,
-  setDnsARecord, setDnsARecordWww,
+  setDnsARecord, setDnsARecordWww, OriginCaZoneNotActiveError,
 } from "./cloudflare"
 import {
   createApplication, findAppId, installCustomSsl, uploadIndexPhp,
@@ -100,6 +100,17 @@ function releaseSlot(domain: string): void {
 
 class PipelineCanceled extends Error {
   constructor() { super("PipelineCanceled"); this.name = "PipelineCanceled" }
+}
+
+/**
+ * Thrown by step 8 when CF Origin CA refuses because the zone is still
+ * pending NS propagation. Caller (pipelineWorkerImpl) catches this,
+ * reverts domain status to ns_set, and exits cleanly so autoCheckPendingNs
+ * can resume from step 5 once the zone activates. NOT a failure — it's
+ * "wait, then resume."
+ */
+class PipelineWaitDns extends Error {
+  constructor() { super("PipelineWaitDns"); this.name = "PipelineWaitDns" }
 }
 
 function checkCancel(domain: string): void {
@@ -453,6 +464,13 @@ async function pipelineWorkerImpl(
       logPipeline(domain, "pipeline", "warning",
         "Pipeline CANCELED by user before completion")
       updateDomain(domain, { status: "canceled", cancel_requested: 0 } as Parameters<typeof updateDomain>[1])
+      return
+    }
+    if (e instanceof PipelineWaitDns) {
+      logPipeline(domain, "pipeline", "warning",
+        "Pipeline paused at step 8 — waiting for NS propagation. " +
+        "autoCheckPendingNs will resume from step 5 once CF marks the zone active.")
+      updateDomain(domain, { status: "ns_set" } as Parameters<typeof updateDomain>[1])
       return
     }
     const err = e as Error
@@ -816,6 +834,18 @@ async function step8IssueAndInstallSsl(domain: string, server: ServerRow): Promi
   try {
     bundle = await fetchOriginCaCert(domain)
   } catch (e) {
+    // Pending-zone case: throw PipelineWaitDns so the worker exits the
+    // entire pipeline cleanly instead of continuing through steps 9-10
+    // (which would set status='hosted' and shadow our ns_set revert,
+    // making autoCheckPendingNs skip this domain). The worker catches
+    // this and reverts status to ns_set; autoCheckPendingNs resumes
+    // from step 5 once NS propagation completes.
+    if (e instanceof OriginCaZoneNotActiveError) {
+      updateStep(domain, 8, "warning",
+        "Origin CA refused — zone still pending NS propagation. " +
+        "Pipeline will resume from step 5 once CF marks the zone active.")
+      throw new PipelineWaitDns()
+    }
     updateStep(domain, 8, "warning", `Origin CA issuance failed: ${(e as Error).message}`)
     return false
   }

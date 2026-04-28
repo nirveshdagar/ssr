@@ -574,6 +574,21 @@ export interface OriginCaCert {
 }
 
 /**
+ * CF Origin CA refused issuance because the zone isn't visible / active
+ * under the authenticating account. By far the most common cause is
+ * "zone is still pending — NS hasn't propagated yet" (CF's auth model
+ * only validates hostnames against active zones in the account). Distinct
+ * error type so step 8 can route through the autoCheckPendingNs recovery
+ * path instead of treating it as a hard failure.
+ */
+export class OriginCaZoneNotActiveError extends Error {
+  constructor(public readonly cfMessage: string) {
+    super(`CF Origin CA refused — zone not yet active. ${cfMessage}`)
+    this.name = "OriginCaZoneNotActiveError"
+  }
+}
+
+/**
  * Issue a CF Origin CA cert for `domain` + `*.domain`. RSA-2048 keypair is
  * generated locally; the private key never leaves this machine. CF signs
  * the CSR; chain is the CF Origin CA RSA Root.
@@ -622,6 +637,25 @@ export async function fetchOriginCaCert(
     if (!resp.ok || !resp.json?.success) {
       const errs = resp.json?.errors?.map((e) => `${e.code}:${e.message}`).join("; ")
       const msg = errs || resp.text.slice(0, 400)
+      // CF error 1010 + "zone is either not part" wording is overwhelmingly
+      // the "zone still pending NS propagation" case in real-world traffic
+      // (a true auth mismatch would show up at zone-create time, not Origin
+      // CA time). Confirm by querying the zone's current activation status
+      // — if pending, surface as a recoverable wait, not a hard auth failure.
+      const looksLikeNotActive = resp.json?.errors?.some(
+        (e) => e.code === 1010 || /not part of your account/i.test(e.message ?? ""),
+      )
+      if (looksLikeNotActive) {
+        let zoneStatus = "unknown"
+        try { zoneStatus = await getZoneStatus(domain) } catch { /* ignore */ }
+        if (zoneStatus !== "active") {
+          logPipeline(domain, "cf_origin_ca", "warning",
+            `Zone status='${zoneStatus}' (NS propagation not complete) — ` +
+            `Origin CA refused as expected. Will resume from step 5 once active.`)
+          throw new OriginCaZoneNotActiveError(msg)
+        }
+        // Zone IS active but CF still refused — that's a real auth issue.
+      }
       logPipeline(domain, "cf_origin_ca", "failed", msg.slice(0, 500))
       throw new Error(`CF Origin CA refused: HTTP ${resp.status} — ${msg}`)
     }
