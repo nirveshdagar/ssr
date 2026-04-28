@@ -19,7 +19,7 @@
  * is a try/catch best-effort hook that becomes real when migration lands.
  */
 
-import { all, getDb, run } from "./db"
+import { all, getDb, one, run } from "./db"
 import { getSetting } from "./repos/settings"
 import { logPipeline } from "./repos/logs"
 
@@ -140,6 +140,32 @@ async function tick(): Promise<void> {
 // Whole-server dead detection
 // ---------------------------------------------------------------------------
 
+/**
+ * Quick DO probe for "definitively dead" droplet states. Used by the
+ * live-checker fast-path to short-circuit the down-streak threshold when
+ * we have hard evidence the droplet is gone.
+ *
+ * Returns a reason string if the droplet is unambiguously dead, else null
+ * (in which case the caller falls back to the normal threshold).
+ *
+ * Conservative: only treats 404 (deleted) and status='archive' (permanently
+ * powered off) as fast-dead. status='off' is treated as transient since
+ * operators frequently power-cycle droplets, and we don't want to migrate
+ * a domain mid-reboot.
+ */
+async function probeDropletFastDead(dropletId: string): Promise<string | null> {
+  try {
+    const { getDroplet } = await import("./digitalocean")
+    const d = await getDroplet(dropletId)
+    if (d.status === "archive") return `DO droplet status='archive' (powered off permanently)`
+    return null
+  } catch (e) {
+    const msg = (e as Error).message
+    if (msg.includes("HTTP 404")) return "DO droplet returns 404 (deleted from account)"
+    return null  // auth / network / 5xx — let normal threshold handle
+  }
+}
+
 async function checkDeadServers(
   byServer: Map<number, { domain: string; downStreak: number }[]>,
 ): Promise<void> {
@@ -147,15 +173,25 @@ async function checkDeadServers(
   const threshold = Number.isFinite(thresholdRaw) && thresholdRaw > 0 ? thresholdRaw : 10
   const autoMigrate = (getSetting("auto_migrate_enabled") || "0") === "1"
 
-  const servers = all<{ id: number; name: string; ip: string; status: string }>(
-    `SELECT id, name, ip, status FROM servers WHERE status = 'ready'`,
+  const servers = all<{ id: number; name: string; ip: string; status: string; do_droplet_id: string | null }>(
+    `SELECT id, name, ip, status, do_droplet_id FROM servers WHERE status = 'ready'`,
   )
 
   for (const s of servers) {
     const entries = byServer.get(s.id)
     if (!entries || entries.length === 0) continue
     const allDown = entries.every((e) => e.downStreak >= threshold)
-    if (!allDown) continue
+
+    // Fast-path: if all domains on this server have failed at least 2 ticks
+    // AND DO confirms the droplet is gone (404) or archived, declare dead
+    // NOW instead of waiting for the full threshold. Saves up to ~9 minutes
+    // on the default 10-tick × 60-s setup when an operator deletes the
+    // droplet from the DO console.
+    let fastReason: string | null = null
+    if (!allDown && s.do_droplet_id && entries.every((e) => e.downStreak >= 2)) {
+      fastReason = await probeDropletFastDead(s.do_droplet_id)
+    }
+    if (!allDown && !fastReason) continue
 
     // Short-circuit: already migrating
     if (migrating.has(s.id)) continue
@@ -163,8 +199,11 @@ async function checkDeadServers(
 
     run(`UPDATE servers SET status='dead' WHERE id = ?`, s.id)
     const worst = entries.reduce((m, e) => Math.max(m, e.downStreak), 0)
-    const msg = `Server #${s.id} (${s.name} / ${s.ip}) marked DEAD — ` +
-      `all ${entries.length} domains down for ${worst}+ ticks (threshold=${threshold})`
+    const msg = fastReason
+      ? `Server #${s.id} (${s.name} / ${s.ip}) marked DEAD via fast-path — ` +
+        `${fastReason} · ${entries.length} domain(s) failing for ${worst}+ tick(s)`
+      : `Server #${s.id} (${s.name} / ${s.ip}) marked DEAD — ` +
+        `all ${entries.length} domains down for ${worst}+ ticks (threshold=${threshold})`
     logPipeline(`server-${s.id}`, "dead_detect", "warning", msg)
 
     // Multi-channel alert (best-effort — notify module is wired separately)
@@ -188,12 +227,83 @@ async function checkDeadServers(
 }
 
 /**
+ * Best-effort cleanup of a dead server after auto-migrate has moved its
+ * domains. Removes:
+ *   1. The SA server entry (zombie that SA itself doesn't auto-remove
+ *      when the agent disconnects)
+ *   2. The DB row in `servers` — but ONLY if migration was 100% successful
+ *      AND no domains still reference this server. Anything less, the row
+ *      stays so the operator can investigate the failed migrations.
+ *
+ * Goes through saRequest so primary→backup token failover applies. SA 404
+ * is treated as success — already gone.
+ */
+async function cleanupDeadServerSaEntry(
+  serverId: number, fullSuccess: boolean,
+): Promise<void> {
+  let saCleanedOrAlreadyGone = false
+  try {
+    const row = one<{ sa_server_id: string | null; name: string | null }>(
+      "SELECT sa_server_id, name FROM servers WHERE id = ?", serverId,
+    )
+    if (!row?.sa_server_id) {
+      saCleanedOrAlreadyGone = true
+    } else {
+      const { saRequest } = await import("./serveravatar")
+      const { res, label } = await saRequest(
+        `/organizations/{ORG_ID}/servers/${row.sa_server_id}`,
+        { method: "DELETE", timeoutMs: 30_000 },
+      )
+      if (res.ok || res.status === 204) {
+        logPipeline(`server-${serverId}`, "auto_migrate", "completed",
+          `Cleaned up zombie SA server entry ${row.sa_server_id} (via ${label} token)`)
+        saCleanedOrAlreadyGone = true
+      } else if (res.status === 404) {
+        logPipeline(`server-${serverId}`, "auto_migrate", "completed",
+          `SA entry ${row.sa_server_id} already gone (404) — no cleanup needed`)
+        saCleanedOrAlreadyGone = true
+      } else {
+        logPipeline(`server-${serverId}`, "auto_migrate", "warning",
+          `SA cleanup HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`)
+      }
+    }
+  } catch (e) {
+    logPipeline(`server-${serverId}`, "auto_migrate", "warning",
+      `SA cleanup failed (best-effort): ${(e as Error).message}`)
+  }
+
+  // Auto-drop the DB row when it's provably useless: migration was fully
+  // successful, no domains still reference this server, and the SA entry
+  // is gone. Anything else, leave the row for operator review.
+  if (!fullSuccess || !saCleanedOrAlreadyGone) return
+  try {
+    const refRow = one<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM domains WHERE server_id = ?", serverId,
+    )
+    const refCount = refRow?.n ?? 0
+    if (refCount > 0) {
+      logPipeline(`server-${serverId}`, "auto_migrate", "warning",
+        `Server #${serverId} still has ${refCount} domain row(s) — skipping DB-row drop. ` +
+        `Investigate the failed migrations.`)
+      return
+    }
+    run("DELETE FROM servers WHERE id = ?", serverId)
+    logPipeline(`server-${serverId}`, "auto_migrate", "completed",
+      `Dropped DB row for server #${serverId} — auto-migrate fully succeeded, ` +
+      `SA entry cleaned up, droplet was deleted, no domains reference it.`)
+  } catch (e) {
+    logPipeline(`server-${serverId}`, "auto_migrate", "warning",
+      `DB row drop failed (best-effort): ${(e as Error).message}`)
+  }
+}
+
+/**
  * Run the migration in the background. Releases the `migrating` slot when
  * done (success OR failure) so a subsequent dead-detect can re-fire if the
  * server stays down.
  *
- * Migration module isn't ported yet — we log a warning explaining that
- * manual migration is required for now.
+ * After successful migration, also fires `cleanupDeadServerSaEntry` so the
+ * SA dashboard isn't left with a disconnected zombie row.
  */
 async function spawnMigration(serverId: number): Promise<void> {
   try {
@@ -202,6 +312,16 @@ async function spawnMigration(serverId: number): Promise<void> {
     logPipeline(`server-${serverId}`, "auto_migrate",
       result.failed.length === 0 ? "completed" : "warning",
       `${result.msg}  ok=${result.ok.length} failed=${result.failed.length}`)
+    // Clean up the zombie SA entry only if at least one domain successfully
+    // migrated. Total migration failure means the source might still be in
+    // use; leave SA alone so the operator can investigate.
+    // The DB row drop is gated separately on `fullSuccess` (no failures)
+    // inside cleanupDeadServerSaEntry — partial success cleans SA but
+    // keeps the row for review.
+    if (result.ok.length > 0) {
+      const fullSuccess = result.failed.length === 0
+      await cleanupDeadServerSaEntry(serverId, fullSuccess)
+    }
     try {
       const { notifyMigrationDone } = await import("./notify")
       await notifyMigrationDone(serverId, result.msg, result.ok.length, result.failed.length)

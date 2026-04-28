@@ -453,7 +453,12 @@ export async function migrateDomain(
     }
 
     try {
-      await sa.uploadIndexPhp(newSaId, domain, php)
+      // Pass NEW server's IP explicitly — uploadIndexPhp's SSH fallback
+      // would otherwise look up domains.server_id which still points at
+      // the OLD (dead) server at this point in migration. Without this,
+      // SSH targets the dead droplet, times out, and the last-resort
+      // overwrite leaves a PHP-source index.html on the new server.
+      await sa.uploadIndexPhp(newSaId, domain, php, newServer.ip ?? undefined)
     } catch (e) {
       logPipeline(domain, "migrate", "failed",
         `upload_index_php: ${(e as Error).message}`)
