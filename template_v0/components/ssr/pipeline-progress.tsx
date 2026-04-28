@@ -58,7 +58,17 @@ export function PipelineProgress({
           <CheckCircle2 className="h-4 w-4 shrink-0" aria-hidden />
           <span className="text-small font-medium">Pipeline complete</span>
           {rel && (
-            <span className="ml-auto font-mono text-micro text-status-completed/70">{rel}</span>
+            // suppressHydrationWarning because `rel` derives from Date.now()
+            // and ticks once per second; the server-rendered value is
+            // ~1s older than the client-rendered one. The 1s mismatch is
+            // intentional and corrects itself on the first SWR poll. This
+            // is exactly the case React's docs recommend the flag for.
+            <span
+              className="ml-auto font-mono text-micro text-status-completed/70"
+              suppressHydrationWarning
+            >
+              {rel}
+            </span>
           )}
         </div>
       </div>
