@@ -29,12 +29,17 @@ async function postForm<T = unknown>(
     if (!r.ok) {
       return { ok: false, error: String(j.error ?? `HTTP ${r.status}`) }
     }
+    // Spread body fields onto the top level so callers that cast to a flat
+    // shape (`as { added?: number; ... }`) read real values instead of
+    // undefined. The structured ok/message/error/data come last so they win
+    // over body keys with the same name.
     return {
+      ...j,
       ok: Boolean(j.ok ?? true),
       message: typeof j.message === "string" ? j.message : undefined,
       error: typeof j.error === "string" ? j.error : undefined,
       data: j as T,
-    }
+    } as ActionResult<T>
   } catch (e) {
     return { ok: false, error: (e as Error).message }
   }
@@ -174,6 +179,13 @@ export const cfKeyActions = {
     }),
   toggle: (id: number) => postForm(`/api/cf-keys/${id}/toggle`),
   refreshAccounts: () => postForm("/api/cf-keys/refresh-accounts"),
+  /** Diagnostic — create a throwaway zone with this key and immediately delete
+   *  it. Confirms the (email, api_key, cf_account_id) triple can mint zones. */
+  testCreateZone: (id: number) => postForm(`/api/cf-keys/${id}/test-create-zone`),
+  /** List zones CF reports for this key's account — surfaces orphans (zones
+   *  in CF that SSR doesn't track) and missing zones (SSR rows with cf_zone_id
+   *  that CF no longer has). */
+  listZones: (id: number) => getJson(`/api/cf-keys/${id}/zones`),
   bulkSetIp: (id: number, domains: string[], newIp: string, proxied = true) => {
     const fd = new FormData()
     for (const d of domains) fd.append("domains", d)

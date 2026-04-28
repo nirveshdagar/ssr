@@ -456,7 +456,19 @@ export async function createZoneForDomain(domain: string): Promise<CreateZoneRes
         creds,
       )
       if (!zones.length) throw new Error(`CF says zone exists but GET returned none`)
-      z = zones[0]
+      // Paranoid name check — CF's ?name= filter should be exact match, but
+      // verify case-insensitively in case CF ever returns a zone whose name
+      // doesn't match what we asked for. Catches a class of "wrong zone got
+      // assigned to the wrong domain" bugs that would otherwise be silent.
+      const wanted = domain.trim().toLowerCase()
+      const matching = zones.find((z2) => z2.name?.trim().toLowerCase() === wanted)
+      if (!matching) {
+        const got = zones.map((z2) => z2.name).join(", ")
+        throw new Error(
+          `CF /zones?name=${domain} returned no name match — got: [${got}]`,
+        )
+      }
+      z = matching
     } else {
       const msg = resp.json?.errors?.map((e) => `${e.code}:${e.message}`).join("; ") ??
         `HTTP ${resp.status}`

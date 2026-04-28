@@ -338,6 +338,14 @@ export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, i
               </span>
             </Row>
           </dl>
+          {row.cf_nameservers && (
+            <p className="mt-2 text-[11px] leading-snug text-muted-foreground/80">
+              Cloudflare assigns the same NS pair to every zone in one account, so other
+              SSR domains on this CF key will share these nameservers. Verify a unique
+              zone via the <strong>Zone ID</strong> in the Cloudflare card above —
+              that's the per-domain identifier.
+            </p>
+          )}
         </ResourceCard>
       </section>
 

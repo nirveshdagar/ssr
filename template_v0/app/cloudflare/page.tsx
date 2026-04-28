@@ -52,6 +52,41 @@ import {
 } from "@/components/ui/select"
 import { cn } from "@/lib/utils"
 
+interface TestZoneResult {
+  ok?: boolean
+  test_zone_name?: string
+  zone_id?: string
+  nameservers?: string[]
+  initial_status?: string
+  cleanup?: { deleted: boolean; error: string | null; orphan_zone_id: string | null }
+  message?: string
+  error?: string
+  stage?: string
+}
+
+interface ZonesListZone {
+  cf_zone_id: string
+  name: string
+  cf_status: string
+  cf_type: string | null
+  cf_paused: boolean
+  cf_created: string | null
+  tracked: boolean
+  ssr_domain_status: string | null
+  ssr_zone_id_match: boolean | null
+}
+
+interface ZonesListResult {
+  ok: boolean
+  key_alias?: string | null
+  cf_account_id?: string
+  zones?: ZonesListZone[]
+  tracked_missing_in_cf?: { domain: string; cf_zone_id: string | null; ssr_status: string; reason: string }[]
+  total_in_cf?: number
+  total_tracked?: number
+  error?: string
+}
+
 export default function CloudflarePage() {
   const [expanded, setExpanded] = React.useState<string | null>(null)
   const [selected, setSelected] = React.useState<Set<string>>(new Set())
@@ -134,6 +169,33 @@ export default function CloudflarePage() {
       setEditingKey(null); show("ok", r.message ?? "Updated"); await refresh()
     } else {
       setEditKeyResult({ kind: "err", text: r.error ?? r.message ?? "edit failed" })
+    }
+  }
+
+  // ---- Test create zone diagnostic ----
+  const [testZone, setTestZone] = React.useState<
+    { id: number; label: string; running: boolean; result: TestZoneResult | null } | null
+  >(null)
+  async function runTestZone(keyId: number, label: string) {
+    setTestZone({ id: keyId, label, running: true, result: null })
+    const r = await cfKeyActions.testCreateZone(keyId) as TestZoneResult
+    setTestZone((s) => s ? { ...s, running: false, result: r } : s)
+  }
+
+  // ---- Zones-in-CF list dialog ----
+  const [zonesListKey, setZonesListKey] = React.useState<{ id: number; label: string } | null>(null)
+  const [zonesListData, setZonesListData] = React.useState<ZonesListResult | null>(null)
+  const [zonesListLoading, setZonesListLoading] = React.useState(false)
+  async function openZonesList(keyId: number, label: string) {
+    setZonesListKey({ id: keyId, label })
+    setZonesListData(null)
+    setZonesListLoading(true)
+    const r = await cfKeyActions.listZones(keyId)
+    setZonesListLoading(false)
+    if (r.ok && r.data) {
+      setZonesListData(r.data as ZonesListResult)
+    } else {
+      setZonesListData({ ok: false, error: r.error ?? "list zones failed" } as ZonesListResult)
     }
   }
 
@@ -476,6 +538,12 @@ export default function CloudflarePage() {
                           <DropdownMenuContent align="end" className="w-48">
                             <DropdownMenuItem onClick={() => openEditKey(Number(k.id), k.alias, k.maxDomains)}>
                               Edit alias / max
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => openZonesList(Number(k.id), k.label)}>
+                              List zones in CF
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => runTestZone(Number(k.id), k.label)}>
+                              Test create zone
                             </DropdownMenuItem>
                             <DropdownMenuItem onClick={() => openCsvModal(Number(k.id), k.label)}>
                               Bulk DNS upsert (CSV)
@@ -912,6 +980,132 @@ export default function CloudflarePage() {
           </label>
           <FieldDescription>If both paste + file are given, the paste wins.</FieldDescription>
         </Field>
+      </OperatorDialog>
+
+      {/* === Test create zone diagnostic === */}
+      <OperatorDialog
+        open={testZone !== null}
+        onOpenChange={(o) => { if (!o) setTestZone(null) }}
+        title={`Test create zone — ${testZone?.label ?? ""}`}
+        description="Creates a throwaway .example zone with this key, captures CF's response, then immediately deletes it. Confirms (email, api_key, account_id) can mint zones."
+        submitLabel="Close"
+        onSubmit={() => setTestZone(null)}
+      >
+        {testZone?.running ? (
+          <div className="text-small text-muted-foreground">Calling Cloudflare…</div>
+        ) : testZone?.result ? (
+          <div className="flex flex-col gap-2 text-small">
+            {testZone.result.ok ? (
+              <>
+                <div className="rounded-md border border-status-completed/30 bg-status-completed/8 px-3 py-2 text-status-completed">
+                  ✓ Cloudflare accepted zone create — see details below.
+                </div>
+                <dl className="font-mono text-xs flex flex-col gap-1">
+                  <div><span className="text-muted-foreground">test_zone_name:</span> {testZone.result.test_zone_name}</div>
+                  <div><span className="text-muted-foreground">zone_id:</span> {testZone.result.zone_id}</div>
+                  <div><span className="text-muted-foreground">initial_status:</span> {testZone.result.initial_status}</div>
+                  <div className="break-all"><span className="text-muted-foreground">nameservers:</span> {testZone.result.nameservers?.join(", ")}</div>
+                  <div>
+                    <span className="text-muted-foreground">cleanup:</span>{" "}
+                    {testZone.result.cleanup?.deleted ? (
+                      <span className="text-status-completed">deleted ✓</span>
+                    ) : (
+                      <span className="text-status-terminal">
+                        FAILED — orphan zone_id={testZone.result.cleanup?.orphan_zone_id} ({testZone.result.cleanup?.error})
+                      </span>
+                    )}
+                  </div>
+                </dl>
+              </>
+            ) : (
+              <div className="rounded-md border border-status-terminal/30 bg-status-terminal/8 px-3 py-2 text-status-terminal">
+                ✗ {testZone.result.error ?? "Test zone create failed"}
+                {testZone.result.stage && ` (stage: ${testZone.result.stage})`}
+              </div>
+            )}
+          </div>
+        ) : null}
+      </OperatorDialog>
+
+      {/* === Zones-in-CF live list === */}
+      <OperatorDialog
+        open={zonesListKey !== null}
+        onOpenChange={(o) => { if (!o) { setZonesListKey(null); setZonesListData(null) } }}
+        title={`Zones in CF account — ${zonesListKey?.label ?? ""}`}
+        description="Live read from Cloudflare's /zones endpoint, joined against SSR's domain rows. Surfaces orphans (in CF but not SSR) and missing zones (SSR thinks it created but CF doesn't have)."
+        submitLabel="Close"
+        onSubmit={() => { setZonesListKey(null); setZonesListData(null) }}
+      >
+        {zonesListLoading ? (
+          <div className="text-small text-muted-foreground">Loading from Cloudflare…</div>
+        ) : zonesListData?.ok ? (
+          <div className="flex flex-col gap-3 max-h-[60vh] overflow-y-auto">
+            <div className="text-micro text-muted-foreground font-mono">
+              account_id={zonesListData.cf_account_id} · {zonesListData.total_in_cf} zone(s) in CF · {zonesListData.total_tracked} tracked by SSR
+            </div>
+            {zonesListData.zones?.length === 0 && (
+              <div className="text-small text-muted-foreground">No zones in this CF account.</div>
+            )}
+            <div className="flex flex-col gap-1">
+              {zonesListData.zones?.map((z) => (
+                <div key={z.cf_zone_id}
+                  className="rounded-md border border-border/60 bg-card px-2.5 py-2 flex items-center justify-between gap-2 text-small">
+                  <div className="flex flex-col min-w-0">
+                    <span className="font-medium truncate">{z.name}</span>
+                    <span className="font-mono text-[11px] text-muted-foreground truncate">
+                      {z.cf_zone_id}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0 text-[11px]">
+                    <span className={cn(
+                      "rounded-sm px-1.5 py-0.5 font-medium",
+                      z.cf_status === "active" && "bg-status-completed/15 text-status-completed",
+                      z.cf_status === "pending" && "bg-status-waiting/15 text-status-waiting",
+                      z.cf_status !== "active" && z.cf_status !== "pending" && "bg-muted text-muted-foreground",
+                    )}>cf:{z.cf_status}</span>
+                    {z.tracked ? (
+                      <span className="rounded-sm bg-status-running/15 text-status-running px-1.5 py-0.5 font-medium">
+                        tracked
+                      </span>
+                    ) : (
+                      <span className="rounded-sm bg-status-terminal/10 text-status-terminal px-1.5 py-0.5 font-medium">
+                        orphan
+                      </span>
+                    )}
+                    {z.ssr_zone_id_match === false && (
+                      <span className="rounded-sm bg-status-terminal/15 text-status-terminal px-1.5 py-0.5 font-medium"
+                        title="SSR's cf_zone_id for this domain doesn't match CF's">
+                        zone-id mismatch
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+            {(zonesListData.tracked_missing_in_cf?.length ?? 0) > 0 && (
+              <div className="mt-2">
+                <div className="text-small font-medium text-status-terminal mb-1">
+                  SSR domains whose zone CF doesn't have ({zonesListData.tracked_missing_in_cf?.length})
+                </div>
+                <div className="flex flex-col gap-1">
+                  {zonesListData.tracked_missing_in_cf?.map((m) => (
+                    <div key={m.domain}
+                      className="rounded-md border border-status-terminal/30 bg-status-terminal/5 px-2.5 py-1.5 text-small">
+                      <span className="font-medium">{m.domain}</span>
+                      <span className="font-mono text-[11px] text-muted-foreground ml-2">
+                        zone_id={m.cf_zone_id ?? "—"} · ssr_status={m.ssr_status}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        ) : zonesListData ? (
+          <div className="rounded-md border border-status-terminal/30 bg-status-terminal/8 px-3 py-2 text-small text-status-terminal">
+            ✗ {zonesListData.error ?? "Failed to load zones from Cloudflare"}
+          </div>
+        ) : null}
       </OperatorDialog>
     </AppShell>
   )
