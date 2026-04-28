@@ -17,9 +17,10 @@ export async function POST(req: NextRequest): Promise<Response> {
   const claimed = "claimed" in result.reconcile ? result.reconcile.claimed.length : 0
   const resumed = "resumed" in result.resume ? result.resume.resumed.length : 0
   const nsResumed = "resumed" in result.ns ? result.ns.resumed.length : 0
+  const retried = "retried" in result.retry ? result.retry.retried.length : 0
   appendAudit(
     "auto_heal_manual", "",
-    `claimed=${claimed} resumed=${resumed} ns_resumed=${nsResumed}`,
+    `claimed=${claimed} resumed=${resumed} ns_resumed=${nsResumed} retried=${retried}`,
     ip,
   )
 
@@ -28,6 +29,6 @@ export async function POST(req: NextRequest): Promise<Response> {
     ...result,
     message:
       `Auto-heal tick: claimed ${claimed} server(s), resumed ${resumed} pipeline(s), ` +
-      `${nsResumed} NS-pending domain(s) advanced.`,
+      `${nsResumed} NS-pending domain(s) advanced, ${retried} retryable_error domain(s) re-enqueued.`,
   })
 }

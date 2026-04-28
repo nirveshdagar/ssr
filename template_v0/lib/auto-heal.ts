@@ -31,6 +31,7 @@ import { appendAudit } from "./repos/audit"
 import { isRetryableError } from "./status-taxonomy"
 import { isPipelineRunning, runFullPipeline } from "./pipeline"
 import { getZoneStatus } from "./cloudflare"
+import { all } from "./db"
 
 // ---------------------------------------------------------------------------
 // 1. Reconcile orphan servers from SA
@@ -197,6 +198,96 @@ export async function autoCheckPendingNs(): Promise<NsCheckResult> {
 }
 
 // ---------------------------------------------------------------------------
+// 4. Generic retry of retryable_error / error domains after cooldown
+// ---------------------------------------------------------------------------
+//
+// The first three paths cover specific recovery cases (claimed orphan,
+// CF zone activation). This one is the catch-all: any domain in a
+// retryable error state gets re-enqueued after a cooldown, so transient
+// failures (DO API hiccup, CF rate-limit, SSH glitch) self-heal without
+// a human click.
+//
+// Guardrails:
+//   - cooldown (default 30 min, env SSR_AUTOHEAL_RETRY_COOLDOWN_MS)
+//     compared against domains.last_heartbeat_at — recent failures wait
+//   - per-domain cap (default 5/24h, env SSR_AUTOHEAL_RETRY_MAX_PER_DAY)
+//     from pipeline_runs.status='failed' count — gives up on truly broken
+//     domains so we don't burn external API quota on a hopeless retry loop
+//   - terminal errors (content_blocked, cf_pool_full, terminal_error,
+//     purchase_failed) are NOT in retryable_error so they're skipped — those
+//     genuinely need a human (override the niche, add CF capacity, etc).
+//
+// Effect: a domain that fails for any retryable reason will retry roughly
+// once every 30 min until it succeeds OR has accumulated 5 failed runs in
+// 24h, then sits until the operator intervenes.
+
+export interface RetryResult {
+  retried: { domain: string; status: string; failed_runs_24h: number; job_id: number | null }[]
+  skipped: { domain: string; reason: string }[]
+}
+
+const DEFAULT_RETRY_COOLDOWN_MS = 30 * 60 * 1000
+const DEFAULT_RETRY_MAX_PER_DAY = 5
+
+export function autoRetryRetryable(): RetryResult {
+  const retried: RetryResult["retried"] = []
+  const skipped: RetryResult["skipped"] = []
+
+  const cooldownMs = Math.max(
+    60_000,
+    Number.parseInt(process.env.SSR_AUTOHEAL_RETRY_COOLDOWN_MS ?? "", 10) || DEFAULT_RETRY_COOLDOWN_MS,
+  )
+  const maxPerDay = Math.max(
+    1,
+    Number.parseInt(process.env.SSR_AUTOHEAL_RETRY_MAX_PER_DAY ?? "", 10) || DEFAULT_RETRY_MAX_PER_DAY,
+  )
+  const cooldownThreshold = new Date(Date.now() - cooldownMs).toISOString().replace(/\.\d{3}Z$/, "")
+
+  for (const d of listDomains()) {
+    if (!isRetryableError(d.status)) continue
+    if (isPipelineRunning(d.domain)) {
+      skipped.push({ domain: d.domain, reason: "already running" })
+      continue
+    }
+    // Cooldown — wait at least cooldownMs since last heartbeat (which the
+    // pipeline pulses every 1s during a run AND once at end, so this gates
+    // both in-flight and just-finished failures).
+    const heartbeatTs = (d.last_heartbeat_at ?? "").trim()
+    if (heartbeatTs && heartbeatTs > cooldownThreshold) {
+      skipped.push({ domain: d.domain, reason: `cooldown (heartbeat ${heartbeatTs} < ${cooldownThreshold})` })
+      continue
+    }
+    // Per-domain 24h cap on failed runs — stops infinite retry loops on
+    // genuinely broken domains.
+    const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString().replace(/\.\d{3}Z$/, "")
+    const failedRow = all<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM pipeline_runs
+        WHERE domain = ? AND status = 'failed' AND ended_at >= ?`,
+      d.domain, since,
+    )
+    const failed24h = failedRow[0]?.n ?? 0
+    if (failed24h >= maxPerDay) {
+      skipped.push({
+        domain: d.domain,
+        reason: `cap reached (${failed24h}/${maxPerDay} failed runs in last 24h — needs human review)`,
+      })
+      continue
+    }
+
+    const jobId = runFullPipeline(d.domain, { /* smart-resume from row state */ })
+    if (jobId == null) {
+      skipped.push({ domain: d.domain, reason: "slot lock rejected" })
+      continue
+    }
+    logPipeline(d.domain, "auto_heal", "running",
+      `Auto-retry: status='${d.status}' (failed ${failed24h}/${maxPerDay} in 24h); ` +
+      `re-enqueueing pipeline.full with smart-resume`)
+    retried.push({ domain: d.domain, status: d.status ?? "", failed_runs_24h: failed24h, job_id: jobId })
+  }
+  return { retried, skipped }
+}
+
+// ---------------------------------------------------------------------------
 // One tick of the background loop
 // ---------------------------------------------------------------------------
 
@@ -204,6 +295,7 @@ export interface AutoHealTickResult {
   reconcile: ReconcileResult | { error: string }
   resume: ResumeResult | { error: string }
   ns: NsCheckResult | { error: string }
+  retry: RetryResult | { error: string }
   ranAt: string
 }
 
@@ -234,19 +326,27 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
     ns = { error: (e as Error).message }
   }
 
+  let retry: RetryResult | { error: string }
+  try {
+    retry = autoRetryRetryable()
+  } catch (e) {
+    retry = { error: (e as Error).message }
+  }
+
   // Only audit-log when something actually happened — avoids audit spam.
   const claimedN = "claimed" in reconcile ? reconcile.claimed.length : 0
   const resumedN = "resumed" in resume ? resume.resumed.length : 0
   const nsResumedN = "resumed" in ns ? ns.resumed.length : 0
-  if (claimedN + resumedN + nsResumedN > 0) {
+  const retriedN = "retried" in retry ? retry.retried.length : 0
+  if (claimedN + resumedN + nsResumedN + retriedN > 0) {
     appendAudit(
       "auto_heal_tick", "",
-      `claimed=${claimedN} resumed=${resumedN} ns_resumed=${nsResumedN}`,
+      `claimed=${claimedN} resumed=${resumedN} ns_resumed=${nsResumedN} retried=${retriedN}`,
       null,
     )
   }
 
-  return { reconcile, resume, ns, ranAt }
+  return { reconcile, resume, ns, retry, ranAt }
 }
 
 // ---------------------------------------------------------------------------
