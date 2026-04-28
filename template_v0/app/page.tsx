@@ -208,7 +208,7 @@ export default function DashboardPage() {
                     <StatusBadge status={d.status} />
                   </div>
                   <div className="mt-3">
-                    <PipelineProgress currentStep={d.step} status={d.status} compact />
+                    <PipelineProgress currentStep={d.step} status={d.status} compact completedAt={d.createdAt} />
                     <div className="mt-2 flex items-center justify-between text-micro text-muted-foreground">
                       <span>
                         Step {d.step} of 10 · started {d.createdAt.split(" ")[1]}

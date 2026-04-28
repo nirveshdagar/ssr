@@ -293,9 +293,22 @@ export default function ServerAvatarPage() {
                                 <code className="font-mono text-micro text-muted-foreground">{a.ssl_status ?? "—"}</code>
                               </td>
                               <td className="px-2 py-1.5">
-                                {a.ssr_status ? <code className="font-mono text-micro">{a.ssr_status}</code> : <span className="text-muted-foreground">—</span>}
+                                {a.ssr_status
+                                  ? <code className={cn(
+                                      "font-mono text-micro",
+                                      (a.ssr_status === "live" || a.ssr_status === "hosted") && "text-status-completed",
+                                    )}>{a.ssr_status}</code>
+                                  : <span className="text-muted-foreground">—</span>}
                               </td>
-                              <td className="px-2 py-1.5 font-mono text-micro text-muted-foreground">
+                              <td className={cn(
+                                "px-2 py-1.5 font-mono text-micro",
+                                // Pipeline at success → no worker beats are
+                                // expected; render quietly so a stale beat
+                                // here doesn't read as a problem.
+                                (a.ssr_status === "live" || a.ssr_status === "hosted")
+                                  ? "text-muted-foreground/50"
+                                  : "text-muted-foreground",
+                              )}>
                                 {a.last_heartbeat_at ?? "—"}
                               </td>
                               <td className="px-2 py-1.5">

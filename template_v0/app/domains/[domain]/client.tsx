@@ -173,25 +173,34 @@ export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, i
               <div className="flex items-center gap-2 flex-wrap">
                 <h2 className="truncate text-lg font-semibold tracking-tight font-mono">{domain}</h2>
                 <StatusBadge status={status} />
-                {/* Heartbeat chip — tracks live polling */}
-                {heartbeat && (
-                  <span
-                    className={cn(
-                      "inline-flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 text-xs font-medium",
-                      heartbeat.alive && "border-status-completed/40 bg-status-completed/10 text-status-completed",
-                      !heartbeat.alive && (heartbeat.seconds_ago ?? 999) <= 30 && "border-status-waiting/40 bg-status-waiting/10 text-status-waiting",
-                      !heartbeat.alive && (heartbeat.seconds_ago ?? 999) > 30 && "border-status-terminal/40 bg-status-terminal/10 text-status-terminal",
-                    )}
-                    title={heartbeat.last_heartbeat_at ?? "no heartbeat yet"}
-                  >
-                    <Heart className="h-3 w-3" aria-hidden />
-                    {heartbeat.seconds_ago == null
-                      ? "no heartbeat"
-                      : heartbeat.alive
-                        ? "live"
-                        : `${heartbeat.seconds_ago}s ago`}
-                  </span>
-                )}
+                {/* Heartbeat chip — tracks live polling. When the pipeline is
+                    in a success state (hosted/live), the lack of a fresh beat
+                    is EXPECTED (no worker is running) so the chip renders
+                    neutral gray instead of the alarming red. */}
+                {heartbeat && (() => {
+                  const pipelineDone = status === "live" || status === "completed"
+                  return (
+                    <span
+                      className={cn(
+                        "inline-flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 text-xs font-medium",
+                        pipelineDone && "border-border bg-muted/40 text-muted-foreground",
+                        !pipelineDone && heartbeat.alive && "border-status-completed/40 bg-status-completed/10 text-status-completed",
+                        !pipelineDone && !heartbeat.alive && (heartbeat.seconds_ago ?? 999) <= 30 && "border-status-waiting/40 bg-status-waiting/10 text-status-waiting",
+                        !pipelineDone && !heartbeat.alive && (heartbeat.seconds_ago ?? 999) > 30 && "border-status-terminal/40 bg-status-terminal/10 text-status-terminal",
+                      )}
+                      title={heartbeat.last_heartbeat_at ?? "no heartbeat yet"}
+                    >
+                      <Heart className="h-3 w-3" aria-hidden />
+                      {pipelineDone
+                        ? "idle"
+                        : heartbeat.seconds_ago == null
+                          ? "no heartbeat"
+                          : heartbeat.alive
+                            ? "live"
+                            : `${heartbeat.seconds_ago}s ago`}
+                    </span>
+                  )
+                })()}
               </div>
               <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
                 <span>step {currentStep} / 10</span>
@@ -238,7 +247,7 @@ export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, i
 
         {/* Pipeline progress strip */}
         <div className="px-5 py-4">
-          <PipelineProgress currentStep={currentStep} status={status} />
+          <PipelineProgress currentStep={currentStep} status={status} completedAt={row.updated_at} />
         </div>
       </section>
 

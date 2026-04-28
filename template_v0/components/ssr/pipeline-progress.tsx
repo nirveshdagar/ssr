@@ -1,4 +1,4 @@
-import { Check, Loader2 } from "lucide-react"
+import { Check, Loader2, CheckCircle2 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { PIPELINE_STEPS } from "@/lib/status-taxonomy"
 import type { PipelineStatus } from "@/lib/ssr/mock-data"
@@ -12,18 +12,67 @@ interface PipelineProgressProps {
   status: PipelineStatus
   className?: string
   compact?: boolean
+  /** Optional ISO/SQL timestamp of when the run completed — used to render
+   *  "complete · X ago" when status is a success state. If omitted on
+   *  success, just shows "Pipeline complete". */
+  completedAt?: string | null
 }
 
-export function PipelineProgress({ currentStep, status, className, compact = false }: PipelineProgressProps) {
+function formatRelative(iso: string | null | undefined): string | null {
+  if (!iso) return null
+  // Accept SQLite "YYYY-MM-DD HH:MM:SS" (no Z) and ISO formats.
+  const normalized = /\d{4}-\d{2}-\d{2}T/.test(iso) ? iso : iso.replace(" ", "T") + "Z"
+  const t = Date.parse(normalized)
+  if (!Number.isFinite(t)) return null
+  const sec = Math.max(0, Math.round((Date.now() - t) / 1000))
+  if (sec < 60) return `${sec}s ago`
+  const min = Math.round(sec / 60)
+  if (min < 60) return `${min}m ago`
+  const hr = Math.round(min / 60)
+  if (hr < 24) return `${hr}h ago`
+  const day = Math.round(hr / 24)
+  return `${day}d ago`
+}
+
+export function PipelineProgress({
+  currentStep, status, className, compact = false, completedAt,
+}: PipelineProgressProps) {
   const failed = status === "terminal_error" || status === "retryable_error"
   const canceled = status === "canceled"
+  // Pipeline success — `live` (visiting URL works) and `completed` both
+  // mean every step is done; render a single quiet "complete" banner
+  // instead of a 10-step strip with no signal.
+  const isSuccess = status === "live" || status === "completed"
+
+  if (isSuccess) {
+    const rel = formatRelative(completedAt)
+    return (
+      <div className={cn("w-full", className)}>
+        <div
+          className={cn(
+            "flex items-center gap-2 rounded-md border border-status-completed/30",
+            "bg-status-completed/8 px-3 py-2 text-status-completed",
+            compact && "py-1.5",
+          )}
+        >
+          <CheckCircle2 className="h-4 w-4 shrink-0" aria-hidden />
+          <span className="text-small font-medium">Pipeline complete</span>
+          {rel && (
+            <span className="ml-auto font-mono text-micro text-status-completed/70">{rel}</span>
+          )}
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className={cn("w-full", className)}>
       <ol className="flex items-stretch gap-1.5 overflow-x-auto" role="list">
         {STEP_ENTRIES.map((step) => {
-          const isCompleted = step.id < currentStep || status === "live"
-          const isCurrent = step.id === currentStep && !canceled && status !== "live"
+          // Note: success states ("live"/"completed") are handled by the
+          // banner above and never reach this loop.
+          const isCompleted = step.id < currentStep
+          const isCurrent = step.id === currentStep && !canceled
           const isPending = step.id > currentStep
           const isFailed = isCurrent && failed
 
