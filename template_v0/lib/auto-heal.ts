@@ -324,23 +324,48 @@ export function autoFixBrokenSsl(): BrokenSslResult {
   const reissued: BrokenSslResult["reissued"] = []
   const skipped: BrokenSslResult["skipped"] = []
 
-  // Domains where step 8 either never ran OR didn't complete. Excludes:
-  //  - non-success-status domains (those have other recovery paths)
-  //  - domains currently mid-pipeline (slot lock would reject anyway)
-  // The step-tracker LEFT JOIN catches both "no row" (pipeline failed
-  // before step 8) and "row but not completed" (step 8 ran and failed).
-  const candidates = all<{ domain: string }>(
-    `SELECT d.domain
+  // Per-domain cooldown so an interrupted step 8 (status stuck at 'running'
+  // because the worker died mid-flight) doesn't trigger another re-fire on
+  // every 5-min sweep. 15 min is enough for one full step-8 attempt + step
+  // 10 to wrap up; if step 8 still hasn't reached 'completed' after that,
+  // refire is genuinely warranted.
+  const cooldownMs = Math.max(
+    60_000,
+    Number.parseInt(process.env.SSR_AUTOFIX_SSL_COOLDOWN_MS ?? "", 10) || 15 * 60_000,
+  )
+  const cooldownThreshold = new Date(Date.now() - cooldownMs).toISOString().replace(/\.\d{3}Z$/, "")
+
+  // Domains where step 8 has explicitly FAILED or never ran (NULL row).
+  // Excludes:
+  //   - status = 'running' (an active worker is on it; piling another
+  //     pipeline.full would just queue behind the slot lock)
+  //   - status = 'completed' / 'skipped' (already good)
+  //   - status = 'warning' if updated recently (step 8 may have soft-
+  //     failed and a retry is already in flight via autoRetryRetryable)
+  // Cooldown filter prevents tight loops on persistent failures.
+  const candidates = all<{ domain: string; step_status: string | null; finished_at: string | null }>(
+    `SELECT d.domain, s.status AS step_status, s.finished_at
        FROM domains d
        LEFT JOIN step_tracker s
          ON s.domain = d.domain AND s.step_num = 8
       WHERE d.status IN ('live', 'hosted', 'completed')
-        AND (s.status IS NULL OR s.status != 'completed')`,
+        AND (s.status IS NULL OR s.status IN ('failed', 'pending'))`,
   )
 
   for (const c of candidates) {
     if (isPipelineRunning(c.domain)) {
       skipped.push({ domain: c.domain, reason: "already running" })
+      continue
+    }
+    // Cooldown: if step 8 was attempted recently (any finished_at within
+    // the cooldown window), wait. autoRetryRetryable's separate cooldown
+    // path also gates retries, so this is belt-and-braces.
+    const finishedAt = (c.finished_at ?? "").trim()
+    if (finishedAt && finishedAt > cooldownThreshold) {
+      skipped.push({
+        domain: c.domain,
+        reason: `cooldown (step 8 attempted at ${finishedAt}, threshold ${cooldownThreshold})`,
+      })
       continue
     }
     const jobId = runFullPipeline(c.domain, { startFrom: 8 })
@@ -349,8 +374,8 @@ export function autoFixBrokenSsl(): BrokenSslResult {
       continue
     }
     logPipeline(c.domain, "auto_heal", "running",
-      `Auto-fix broken SSL: domain status is live/hosted but step 8 never ` +
-      `completed in step_tracker. Re-firing pipeline.full with start_from=8.`)
+      `Auto-fix broken SSL: step 8 status='${c.step_status ?? "(none)"}' but ` +
+      `domain marked live/hosted. Re-firing pipeline.full with start_from=8.`)
     reissued.push({ domain: c.domain, job_id: jobId })
   }
   return { reissued, skipped }
