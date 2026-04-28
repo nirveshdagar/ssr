@@ -668,9 +668,36 @@ async function step7CreateAppAndDns(domain: string, server: ServerRow): Promise<
   try {
     appId = await createApplication(server.sa_server_id!, domain)
   } catch (e) {
-    updateStep(domain, 7, "failed", `SA createApplication: ${(e as Error).message}`)
-    updateDomain(domain, { status: "retryable_error" })
-    return false
+    // SA refuses duplicate apps with this validation message. Treat as
+    // "already there" — look up the existing app id and continue. Mirrors
+    // the same idempotent-on-create pattern step 3 (CF zone) uses.
+    const msg = (e as Error).message
+    const isDup = /already exists/i.test(msg) ||
+      /Application name already exists/i.test(msg) ||
+      /Application domain already exists/i.test(msg)
+    if (isDup) {
+      try {
+        const existing = await findAppId(server.sa_server_id!, domain)
+        if (!existing) {
+          updateStep(domain, 7, "failed",
+            `SA says app exists but findAppId returned null: ${msg}`)
+          updateDomain(domain, { status: "retryable_error" })
+          return false
+        }
+        appId = existing
+        logPipeline(domain, "sa_create_app", "warning",
+          `App ${appId} already exists on SA — reusing instead of failing`)
+      } catch (lookupErr) {
+        updateStep(domain, 7, "failed",
+          `SA app exists but findAppId threw: ${(lookupErr as Error).message}`)
+        updateDomain(domain, { status: "retryable_error" })
+        return false
+      }
+    } else {
+      updateStep(domain, 7, "failed", `SA createApplication: ${msg}`)
+      updateDomain(domain, { status: "retryable_error" })
+      return false
+    }
   }
   updateDomain(domain, { server_id: server.id })
 
