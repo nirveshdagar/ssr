@@ -634,16 +634,23 @@ async function step6GetOrProvisionServer(
         `Attempts: ${e.attempts.map(([lbl, err]) => `${lbl}→${err}`).join("; ")}`
       updateStep(domain, 6, "failed", msg)
       logPipeline(domain, "provision", "failed", msg)
+      updateDomain(domain, { status: "retryable_error" })
       return null
     }
     if (e instanceof DropletRateLimited) {
       const msg = `Droplet creation refused by cost cap: ${e.message}`
       updateStep(domain, 6, "failed", msg)
       logPipeline(domain, "provision", "failed", msg)
+      updateDomain(domain, { status: "retryable_error" })
       return null
     }
     updateStep(domain, 6, "failed", `Provisioning failed: ${(e as Error).message}`)
     logPipeline(domain, "provision", "failed", (e as Error).message)
+    // Without this, the domain row stays at whatever step 4 set (ns_set),
+    // making the failure invisible to auto-heal's autoResumeStuckPipelines
+    // filter (which watches for retryable_error). Steps 3/4/7/8/9/10 all set
+    // this on their failure paths — step 6 was the lone outlier.
+    updateDomain(domain, { status: "retryable_error" })
     return null
   }
 }
