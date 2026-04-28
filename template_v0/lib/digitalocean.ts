@@ -258,6 +258,72 @@ export async function listDroplets(opts: { tag?: string } = {}): Promise<Droplet
   return all
 }
 
+/**
+ * List droplets using a specific token (primary or backup) — bypasses the
+ * failover ladder. Used by the unique-name generator so we can verify a
+ * candidate server name doesn't collide on EITHER DO account, not just
+ * whichever happens to be the currently-active one.
+ */
+export async function listDropletsForToken(
+  token: string, opts: { tag?: string } = {},
+): Promise<Droplet[]> {
+  const tag = opts.tag ?? undefined
+  const all: Droplet[] = []
+  let page = 1
+  while (true) {
+    const url = new URL(`${DO_API}/droplets`)
+    if (tag) url.searchParams.set("tag_name", tag)
+    url.searchParams.set("page", String(page))
+    url.searchParams.set("per_page", "200")
+    const res = await fetch(url.toString(), {
+      headers: tokenHeaders(token, false),
+      signal: AbortSignal.timeout(30_000),
+    })
+    if (!res.ok) {
+      throw new Error(`DO list_droplets (per-token) HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`)
+    }
+    const data = (await res.json()) as { droplets: Droplet[]; links?: { pages?: { next?: string } } }
+    all.push(...(data.droplets ?? []))
+    if (!data.links?.pages?.next) break
+    page++
+    if (page > 50) break
+  }
+  return all
+}
+
+/**
+ * Helper for callers that need to enumerate every configured DO token
+ * (primary + backup). Returns the unique union of droplets across both
+ * accounts. Failures on one token are logged-and-skipped — we use what's
+ * available rather than crashing the whole sweep on one credential issue.
+ */
+export async function listDropletsAllTokens(opts: { tag?: string } = {}): Promise<{
+  droplets: Droplet[]
+  errors: { token: string; error: string }[]
+}> {
+  const primary = (getSetting("do_api_token") || "").trim()
+  const backup = (getSetting("do_api_token_backup") || "").trim()
+  const tokens: { label: string; token: string }[] = []
+  if (primary) tokens.push({ label: "primary", token: primary })
+  if (backup) tokens.push({ label: "backup", token: backup })
+
+  const seen = new Set<string>()
+  const droplets: Droplet[] = []
+  const errors: { token: string; error: string }[] = []
+  for (const t of tokens) {
+    try {
+      const list = await listDropletsForToken(t.token, opts)
+      for (const d of list) {
+        const id = String(d.id)
+        if (!seen.has(id)) { seen.add(id); droplets.push(d) }
+      }
+    } catch (e) {
+      errors.push({ token: t.label, error: (e as Error).message })
+    }
+  }
+  return { droplets, errors }
+}
+
 export async function getDroplet(dropletId: string | number): Promise<Droplet> {
   const res = await doRequest("GET", `/droplets/${dropletId}`, { timeoutMs: 30_000 })
   if (!res.ok) throw new Error(`DO get_droplet HTTP ${res.status}`)

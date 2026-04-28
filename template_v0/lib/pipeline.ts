@@ -611,7 +611,18 @@ async function step6GetOrProvisionServer(
       ? "Operator requested new server — provisioning DO droplet..."
       : "No server with capacity — provisioning new DO droplet...")
   try {
-    const serverName = `ssr-${Math.floor(Date.now() / 1000)}-${Math.floor(Math.random() * 9000) + 1000}`
+    const { generateServerName } = await import("./server-names")
+    const gen = await generateServerName()
+    const serverName = gen.name
+    if (gen.lookup_errors.length > 0) {
+      logPipeline(domain, "name_gen", "warning",
+        `Name picked '${serverName}' but uniqueness check had errors on: ` +
+        gen.lookup_errors.map((e) => `${e.source}=${e.error.slice(0, 60)}`).join("; "))
+    } else {
+      logPipeline(domain, "name_gen", "running",
+        `Server name '${serverName}' (db=${gen.used_counts.db} sa=${gen.used_counts.sa} ` +
+        `do_primary=${gen.used_counts.do_primary} do_backup=${gen.used_counts.do_backup} reserved)`)
+    }
     const { serverId, ip, dropletId } = await createDroplet({ name: serverName })
     updateStep(domain, 6, "running",
       `Droplet ${dropletId} up at ${ip} — installing ServerAvatar agent (5-15 min)...`)

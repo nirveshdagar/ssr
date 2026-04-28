@@ -55,7 +55,14 @@ async function resolveTarget(
     try {
       const { createDroplet } = await import("../digitalocean")
       const { installAgentOnDroplet } = await import("../serveravatar")
-      const newName = `ssr-bulk-migrate-${Math.floor(Date.now() / 1000)}`
+      const { generateServerName } = await import("../server-names")
+      const gen = await generateServerName()
+      const newName = gen.name
+      if (gen.lookup_errors.length > 0) {
+        logPipeline(anchorDomain, "bulk_migrate", "warning",
+          `Name picked '${newName}' but uniqueness lookup had errors: ` +
+          gen.lookup_errors.map((e) => `${e.source}=${e.error.slice(0, 60)}`).join("; "))
+      }
       const { serverId, ip, dropletId } = await createDroplet({ name: newName })
       logPipeline(anchorDomain, "bulk_migrate", "running",
         `Droplet ${dropletId} up at ${ip} — installing SA agent (5–15 min)…`)

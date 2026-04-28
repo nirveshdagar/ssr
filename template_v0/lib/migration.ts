@@ -565,7 +565,14 @@ export async function migrateServer(
       const { installAgentOnDroplet } = await import("./serveravatar")
       const { updateServer } = await import("./repos/servers")
 
-      const newName = `ssr-migrate-${Math.floor(Date.now() / 1000)}`
+      const { generateServerName } = await import("./server-names")
+      const gen = await generateServerName()
+      const newName = gen.name
+      if (gen.lookup_errors.length > 0) {
+        logPipeline(anchorName, "migrate", "warning",
+          `Name picked '${newName}' but uniqueness lookup had errors: ` +
+          gen.lookup_errors.map((e) => `${e.source}=${e.error.slice(0, 60)}`).join("; "))
+      }
       const { serverId, ip: newIp, dropletId } = await createDroplet({ name: newName })
       logPipeline(anchorName, "migrate", "running",
         `Droplet ${dropletId} up at ${newIp} — installing SA agent (~5–15 min)…`)
