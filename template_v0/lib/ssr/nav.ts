@@ -7,6 +7,7 @@ import {
   ScrollText,
   ShieldCheck,
   Settings,
+  Boxes,
   type LucideIcon,
 } from "lucide-react"
 
@@ -19,6 +20,7 @@ export type NavAccent =
   | "logs"
   | "audit"
   | "settings"
+  | "sa"
 
 /** Keys the sidebar can pull from /api/status counts to render a live badge. */
 export type NavBadgeKey = "domains" | "servers" | "cf_keys" | "active_watchers"
@@ -44,6 +46,7 @@ export const NAV_ITEMS: NavItem[] = [
   { label: "Dashboard", href: "/", icon: LayoutDashboard, accent: "dashboard" },
   { label: "Domains", href: "/domains", icon: Globe, badgeKey: "domains", accent: "domains" },
   { label: "Servers", href: "/servers", icon: Server, badgeKey: "servers", accent: "servers" },
+  { label: "ServerAvatar", href: "/serveravatar", icon: Boxes, accent: "sa" },
   { label: "Cloudflare", href: "/cloudflare", icon: Cloud, badgeKey: "cf_keys", accent: "cloudflare" },
   { label: "Watcher", href: "/watcher", icon: Activity, badgeKey: "active_watchers", accent: "watcher" },
   { label: "Logs", href: "/logs", icon: ScrollText, accent: "logs" },

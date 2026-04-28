@@ -35,6 +35,7 @@ type Accent =
   | "logs"
   | "audit"
   | "settings"
+  | "sa"
 
 interface TopBarProps {
   title: string
@@ -53,6 +54,7 @@ const ACCENT_CLASS: Record<Accent, string> = {
   logs: "accent-logs",
   audit: "accent-audit",
   settings: "accent-settings",
+  sa: "accent-sa",
 }
 
 export function TopBar({ title, description, breadcrumbs, actions, accent }: TopBarProps) {

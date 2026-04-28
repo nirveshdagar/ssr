@@ -183,6 +183,16 @@ export class SshSession {
     })
   }
 
+  async sftpReadFile(path: string, encoding: BufferEncoding = "utf8"): Promise<string> {
+    const sftp = await this.sftp()
+    return new Promise<string>((resolve, reject) => {
+      sftp.readFile(path, { encoding }, (err, data) => {
+        if (err) return reject(err)
+        resolve(typeof data === "string" ? data : Buffer.from(data).toString(encoding))
+      })
+    })
+  }
+
   close(): void {
     if (this.closed) return
     this.closed = true
@@ -227,11 +237,11 @@ export async function waitForSsh(
 // EXACTLY so paths probed via SSH align with what create_application created)
 // ---------------------------------------------------------------------------
 
-function appNameFor(domain: string): string {
+export function appNameFor(domain: string): string {
   return domain.replace(/\./g, "-").replace(/_/g, "-")
 }
 
-function sysUserFor(domain: string): string {
+export function sysUserFor(domain: string): string {
   let u = domain.replace(/[^a-zA-Z0-9]/g, "").toLowerCase().slice(0, 20)
   if (!u || !/^[a-zA-Z]/.test(u)) {
     u = ("ssruser" + u).slice(0, 20)

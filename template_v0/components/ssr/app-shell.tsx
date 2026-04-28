@@ -12,6 +12,7 @@ export type PageAccent =
   | "logs"
   | "audit"
   | "settings"
+  | "sa"
 
 interface AppShellProps {
   title: string
