@@ -29,11 +29,20 @@ type WatchedRun = {
 
 export default function WatcherPage() {
   const { rows: domains } = useDomains()
-  // Derive RUNS from active-state domains. The full watcher in Flask
-  // shows in-flight pipeline_runs; while we're using the lite version,
-  // any domain in a running/waiting/retryable_error state qualifies.
+  // Derive RUNS from non-success domains. The watcher needs to surface
+  // anything that needs operator attention — including TERMINAL errors
+  // (content_blocked / cf_pool_full / purchase_failed). Hiding those once
+  // they hit a wall meant operators couldn't even see what to fix. Only
+  // omit fully-successful (live / completed) and never-started (pending)
+  // states from the active-runs sidebar.
   const RUNS: WatchedRun[] = domains
-    .filter((d) => d.status === "running" || d.status === "waiting" || d.status === "retryable_error")
+    .filter((d) =>
+      d.status === "running" ||
+      d.status === "waiting" ||
+      d.status === "retryable_error" ||
+      d.status === "terminal_error" ||
+      d.status === "canceled",
+    )
     .map((d, i) => ({
       pipelineId: `run-${d.id}`,
       domain: d.name,
@@ -109,6 +118,18 @@ export default function WatcherPage() {
     const r = await domainActions.runFromStep(active.domain, active.step)
     setActionMsg(r.message ?? r.error ?? "")
     setBusy(null)
+  }
+  // Per-step "Run from here" — re-enqueues pipeline.full with start_from=N.
+  // The pipeline's per-step skip logic re-runs N onward and short-circuits any
+  // already-completed downstream work, so this is safe whether step N is
+  // currently failed, warning, or completed (operator wants to redo from N).
+  const [perStepBusy, setPerStepBusy] = React.useState<number | null>(null)
+  async function onRunFromStep(stepNum: number) {
+    if (active.domain === "No active runs") return
+    setPerStepBusy(stepNum); setActionMsg("")
+    const r = await domainActions.runFromStep(active.domain, stepNum)
+    setActionMsg(r.message ?? r.error ?? `Run from step ${stepNum} requested`)
+    setPerStepBusy(null)
   }
 
   return (
@@ -423,6 +444,26 @@ export default function WatcherPage() {
                           <div className="flex items-center gap-2">
                             <StatusBadge status={badge} />
                             <span className="font-mono text-micro tabular-nums text-muted-foreground">{elapsed}</span>
+                            {/* Per-step "Run from here" — visible whenever the step
+                                isn't currently running. Lets operators restart
+                                the pipeline at any failed / warning / completed
+                                / skipped / pending boundary. The endpoint just
+                                enqueues pipeline.full with start_from=N; the
+                                pipeline's per-step skip logic handles upstream
+                                completed work. */}
+                            {!isRunning && active.domain !== "No active runs" && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-6 gap-1 px-1.5 text-micro"
+                                onClick={() => onRunFromStep(num)}
+                                disabled={perStepBusy === num}
+                                title={`Re-run pipeline starting from step ${num} (${stepName})`}
+                              >
+                                <RotateCw className={cn("h-3 w-3", perStepBusy === num && "animate-spin")} />
+                                Run from here
+                              </Button>
+                            )}
                           </div>
                         </div>
                         {message && (

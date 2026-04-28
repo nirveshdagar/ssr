@@ -106,6 +106,16 @@ export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, i
     show(r.ok ? "ok" : "err", r.message ?? r.error ?? "")
     setBusy(null)
   }
+  // Per-step "Run from here" — same primitive as the watcher page's per-row
+  // button. Re-enqueues pipeline.full with start_from=N; smart-resume short-
+  // circuits already-completed upstream work, so safe at any boundary.
+  const [perStepBusy, setPerStepBusy] = React.useState<number | null>(null)
+  async function onRunFromStep(stepNum: number) {
+    setPerStepBusy(stepNum)
+    const r = await domainActions.runFromStep(domain, stepNum)
+    show(r.ok ? "ok" : "err", r.message ?? r.error ?? `Run from step ${stepNum} requested`)
+    setPerStepBusy(null)
+  }
   async function cancelPipeline() {
     if (!confirm(
       `Cancel pipeline for ${domain}?\n\n` +
@@ -401,6 +411,19 @@ export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, i
                         <code className="font-mono text-xs text-muted-foreground">step_{num}</code>
                         {elapsed && (
                           <span className="font-mono text-xs tabular-nums text-muted-foreground">{elapsed}</span>
+                        )}
+                        {st !== "running" && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-6 gap-1 px-1.5 text-xs"
+                            onClick={() => onRunFromStep(num)}
+                            disabled={perStepBusy === num}
+                            title={`Re-run pipeline starting from step ${num} (${stepName})`}
+                          >
+                            <RotateCw className={cn("h-3 w-3", perStepBusy === num && "animate-spin")} />
+                            Run from here
+                          </Button>
                         )}
                       </div>
                     </div>
