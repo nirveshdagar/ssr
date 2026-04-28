@@ -310,7 +310,7 @@ export async function patchCfARecords(
 
 interface MigrateDomainResult { ok: boolean; message: string }
 
-interface ServerLike {
+export interface ServerLike {
   id: number
   ip: string | null
   sa_server_id: string | null

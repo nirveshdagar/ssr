@@ -101,6 +101,23 @@ export const domainActions = {
     return fetch("/api/domains/run-bulk", { method: "POST", body: fd, credentials: "same-origin" })
       .then(async (r) => ({ ok: r.ok, ...((await r.json()) as Record<string, unknown>) }))
   },
+  /**
+   * Migrate the selected domains to a chosen target server. Each domain's
+   * SA app moves; CF A-records flip to new IP; original zone / NS /
+   * registrar settings are preserved. Uses the cached site archive for
+   * cert + index.php redeploy, no LLM regeneration.
+   */
+  bulkMigrate: (
+    domainIds: string[],
+    opts: { targetServerId?: number; forceNewServer?: boolean } = {},
+  ) => {
+    const fd = new FormData()
+    for (const id of domainIds) fd.append("domain_ids", id)
+    if (opts.targetServerId != null) fd.set("target_server_id", String(opts.targetServerId))
+    if (opts.forceNewServer) fd.set("force_new_server", "on")
+    return fetch("/api/domains/bulk-migrate", { method: "POST", body: fd, credentials: "same-origin" })
+      .then(async (r) => ({ ok: r.ok, ...((await r.json()) as Record<string, unknown>) }))
+  },
   updateCf: (domain: string, fields: { cf_email?: string; cf_global_key?: string; cf_zone_id?: string }) =>
     postForm(`/api/domains/${domain}/update-cf`, fields),
   override: (domain: string, field: string, value: string) =>

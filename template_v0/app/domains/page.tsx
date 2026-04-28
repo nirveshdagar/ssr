@@ -22,6 +22,7 @@ import {
   Server as ServerIcon,
   FileUp,
   Info,
+  ArrowLeftRight,
 } from "lucide-react"
 import { AppShell } from "@/components/ssr/app-shell"
 import { StatusBadge } from "@/components/ssr/status-badge"
@@ -323,6 +324,33 @@ function DomainsPageInner() {
     setSelected(new Set()); setBulkSkipPurchase(false); setBulkServerId("")
     await refresh(); setBusy(null)
   }
+  // ---- Bulk migrate-to-server dialog ----
+  const [migrateOpen, setMigrateOpen] = React.useState(false)
+  const [migrateTarget, setMigrateTarget] = React.useState<string>("__auto__")
+  const [migrateResult, setMigrateResult] = React.useState<{ kind: "ok" | "err"; text: string } | null>(null)
+  function openBulkMigrate() {
+    setMigrateTarget("__auto__")
+    setMigrateResult(null)
+    setMigrateOpen(true)
+  }
+  async function submitBulkMigrate() {
+    const opts: { targetServerId?: number; forceNewServer?: boolean } = {}
+    if (migrateTarget === "__new__") opts.forceNewServer = true
+    else if (migrateTarget !== "__auto__") opts.targetServerId = Number(migrateTarget)
+    setBusy("bulk")
+    const r = await domainActions.bulkMigrate([...selected], opts) as
+      { ok?: boolean; job_id?: number; count?: number; message?: string; error?: string }
+    if (r.ok) {
+      show("ok", r.message ?? `Bulk migrate enqueued for ${r.count} domain(s) (job #${r.job_id})`)
+      setMigrateOpen(false)
+      setSelected(new Set())
+      await refresh()
+    } else {
+      setMigrateResult({ kind: "err", text: r.error ?? r.message ?? "bulk migrate failed" })
+    }
+    setBusy(null)
+  }
+
   async function bulkSoftDelete() {
     if (!confirm(
       `Remove ${selected.size} domain(s) from dashboard ONLY?\n\n` +
@@ -916,6 +944,14 @@ function DomainsPageInner() {
               </Button>
               <Button
                 size="sm" variant="outline"
+                className="gap-1.5 btn-soft-info"
+                onClick={openBulkMigrate} disabled={busy === "bulk"}
+                title="Move selected domains to a different server — old SA app removed, new one created on target, CF A-records flipped, original NS/zone preserved"
+              >
+                <ArrowLeftRight className="h-3.5 w-3.5" /> Migrate to server
+              </Button>
+              <Button
+                size="sm" variant="outline"
                 className="gap-1.5 btn-soft-warning"
                 onClick={bulkCancel} disabled={busy === "bulk"}
                 title="Request graceful cancel on every selected running pipeline"
@@ -1265,6 +1301,38 @@ function DomainsPageInner() {
             placeholder="(leave blank to keep)"
             className="font-mono text-small"
           />
+        </Field>
+      </OperatorDialog>
+
+      {/* === Bulk migrate to server modal === */}
+      <OperatorDialog
+        open={migrateOpen}
+        onOpenChange={(o) => { if (!o) setMigrateOpen(false) }}
+        title={`Migrate ${selected.size} domain(s) to a server`}
+        description="Each selected domain's SA app moves to the chosen target — old app removed, new one created, CF A-records flipped to the new IP. Original CF zone, nameservers, and registrar settings are preserved."
+        submitLabel="Start migration"
+        onSubmit={submitBulkMigrate}
+        resultMessage={migrateResult?.text ?? null}
+        resultKind={migrateResult?.kind ?? null}
+      >
+        <Field>
+          <FieldLabel>Target server</FieldLabel>
+          <Select value={migrateTarget} onValueChange={setMigrateTarget}>
+            <SelectTrigger size="sm" className="h-8 text-small"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__auto__">Auto — lowest-utilization eligible server (excluding source)</SelectItem>
+              <SelectItem value="__new__">Provision new server (fresh DO droplet, 5–15 min)</SelectItem>
+              {eligibleServers.map((s) => (
+                <SelectItem key={s.id} value={s.id}>
+                  {s.name} ({s.ip}) · {s.domains}/{s.capacity}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <FieldDescription>
+            Migration uses the cached site archive at <code className="font-mono">data/site_archives/&lt;domain&gt;.tar.gz</code> —
+            no LLM regeneration; same content reuploads to the new server. Existing Origin CA cert is also reused.
+          </FieldDescription>
         </Field>
       </OperatorDialog>
 

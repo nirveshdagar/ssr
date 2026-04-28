@@ -25,6 +25,8 @@ export async function register() {
   try { registerHandler("server.create", serverCreateHandler) } catch {}
   const { migrateNowHandler } = await import("./lib/handlers/migrate-now")
   try { registerHandler("server.migrate_now", migrateNowHandler) } catch {}
+  const { bulkMigrateHandler } = await import("./lib/handlers/bulk-migrate")
+  try { registerHandler("domain.bulk_migrate", bulkMigrateHandler) } catch {}
   startPool()
   // Boot resilience: grey-cloud recovery + orphan-droplet sweep.
   // Skip in test mode (vitest sets NODE_ENV=test).
