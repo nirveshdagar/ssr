@@ -48,6 +48,8 @@ export interface SettingsValues {
   live_check_interval_s: string
   dead_server_threshold_ticks: string
   max_droplets_per_hour: string
+  sites_per_server: string
+  cf_domains_per_key: string
   // booleans
   auto_migrate_enabled: boolean
   do_use_backup_first: boolean

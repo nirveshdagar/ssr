@@ -297,6 +297,29 @@ export default function SettingsPage() {
                 primary={get("do_api_token") ?? ""}
                 backup={get("do_api_token_backup") ?? ""}
               />
+              <Field>
+                <FieldLabel>
+                  <span className="inline-flex items-center gap-1.5">
+                    Domains per server (default cap)
+                    <span className="rounded bg-status-running/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-status-running">
+                      provisioning trigger
+                    </span>
+                  </span>
+                </FieldLabel>
+                <Input
+                  type="number" min={1} max={500}
+                  value={get("sites_per_server") ?? ""}
+                  onChange={(e) => set("sites_per_server", e.target.value)}
+                  placeholder="60"
+                />
+                <FieldDescription>
+                  Default <code className="font-mono">max_sites</code> stamped on every newly-provisioned
+                  droplet. When all eligible servers reach this cap, the pipeline provisions a fresh one
+                  for the next domain. Per-server overrides remain editable on the Servers page (⋯ →
+                  Edit). Only affects NEW servers added after this change — existing rows keep their
+                  current cap.
+                </FieldDescription>
+              </Field>
             </FieldGroup>
           </SettingsSection>
 
@@ -431,17 +454,42 @@ export default function SettingsPage() {
           {/* ---------------- Cloudflare (link to dedicated page) ---------------- */}
           <SettingsSection
             id="cf" title="Cloudflare API Keys Pool" subtitle="Per-domain DNS zones"
-            description="Each pooled key handles ~20 domains before the pipeline auto-rotates. Full pool management lives on the dedicated /cloudflare page."
+            description="Each pooled key handles N domains before the pipeline auto-rotates to the next active key. Full pool management lives on the dedicated /cloudflare page."
             icon={Globe} tint={SECTIONS[4].tint}
           >
-            <a href="/cloudflare">
-              <Button
-                variant="outline" size="sm" className="gap-1.5 btn-soft-info"
-                title="Open the dedicated Cloudflare page — add/edit keys, change A-records, bulk DNS upsert"
-              >
-                <Globe className="h-3.5 w-3.5" /> Manage CF keys pool
-              </Button>
-            </a>
+            <FieldGroup>
+              <Field>
+                <FieldLabel>
+                  <span className="inline-flex items-center gap-1.5">
+                    Domains per CF key (default cap)
+                    <span className="rounded bg-status-running/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-status-running">
+                      pool rotation
+                    </span>
+                  </span>
+                </FieldLabel>
+                <Input
+                  type="number" min={1} max={1000}
+                  value={get("cf_domains_per_key") ?? ""}
+                  onChange={(e) => set("cf_domains_per_key", e.target.value)}
+                  placeholder="20"
+                />
+                <FieldDescription>
+                  Default <code className="font-mono">max_domains</code> stamped on every CF key added
+                  via Add CF Key on /cloudflare. When a key fills, the pipeline rolls to the next
+                  active key with capacity. Set to <strong>1</strong> if you want every domain on its
+                  own CF account / unique NS pair. Per-key overrides editable from the row's ⋯ menu.
+                  Only affects NEW keys added after this change — existing keys keep their current cap.
+                </FieldDescription>
+              </Field>
+              <a href="/cloudflare">
+                <Button
+                  variant="outline" size="sm" className="gap-1.5 btn-soft-info"
+                  title="Open the dedicated Cloudflare page — add/edit keys, change A-records, bulk DNS upsert"
+                >
+                  <Globe className="h-3.5 w-3.5" /> Manage CF keys pool
+                </Button>
+              </a>
+            </FieldGroup>
           </SettingsSection>
 
           {/* ---------------- Server SSH ---------------- */}
