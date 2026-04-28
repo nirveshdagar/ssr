@@ -21,6 +21,15 @@ import path from "node:path"
 import { existsSync, mkdirSync } from "node:fs"
 import { getSetting } from "./repos/settings"
 import { logPipeline } from "./repos/logs"
+import { getSemaphore } from "./concurrency"
+
+// Cap simultaneous Chromium launches. Each headless browser is ~300 MB;
+// without this cap, 50 fan-out runs hitting the SSL UI fallback would hit
+// ~15 GB. Override with SSR_CHROMIUM_CONCURRENCY (min 1).
+const CHROMIUM_CAP = Math.max(
+  1,
+  Number.parseInt(process.env.SSR_CHROMIUM_CONCURRENCY ?? "", 10) || 4,
+)
 
 const DASHBOARD_URL = "https://app.serveravatar.com"
 
@@ -111,6 +120,19 @@ export async function installCustomSslViaUi(
   // Lazy import — patchright pulls native browser binaries on first use, so
   // only load when the UI path is actually exercised.
   const { chromium } = await import("patchright")
+
+  // Cap simultaneous Chromium launches to bound memory under fan-out.
+  // Acquire BEFORE launch and release in finally so the permit covers the
+  // full browser-alive window, not just the launch call.
+  const sem = getSemaphore("patchright", CHROMIUM_CAP)
+  const stats = sem.stats()
+  if (stats.inFlight >= stats.capacity) {
+    logPipeline(opts.domain, "sa_ui_ssl", "running",
+      `Chromium semaphore full (${stats.inFlight}/${stats.capacity}); ` +
+      `queued behind ${stats.waiting} other UI run(s)`)
+  }
+  const releaseSem = await sem.acquire()
+  try {
 
   const snap = async (page: { screenshot: (o: { path: string; fullPage: boolean }) => Promise<unknown> }, tag: string): Promise<string | null> => {
     if (!screenshotOnFail) return null
@@ -330,6 +352,10 @@ export async function installCustomSslViaUi(
     return { ok: true, message: "Installed via SA UI" }
   } finally {
     try { await browser.close() } catch { /* ignore */ }
+  }
+
+  } finally {
+    releaseSem()
   }
 }
 

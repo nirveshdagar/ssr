@@ -24,6 +24,17 @@ export const VALID_DNS_RECORD_TYPES = ["A", "AAAA", "CNAME", "TXT"] as const
 export type DnsRecordType = (typeof VALID_DNS_RECORD_TYPES)[number]
 
 import { one } from "./db"
+import { withSemaphore } from "./concurrency"
+
+// Cap concurrent CF API calls PER KEY (keyed on cf_email). With 50 fan-out
+// pipelines spread across 10 keys, each key sees ~5 simultaneous calls;
+// this semaphore enforces that bound so step-7's DNS-setup burst can't
+// trip the per-account rate limiter even if the load skews to one key.
+// Override with SSR_CF_CONCURRENCY (min 1).
+const CF_CAP_PER_KEY = Math.max(
+  1,
+  Number.parseInt(process.env.SSR_CF_CONCURRENCY ?? "", 10) || 5,
+)
 
 interface DomainCreds {
   cf_email: string
@@ -64,32 +75,38 @@ async function cfRequest<T>(
   body?: unknown,
   retries = 3,
 ): Promise<T> {
-  let lastErr: unknown
-  for (let attempt = 0; attempt < retries; attempt++) {
-    try {
-      const res = await fetch(url, {
-        method,
-        headers: authHeaders(creds, body !== undefined),
-        body: body !== undefined ? JSON.stringify(body) : undefined,
-      })
-      if (res.status === 429 || res.status >= 500) {
-        // Retry on rate-limit / 5xx with linear backoff
+  // Per-key semaphore — each cf_email gets its own queue. Acquire across
+  // the whole retry loop so a 429-backoff retry doesn't release the slot
+  // and let another caller jump the queue ahead of it.
+  const semKey = `cf:${creds.cf_email.toLowerCase()}`
+  return withSemaphore(semKey, CF_CAP_PER_KEY, async () => {
+    let lastErr: unknown
+    for (let attempt = 0; attempt < retries; attempt++) {
+      try {
+        const res = await fetch(url, {
+          method,
+          headers: authHeaders(creds, body !== undefined),
+          body: body !== undefined ? JSON.stringify(body) : undefined,
+        })
+        if (res.status === 429 || res.status >= 500) {
+          // Retry on rate-limit / 5xx with linear backoff
+          await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)))
+          continue
+        }
+        const json = (await res.json()) as CfResponse<T>
+        if (!res.ok || !json.success) {
+          const msg = json.errors?.map((e) => `${e.code}:${e.message}`).join("; ") ?? `HTTP ${res.status}`
+          throw new Error(`CF ${method} ${url}: ${msg}`)
+        }
+        return json.result
+      } catch (e) {
+        lastErr = e
+        if (attempt === retries - 1) throw e
         await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)))
-        continue
       }
-      const json = (await res.json()) as CfResponse<T>
-      if (!res.ok || !json.success) {
-        const msg = json.errors?.map((e) => `${e.code}:${e.message}`).join("; ") ?? `HTTP ${res.status}`
-        throw new Error(`CF ${method} ${url}: ${msg}`)
-      }
-      return json.result
-    } catch (e) {
-      lastErr = e
-      if (attempt === retries - 1) throw e
-      await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)))
     }
-  }
-  throw lastErr
+    throw lastErr as never
+  })
 }
 
 const ZONE_CACHE = new Map<string, string>()
@@ -367,11 +384,17 @@ interface RawCfResponse {
 }
 
 async function rawCfPost(url: string, body: unknown, headers: Record<string, string>): Promise<RawCfResponse> {
-  const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) })
-  const text = await res.text()
-  let json: RawCfResponse["json"] = null
-  try { json = text ? JSON.parse(text) : null } catch { /* keep null */ }
-  return { status: res.status, ok: res.ok, json, text }
+  // Same per-key semaphore as cfRequest — keeps the step-3 zone-creation
+  // burst and the step-8 cert-creation burst within the per-key cap.
+  const email = (headers["X-Auth-Email"] ?? "").toLowerCase()
+  const semKey = email ? `cf:${email}` : "cf:_anon"
+  return withSemaphore(semKey, CF_CAP_PER_KEY, async () => {
+    const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) })
+    const text = await res.text()
+    let json: RawCfResponse["json"] = null
+    try { json = text ? JSON.parse(text) : null } catch { /* keep null */ }
+    return { status: res.status, ok: res.ok, json, text }
+  })
 }
 
 function isAccountError(resp: RawCfResponse): boolean {

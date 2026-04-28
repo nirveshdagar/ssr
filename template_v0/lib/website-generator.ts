@@ -15,6 +15,14 @@
 
 import { getSetting } from "./repos/settings"
 import { logPipeline } from "./repos/logs"
+import { withSemaphore, getSemaphore } from "./concurrency"
+
+// Cap concurrent LLM calls so a 50-fan-out doesn't blow per-account RPM/TPM
+// quotas. Override with SSR_LLM_CONCURRENCY (min 1).
+const LLM_CAP = Math.max(
+  1,
+  Number.parseInt(process.env.SSR_LLM_CONCURRENCY ?? "", 10) || 8,
+)
 
 // ---------------------------------------------------------------------------
 // Provider config
@@ -212,6 +220,21 @@ interface UsageInfo {
 }
 
 export async function generateSinglePage(domain: string): Promise<GeneratedPage> {
+  // Cap concurrent LLM calls. Without this, 50 simultaneous step-9s would
+  // burst Anthropic's per-account TPM quota and Anthropic returns 429s
+  // that look like model "blocked" errors. The semaphore queues callers
+  // FIFO so an in-progress run finishes before the next acquires.
+  const sem = getSemaphore("llm", LLM_CAP)
+  const stats = sem.stats()
+  if (stats.inFlight >= stats.capacity) {
+    logPipeline(domain, "generate_site_v2", "running",
+      `LLM semaphore full (${stats.inFlight}/${stats.capacity}); ` +
+      `queued behind ${stats.waiting} other run(s)`)
+  }
+  return withSemaphore("llm", LLM_CAP, () => _generateSinglePageImpl(domain))
+}
+
+async function _generateSinglePageImpl(domain: string): Promise<GeneratedPage> {
   const { provider, apiKey } = getLlmConfig()
   const blocklist = loadBlocklist()
   const maxTokensRaw = parseInt(getSetting("llm_max_output_tokens") || "3500", 10)
