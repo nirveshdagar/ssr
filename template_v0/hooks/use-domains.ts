@@ -76,7 +76,7 @@ export function useDomains() {
   const { data, error, isLoading, mutate } = useSWR<{ domains: ApiDomain[] }>(
     "/api/domains",
     fetcher,
-    { refreshInterval: 5000 },
+    { refreshInterval: 8000, revalidateOnFocus: false },
   )
   const rows: DomainRow[] = (data?.domains ?? []).map((d) => ({
     id: String(d.id),

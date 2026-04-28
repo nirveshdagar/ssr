@@ -65,6 +65,20 @@ export async function reconcileOrphanServers(
       alreadyOk++
       continue
     }
+    // Hands off 'dead' rows. Status='dead' is set by the live-checker (after
+    // N consecutive HTTPS failures) or by an operator's mark-dead — either
+    // way it's a deliberate signal that this server is being retired.
+    // Reconciling it back to 'ready' would race with auto-migrate (which
+    // may already be in flight) and reverse the live-checker's verdict
+    // based on a transient SA-agent-still-pinging signal. Operator must
+    // explicitly mark-ready to bring a dead server back into rotation.
+    if (row.status === "dead") {
+      stillOrphaned.push({
+        id: row.id, name: row.name, ip: row.ip,
+        reason: "status='dead' — left for live-checker / operator to manage",
+      })
+      continue
+    }
     const dbIp = (row.ip ?? "").trim()
     if (!dbIp) {
       stillOrphaned.push({ id: row.id, name: row.name, ip: row.ip, reason: "no IP on DB row" })
@@ -353,10 +367,18 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
 // Scheduler
 // ---------------------------------------------------------------------------
 
-let tickTimer: NodeJS.Timeout | null = null
+// HMR-safe: the timer handle lives on globalThis so module re-evaluation
+// (Turbopack edit, Next dev reload) doesn't accidentally spin up a second
+// interval alongside the first.
+declare global {
+  // eslint-disable-next-line no-var
+  var __ssrAutoHealTimer: NodeJS.Timeout | null | undefined
+  // eslint-disable-next-line no-var
+  var __ssrAutoHealStartScheduled: boolean | undefined
+}
 
 export function startAutoHeal(): void {
-  if (tickTimer) return
+  if (globalThis.__ssrAutoHealTimer || globalThis.__ssrAutoHealStartScheduled) return
   if (process.env.NODE_ENV === "test") return
   if (process.env.SSR_AUTOHEAL === "0") return
 
@@ -366,6 +388,7 @@ export function startAutoHeal(): void {
     Number.parseInt(process.env.SSR_AUTOHEAL_INTERVAL_MS ?? "", 10) || 300_000,
   )
 
+  globalThis.__ssrAutoHealStartScheduled = true
   // First tick 60s after boot so init + first request settles before we
   // hit external APIs.
   setTimeout(() => {
@@ -373,21 +396,23 @@ export function startAutoHeal(): void {
       logPipeline("(auto-heal)", "auto_heal", "warning",
         `tick threw: ${(e as Error).message}`)
     })
-    tickTimer = setInterval(() => {
+    const timer = setInterval(() => {
       void autoHealTickOnce().catch((e) => {
         logPipeline("(auto-heal)", "auto_heal", "warning",
           `tick threw: ${(e as Error).message}`)
       })
     }, intervalMs)
-    tickTimer.unref?.()
+    timer.unref?.()
+    globalThis.__ssrAutoHealTimer = timer
   }, 60_000).unref?.()
 }
 
 export function stopAutoHeal(): void {
-  if (tickTimer) {
-    clearInterval(tickTimer)
-    tickTimer = null
+  if (globalThis.__ssrAutoHealTimer) {
+    clearInterval(globalThis.__ssrAutoHealTimer)
+    globalThis.__ssrAutoHealTimer = null
   }
+  globalThis.__ssrAutoHealStartScheduled = false
 }
 
 // Exported for tests

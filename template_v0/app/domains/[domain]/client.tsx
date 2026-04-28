@@ -66,10 +66,15 @@ const STATUS_TO_PIPELINE: Record<string, PipelineStatus> = {
 }
 
 export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, initialLogs }: Props) {
+  // Pipeline done? Skip the live polling — the page is showing a complete
+  // pill, the server isn't writing heartbeats, and there's no progress to
+  // chase. Saves ~6 req/min per open detail tab on a 2-CPU box.
+  const pipelineActive = !["live", "completed", "hosted", "canceled",
+    "terminal_error", "content_blocked", "cf_pool_full"].includes(row.status)
   // Live SWR — falls back to the SSR-rendered initial data so first paint
   // is instant and the page hydrates with fresher data after a tick.
-  const { steps: liveSteps } = useDomainWatcher(domain)
-  const { heartbeat } = useHeartbeat(domain)
+  const { steps: liveSteps } = useDomainWatcher(pipelineActive ? domain : null, 1500)
+  const { heartbeat } = useHeartbeat(pipelineActive ? domain : null, 1500)
   const { events: liveLogs } = useLogs({ domain, limit: 50 })
 
   const steps = liveSteps ?? initialSteps

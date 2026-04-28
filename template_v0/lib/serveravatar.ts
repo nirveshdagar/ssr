@@ -17,7 +17,11 @@
  * Node uses; UI is the middle path that Flask still owns.
  */
 
-import { Client as SshClient, type ConnectConfig, type ClientChannel, type SFTPWrapper } from "ssh2"
+// ssh2 is type-only at module scope so it stays out of the instrumentation
+// bundle; Turbopack mangles the runtime require otherwise (see the
+// `ssh2-df016e52d1a2696f` cannot-find-module crash). The Client constructor
+// is loaded lazily inside SshSession.connect().
+import type { Client as SshClient, ConnectConfig, ClientChannel, SFTPWrapper } from "ssh2"
 import { one } from "./db"
 import { getSetting } from "./repos/settings"
 import { logPipeline } from "./repos/logs"
@@ -40,6 +44,94 @@ function loadCreds(): SaCreds {
   if (!tok) throw new Error("ServerAvatar API key not configured. Go to Settings.")
   if (!org) throw new Error("ServerAvatar Organization ID not configured. Go to Settings.")
   return { token: tok.trim(), orgId: org.trim() }
+}
+
+// ---------------------------------------------------------------------------
+// SA backup-token failover — mirrors lib/digitalocean.ts's pattern. Tries
+// primary first, falls over to backup on auth/rate-limit/5xx so a blocked
+// or rate-limited SA account doesn't stall a mid-flight migration.
+// ---------------------------------------------------------------------------
+
+const SA_FAILOVER_STATUSES = new Set([401, 403, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524])
+
+interface SaCandidate { label: string; token: string; orgId: string }
+
+function saCandidates(): SaCandidate[] {
+  const primaryTok = (getSetting("serveravatar_api_key") || "").trim()
+  const primaryOrg = (getSetting("serveravatar_org_id") || "").trim()
+  const backupTok = (getSetting("serveravatar_api_key_backup") || "").trim()
+  const backupOrg = (getSetting("serveravatar_org_id_backup") || "").trim() || primaryOrg
+  const out: SaCandidate[] = []
+  if (primaryTok && primaryOrg) out.push({ label: "primary", token: primaryTok, orgId: primaryOrg })
+  if (backupTok && backupOrg)   out.push({ label: "backup",  token: backupTok,  orgId: backupOrg })
+  return out
+}
+
+export class SAAllTokensFailed extends Error {
+  attempts: [string, string][]
+  constructor(attempts: [string, string][]) {
+    super(`All SA tokens failed — ${attempts.map(([l, e]) => `${l}: ${e}`).join("; ")}`)
+    this.name = "SAAllTokensFailed"
+    this.attempts = attempts
+  }
+}
+
+interface SaRequestOpts {
+  method?: string
+  json?: boolean         // body is JSON (sets Content-Type)
+  body?: BodyInit | null
+  timeoutMs?: number
+}
+
+/**
+ * Issue an SA REST request with primary→backup token failover. Path is
+ * relative to SA_API; `{ORG_ID}` placeholder gets substituted with the
+ * candidate's org id (so backup keys belonging to a different org work).
+ *
+ * Returns `{ res, orgId }` so callers that record which org owned the
+ * resource (e.g. createServer writes sa_org_id into the DB) can use the
+ * actually-succeeding candidate, not just the configured primary.
+ */
+export async function saRequest(
+  pathTemplate: string,
+  opts: SaRequestOpts = {},
+): Promise<{ res: Response; orgId: string; label: string }> {
+  const cands = saCandidates()
+  if (cands.length === 0) {
+    throw new Error("ServerAvatar API key + org id not configured. Go to Settings.")
+  }
+  const method = opts.method ?? "GET"
+  const timeoutMs = opts.timeoutMs ?? 30_000
+  const attempts: [string, string][] = []
+  for (const c of cands) {
+    const url = `${SA_API}${pathTemplate.replaceAll("{ORG_ID}", c.orgId)}`
+    const headers: Record<string, string> = {
+      Authorization: c.token,
+      Accept: "application/json",
+    }
+    if (opts.json) headers["Content-Type"] = "application/json"
+    let res: Response
+    try {
+      res = await fetch(url, {
+        method,
+        headers,
+        body: opts.body ?? undefined,
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+    } catch (e) {
+      attempts.push([c.label, `${(e as Error).name}: ${(e as Error).message}`])
+      continue
+    }
+    if (res.ok) return { res, orgId: c.orgId, label: c.label }
+    if (SA_FAILOVER_STATUSES.has(res.status)) {
+      const body = (await res.text()).slice(0, 200).replace(/\n/g, " ")
+      attempts.push([c.label, `HTTP ${res.status} — ${body}`])
+      continue
+    }
+    // Real (non-failover) HTTP error — surface to caller without retrying
+    return { res, orgId: c.orgId, label: c.label }
+  }
+  throw new SAAllTokensFailed(attempts)
 }
 
 function jsonHeaders(creds = loadCreds()): Record<string, string> {
@@ -96,9 +188,10 @@ export class SshSession {
     this.conn = conn
   }
 
-  static connect(opts: ConnectConfig & { host: string }): Promise<SshSession> {
+  static async connect(opts: ConnectConfig & { host: string }): Promise<SshSession> {
+    const { Client } = await import("ssh2")
     return new Promise((resolve, reject) => {
-      const c = new SshClient()
+      const c = new Client()
       let settled = false
       const onReady = () => {
         if (settled) return
@@ -264,20 +357,14 @@ export interface SaServer {
 }
 
 export async function listServers(): Promise<SaServer[]> {
-  const creds = loadCreds()
-  const res = await fetch(`${SA_API}/organizations/${creds.orgId}/servers?pagination=0`, {
-    headers: getHeaders(creds),
-  })
+  const { res } = await saRequest("/organizations/{ORG_ID}/servers?pagination=0")
   if (!res.ok) throw new Error(`SA list_servers HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`)
   const body = (await res.json()) as { servers?: SaServer[]; data?: SaServer[] }
   return body.servers ?? body.data ?? []
 }
 
 export async function getServerInfo(saServerId: string): Promise<SaServer> {
-  const creds = loadCreds()
-  const res = await fetch(`${SA_API}/organizations/${creds.orgId}/servers/${saServerId}`, {
-    headers: getHeaders(creds),
-  })
+  const { res } = await saRequest(`/organizations/{ORG_ID}/servers/${saServerId}`)
   if (!res.ok) throw new Error(`SA get_server HTTP ${res.status}`)
   const body = (await res.json()) as { server?: SaServer } & SaServer
   return body.server ?? body
@@ -287,10 +374,8 @@ export async function getServerInfo(saServerId: string): Promise<SaServer> {
  * servers that were manually deleted from the SA dashboard. */
 export async function isSaServerAlive(saServerId: string): Promise<boolean> {
   try {
-    const creds = loadCreds()
-    const res = await fetch(`${SA_API}/organizations/${creds.orgId}/servers/${saServerId}`, {
-      headers: getHeaders(creds),
-      signal: AbortSignal.timeout(10_000),
+    const { res } = await saRequest(`/organizations/{ORG_ID}/servers/${saServerId}`, {
+      timeoutMs: 10_000,
     })
     return res.status === 200
   } catch {
@@ -314,7 +399,6 @@ export async function createServer(opts: {
   const size = opts.size ?? "s-2vcpu-4gb"
   logPipeline(serverName, "sa_create", "running", `Creating server via ServerAvatar...`)
   try {
-    const creds = loadCreds()
     const providerId = parseInt(getSetting("sa_cloud_provider_id") || "0", 10) || 0
     const payload = {
       name: serverName,
@@ -328,10 +412,8 @@ export async function createServer(opts: {
       database_type: "mysql",
       nodejs: false,
     }
-    const res = await fetch(`${SA_API}/organizations/${creds.orgId}/servers`, {
-      method: "POST",
-      headers: jsonHeaders(creds),
-      body: JSON.stringify(payload),
+    const { res, orgId, label } = await saRequest("/organizations/{ORG_ID}/servers", {
+      method: "POST", json: true, body: JSON.stringify(payload),
     })
     if (!res.ok) {
       const body = await safeJson(res)
@@ -343,10 +425,13 @@ export async function createServer(opts: {
     const server = data.server ?? data
     const saServerId = String(server.id ?? "")
     const ip = String(server.ip ?? "")
-    updateServer(serverIdDb, { sa_server_id: saServerId, sa_org_id: creds.orgId })
+    // Record the org id of whichever candidate succeeded — failover may
+    // have placed this server on the backup org, and subsequent SA calls
+    // about it must use the matching org for its URLs.
+    updateServer(serverIdDb, { sa_server_id: saServerId, sa_org_id: orgId })
     if (ip) updateServer(serverIdDb, { ip })
     logPipeline(serverName, "sa_create", "completed",
-      `Server created (SA ID: ${saServerId}, IP: ${ip})`)
+      `Server created via ${label} token (SA ID: ${saServerId}, IP: ${ip}, org: ${orgId})`)
     return { saServerId, ip }
   } catch (e) {
     if (!(e instanceof Error)) throw new Error(String(e))
@@ -387,13 +472,11 @@ interface SaPaginated<T> {
 
 /** Paginate transparently and return ALL applications across pages. */
 export async function listApplications(saServerId: string): Promise<SaApp[]> {
-  const creds = loadCreds()
   const all: SaApp[] = []
   let page = 1
   while (true) {
-    const res = await fetch(
-      `${SA_API}/organizations/${creds.orgId}/servers/${saServerId}/applications?page=${page}`,
-      { headers: getHeaders(creds) },
+    const { res } = await saRequest(
+      `/organizations/{ORG_ID}/servers/${saServerId}/applications?page=${page}`,
     )
     if (!res.ok) {
       throw new Error(`SA list_applications HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`)
@@ -431,10 +514,9 @@ export async function findAppId(saServerId: string, domain: string): Promise<str
 
 async function getSystemUserId(saServerId: string): Promise<string | number | null> {
   try {
-    const creds = loadCreds()
-    const res = await fetch(
-      `${SA_API}/organizations/${creds.orgId}/servers/${saServerId}/system-users`,
-      { headers: getHeaders(creds), signal: AbortSignal.timeout(15_000) },
+    const { res } = await saRequest(
+      `/organizations/{ORG_ID}/servers/${saServerId}/system-users`,
+      { timeoutMs: 15_000 },
     )
     if (!res.ok) return null
     const data = (await res.json()) as { systemUsers?: { id: number | string }[]; data?: { id: number | string }[] }
@@ -448,7 +530,6 @@ async function getSystemUserId(saServerId: string): Promise<string | number | nu
 /** Create an SA application backed by a system user (existing or new). */
 export async function createApplication(saServerId: string, domain: string): Promise<string> {
   logPipeline(domain, "sa_create_app", "running", `Creating app for ${domain}`)
-  const creds = loadCreds()
   const appName = appNameFor(domain)
   const sysUsername = sysUserFor(domain)
 
@@ -473,9 +554,9 @@ export async function createApplication(saServerId: string, domain: string): Pro
     }
   }
 
-  const res = await fetch(
-    `${SA_API}/organizations/${creds.orgId}/servers/${saServerId}/applications`,
-    { method: "POST", headers: jsonHeaders(creds), body: JSON.stringify(payload) },
+  const { res } = await saRequest(
+    `/organizations/{ORG_ID}/servers/${saServerId}/applications`,
+    { method: "POST", json: true, body: JSON.stringify(payload) },
   )
   if (!res.ok) {
     const body = await safeJson(res)
@@ -501,10 +582,9 @@ export async function deleteApplication(
       logPipeline(domain, "sa_delete_app", "warning", "App not found on SA server")
       return { ok: false, message: "App not found" }
     }
-    const creds = loadCreds()
-    const res = await fetch(
-      `${SA_API}/organizations/${creds.orgId}/servers/${saServerId}/applications/${appId}`,
-      { method: "DELETE", headers: getHeaders(creds) },
+    const { res } = await saRequest(
+      `/organizations/{ORG_ID}/servers/${saServerId}/applications/${appId}`,
+      { method: "DELETE" },
     )
     if (!res.ok) {
       const body = await safeJson(res)
@@ -535,7 +615,6 @@ async function generateInstallCommand(opts: {
   databaseType?: string
   nodejs?: boolean
 }): Promise<string> {
-  const creds = loadCreds()
   const webServer = opts.webServer ?? getSetting("sa_install_webserver") ?? "apache2"
   const databaseType = opts.databaseType ?? getSetting("sa_install_database") ?? "mysql"
   const payload = {
@@ -545,9 +624,9 @@ async function generateInstallCommand(opts: {
     nodejs: opts.nodejs ? 1 : 0,
     root_password_available: false,
   }
-  const res = await fetch(
-    `${SA_API}/organizations/${creds.orgId}/direct-installation/generate-command`,
-    { method: "POST", headers: jsonHeaders(creds), body: JSON.stringify(payload) },
+  const { res } = await saRequest(
+    "/organizations/{ORG_ID}/direct-installation/generate-command",
+    { method: "POST", json: true, body: JSON.stringify(payload) },
   )
   if (!res.ok) {
     const body = await safeJson(res)
@@ -723,23 +802,30 @@ interface InstallSslOpts {
  * ported here — only API → SSH.
  */
 export async function installCustomSsl(opts: InstallSslOpts): Promise<{ ok: boolean; message: string }> {
-  const creds = loadCreds()
-  const base =
-    `${SA_API}/organizations/${creds.orgId}/servers/${opts.saServerId}` +
+  // SSL API path template — saRequest substitutes {ORG_ID} per candidate.
+  // NOTE on failover semantics: an SA application belongs to one specific
+  // org, so a primary-blocked install can't truly succeed via backup unless
+  // the backup org happens to also own this app (rare). Still, going
+  // through saRequest gives us automatic 429/5xx retry on the SAME org —
+  // which is the more common rescue case anyway.
+  const sslPath =
+    `/organizations/{ORG_ID}/servers/${opts.saServerId}` +
     `/applications/${opts.appId}/ssl`
-  const hdr = jsonHeaders(creds)
 
-  const apiResult = await tryApiSslFlow(base, hdr, opts)
+  const apiResult = await tryApiSslFlow(sslPath, opts)
   if (apiResult.ok) return apiResult
 
   // UI fallback (patchright + iproyal proxy if configured) — drives SA's
   // dashboard like a human. Heavy: only loaded when API has actually failed.
+  // For UI fallback we need a concrete org id — use the primary's since
+  // that's whichever org originally created the resource.
+  const primaryOrg = (getSetting("serveravatar_org_id") || "").trim()
   let uiMsg = ""
-  if (opts.domain) {
+  if (opts.domain && primaryOrg) {
     try {
       const { installCustomSslViaUi } = await import("./serveravatar-ui")
       const ui = await installCustomSslViaUi({
-        orgId: creds.orgId,
+        orgId: primaryOrg,
         serverId: opts.saServerId,
         appId: opts.appId,
         domain: opts.domain,
@@ -787,15 +873,13 @@ export async function installCustomSsl(opts: InstallSslOpts): Promise<{ ok: bool
 }
 
 async function tryApiSslFlow(
-  base: string,
-  hdr: Record<string, string>,
+  sslPath: string,
   opts: InstallSslOpts,
 ): Promise<{ ok: boolean; message: string }> {
   try {
     // 1. Install automatic (Let's Encrypt) — primes the tracker
-    let r = await fetch(base, {
-      method: "POST",
-      headers: hdr,
+    let { res: r } = await saRequest(sslPath, {
+      method: "POST", json: true,
       body: JSON.stringify({ ssl_type: "automatic", force_https: false }),
     })
     if (!r.ok) {
@@ -804,7 +888,7 @@ async function tryApiSslFlow(
     await new Promise((res) => setTimeout(res, 3000))
 
     // 2. Destroy — clears Let's Encrypt cert
-    r = await fetch(`${base}/destroy`, { method: "POST", headers: hdr })
+    ;({ res: r } = await saRequest(`${sslPath}/destroy`, { method: "POST" }))
     if (![200, 204, 404].includes(r.status)) {
       return { ok: false, message: `destroy failed (HTTP ${r.status}): ${(await r.text()).slice(0, 200)}` }
     }
@@ -818,7 +902,9 @@ async function tryApiSslFlow(
       chain_file: opts.chainPem ? opts.chainPem.trim() + "\n" : "",
       force_https: opts.forceHttps !== false,
     }
-    r = await fetch(base, { method: "POST", headers: hdr, body: JSON.stringify(customBody) })
+    ;({ res: r } = await saRequest(sslPath, {
+      method: "POST", json: true, body: JSON.stringify(customBody),
+    }))
     if (!r.ok) {
       const body = await safeJson(r)
       return { ok: false, message: `custom-install refused (HTTP ${r.status}): ${saErrorMessage(body, "")}` }
@@ -827,7 +913,7 @@ async function tryApiSslFlow(
     // 4. Verify tracker
     let trackerOk: boolean | null = null
     try {
-      const gr = await fetch(base, { headers: hdr, signal: AbortSignal.timeout(15_000) })
+      const { res: gr } = await saRequest(sslPath, { timeoutMs: 15_000 })
       if (gr.ok) {
         const body = (await gr.json()) as { installed?: boolean }
         trackerOk = Boolean(body.installed)
@@ -906,26 +992,33 @@ export async function sshInstallSslFiles(
  * Write index.php and remove the default 15KB SA welcome index.html. Tries
  * the SA File Manager API for both, falling back to SSH for the delete (and
  * a full SFTP upload for the write if the API is broken).
+ *
+ * `serverIp` is REQUIRED in practice for the SSH fallback path. Migration
+ * callers must pass the NEW server's IP — falling back to a DB lookup
+ * (`lookupServerIp(domain)`) returns the OLD server's IP because
+ * `domains.server_id` hasn't been flipped yet at this point in the
+ * migration. Without an explicit IP here, the SSH delete targets the dead
+ * source droplet, times out, and the "overwrite-with-PHP" last-resort
+ * leaves a 1KB index.html on the new server containing PHP source.
  */
 export async function uploadIndexPhp(
   saServerId: string,
   domain: string,
   phpContent: string,
+  serverIp?: string,
 ): Promise<boolean> {
   logPipeline(domain, "upload_index_php", "running",
     "Writing index.php and deleting default index.html in /public_html/")
   try {
     const appId = await findAppId(saServerId, domain)
     if (!appId) throw new Error(`App not found on SA server ${saServerId}`)
-    const creds = loadCreds()
-    const base =
-      `${SA_API}/organizations/${creds.orgId}/servers/${saServerId}` +
+    const basePath =
+      `/organizations/{ORG_ID}/servers/${saServerId}` +
       `/applications/${appId}/file-managers`
-    const hdr = jsonHeaders(creds)
 
     // 1. Create + write index.php
-    const createRes = await fetch(`${base}/file/create`, {
-      method: "PATCH", headers: hdr,
+    const { res: createRes } = await saRequest(`${basePath}/file/create`, {
+      method: "PATCH", json: true,
       body: JSON.stringify({ type: "file", name: "index.php", path: "/public_html/" }),
     })
     if (createRes.status === 500) {
@@ -935,8 +1028,8 @@ export async function uploadIndexPhp(
         throw new Error(`index.php create HTTP 500: ${msg}`)
       }
     }
-    const writeRes = await fetch(`${base}/file`, {
-      method: "PATCH", headers: hdr,
+    const { res: writeRes } = await saRequest(`${basePath}/file`, {
+      method: "PATCH", json: true,
       body: JSON.stringify({ filename: "index.php", path: "/public_html/", body: phpContent }),
     })
     if (!writeRes.ok) {
@@ -945,32 +1038,34 @@ export async function uploadIndexPhp(
 
     // 2. Delete index.html via API (try several verb patterns)
     let deletedViaApi = false
-    const deleteTargets: { method: string; url: string }[] = [
-      { method: "DELETE", url: `${base}/file` },
-      { method: "PATCH", url: `${base}/file/delete` },
-      { method: "POST", url: `${base}/file/delete` },
+    const deleteTargets: { method: string; pathSuffix: string }[] = [
+      { method: "DELETE", pathSuffix: "/file" },
+      { method: "PATCH",  pathSuffix: "/file/delete" },
+      { method: "POST",   pathSuffix: "/file/delete" },
     ]
     for (const t of deleteTargets) {
       try {
-        const r = await fetch(t.url, {
-          method: t.method, headers: hdr,
+        const { res: r } = await saRequest(`${basePath}${t.pathSuffix}`, {
+          method: t.method, json: true,
           body: JSON.stringify({ filename: "index.html", path: "/public_html/" }),
         })
         if (r.ok) { deletedViaApi = true; break }
       } catch { /* try next */ }
     }
 
-    // 3. SSH fallback for deletion
+    // 3. SSH fallback for deletion. Caller passes the NEW server's IP
+    // explicitly — falling back to a domains.server_id lookup would target
+    // the OLD (dead) server during migration.
     if (!deletedViaApi) {
       try {
-        await deleteIndexHtmlViaSsh(domain)
+        await deleteIndexHtmlViaSsh(domain, serverIp)
         logPipeline(domain, "upload_index_php", "running",
           "index.html removed via SSH fallback (SA API delete unsupported)")
       } catch (sshErr) {
         logPipeline(domain, "upload_index_php", "warning",
           `Could not delete index.html (SA API + SSH both failed: ${(sshErr as Error).message}) ` +
           `— overwriting with PHP content as last resort`)
-        await overwriteIndexHtmlViaApi(base, hdr, phpContent)
+        await overwriteIndexHtmlViaApi(basePath, phpContent)
       }
     }
 
@@ -980,16 +1075,16 @@ export async function uploadIndexPhp(
   } catch (e) {
     logPipeline(domain, "upload_index_php", "warning",
       `SA API path failed (${(e as Error).message}); falling back to full SFTP upload`)
-    return uploadIndexPhpViaSftp(domain, phpContent)
+    return uploadIndexPhpViaSftp(domain, phpContent, serverIp)
   }
 }
 
 async function overwriteIndexHtmlViaApi(
-  base: string, hdr: Record<string, string>, phpContent: string,
+  basePath: string, phpContent: string,
 ): Promise<void> {
   try {
-    await fetch(`${base}/file`, {
-      method: "PATCH", headers: hdr,
+    await saRequest(`${basePath}/file`, {
+      method: "PATCH", json: true,
       body: JSON.stringify({ filename: "index.html", path: "/public_html/", body: phpContent }),
     })
   } catch { /* best-effort */ }
@@ -1093,14 +1188,12 @@ export async function uploadSiteViaApi(
   try {
     const appId = await findAppId(saServerId, domain)
     if (!appId) throw new Error(`App not found on SA server ${saServerId}`)
-    const creds = loadCreds()
-    const base =
-      `${SA_API}/organizations/${creds.orgId}/servers/${saServerId}` +
+    const basePath =
+      `/organizations/{ORG_ID}/servers/${saServerId}` +
       `/applications/${appId}/file-managers`
-    const hdr = jsonHeaders(creds)
 
-    const createRes = await fetch(`${base}/file/create`, {
-      method: "PATCH", headers: hdr,
+    const { res: createRes } = await saRequest(`${basePath}/file/create`, {
+      method: "PATCH", json: true,
       body: JSON.stringify({ type: "file", name: "index.html", path: "/" }),
     })
     if (createRes.status === 500) {
@@ -1109,8 +1202,8 @@ export async function uploadSiteViaApi(
         throw new Error(`index.html create HTTP 500`)
       }
     }
-    const writeRes = await fetch(`${base}/file`, {
-      method: "PATCH", headers: hdr,
+    const { res: writeRes } = await saRequest(`${basePath}/file`, {
+      method: "PATCH", json: true,
       body: JSON.stringify({ filename: "index.html", path: "/", body: htmlContent }),
     })
     if (!writeRes.ok) throw new Error(`index.html write HTTP ${writeRes.status}`)

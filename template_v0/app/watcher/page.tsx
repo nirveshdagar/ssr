@@ -75,8 +75,11 @@ export default function WatcherPage() {
   // Pull the full watcher snapshot so we can scan EVERY domain's steps for
   // ACTION REQUIRED markers (Flask templates/watcher.html line 84-91 — the
   // banner needs to fire even if the operator is looking at a different
-  // domain in the sidebar).
-  const { watcher: globalWatcher } = useWatcher(2000)
+  // domain in the sidebar). Poll fast (2s) only while runs are active; back
+  // off to 8s on an idle dashboard so a 2-CPU box doesn't burn cycles
+  // re-fetching identical empty payloads.
+  const watcherPollMs = RUNS.length > 0 ? 2000 : 8000
+  const { watcher: globalWatcher } = useWatcher(watcherPollMs)
   const actionRequiredStep = (liveSteps ?? []).find(
     (s) => s.message && /ACTION\s*REQUIRED/i.test(s.message),
   )

@@ -34,12 +34,20 @@ export interface JobRow {
   updated_at: number
 }
 
-const handlers = new Map<string, JobHandler>()
 const POLL_INTERVAL_MS = 2000
 
-let poolStop = false
-const poolThreads: Promise<void>[] = []
-let poolStarted = false
+// HMR-safe state. Next dev / Turbopack re-evaluates this module on edits;
+// keeping these on globalThis means each re-eval reuses the existing pool
+// instead of spawning a fresh set of workers while the old loops keep
+// polling. Fixes the multi-pool leak that compounded the CPU spike.
+declare global {
+  // eslint-disable-next-line no-var
+  var __ssrJobPool: { started: boolean; stop: boolean; threads: Promise<void>[] } | undefined
+  // eslint-disable-next-line no-var
+  var __ssrJobHandlers: Map<string, JobHandler> | undefined
+}
+const pool = (globalThis.__ssrJobPool ??= { started: false, stop: false, threads: [] })
+const handlers = (globalThis.__ssrJobHandlers ??= new Map<string, JobHandler>())
 
 const WORKER_ID_BASE = `node-pid-${process.pid}`
 
@@ -52,9 +60,10 @@ function defaultWorkers(): number {
 }
 
 export function registerHandler(kind: string, fn: JobHandler): void {
-  if (handlers.has(kind)) {
-    throw new Error(`handler for ${JSON.stringify(kind)} already registered (Node side)`)
-  }
+  // Idempotent re-register: HMR re-runs instrumentation, which re-imports
+  // pipeline/cf-bulk/etc. and calls registerHandler again. Throwing here
+  // would spam errors on every dev edit; replacing the entry is fine since
+  // the new function is the latest source.
   handlers.set(kind, fn)
 }
 
@@ -99,6 +108,26 @@ export function recoverOrphans(): number {
       WHERE status = 'running' AND attempt_count >= max_attempts`,
     now,
   )
+  // Mark pipeline.full orphans whose domain is already at a success status
+  // as 'done' instead of requeueing — otherwise a worker killed AFTER its
+  // pipeline finished but BEFORE finishJob() runs would re-fire the whole
+  // pipeline (step 4 hits Spaceship, step 5 polls CF for 2 min) on a
+  // domain that's already serving. Inline the success-status list rather
+  // than importing from status-taxonomy to avoid a cycle.
+  const skippedDone = run(
+    `UPDATE jobs
+        SET status = 'done',
+            last_error = COALESCE(last_error, '') || ' | orphan recovered: domain already at success',
+            locked_by = NULL, locked_at = NULL, updated_at = ?
+      WHERE status = 'running'
+        AND kind = 'pipeline.full'
+        AND EXISTS (
+          SELECT 1 FROM domains d
+          WHERE d.domain = json_extract(jobs.payload_json, '$.domain')
+            AND d.status IN ('hosted', 'live', 'completed')
+        )`,
+    now,
+  )
   // Requeue the rest.
   const requeued = run(
     `UPDATE jobs
@@ -106,7 +135,7 @@ export function recoverOrphans(): number {
       WHERE status = 'running'`,
     now,
   )
-  return Number(failed.changes) + Number(requeued.changes)
+  return Number(failed.changes) + Number(skippedDone.changes) + Number(requeued.changes)
 }
 
 function claimOne(workerId: string): JobRow | null {
@@ -180,7 +209,7 @@ async function runOne(job: JobRow): Promise<void> {
 }
 
 async function workerLoop(workerId: string): Promise<void> {
-  while (!poolStop) {
+  while (!pool.stop) {
     let job: JobRow | null = null
     try {
       job = claimOne(workerId)
@@ -202,19 +231,19 @@ function sleep(ms: number): Promise<void> {
 }
 
 export function startPool(numWorkers = defaultWorkers()): void {
-  if (poolStarted) return
-  poolStarted = true
-  poolStop = false
+  if (pool.started) return
+  pool.started = true
+  pool.stop = false
   recoverOrphans()
   for (let i = 0; i < numWorkers; i++) {
     const id = `${WORKER_ID_BASE}-w${i}`
-    poolThreads.push(workerLoop(id))
+    pool.threads.push(workerLoop(id))
   }
 }
 
 export async function stopPool(): Promise<void> {
-  poolStop = true
-  await Promise.all(poolThreads)
-  poolThreads.length = 0
-  poolStarted = false
+  pool.stop = true
+  await Promise.all(pool.threads)
+  pool.threads.length = 0
+  pool.started = false
 }

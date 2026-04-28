@@ -216,6 +216,55 @@ export function runBulkPipeline(
   }
 }
 
+/**
+ * Sequential variant — enqueues a SINGLE `pipeline.bulk` job that walks
+ * the domain list one-by-one in a single worker. Total wall-time is the
+ * sum of per-domain durations, but only one external API burst is in
+ * flight at a time. Use this when you'd rather keep the rate-limit blast
+ * radius small (e.g., a single CF Free key with 5 zones to spend, or
+ * when you want a deterministic order to debug a flaky pipeline).
+ *
+ * Slot lock: acquired for every eligible domain UPFRONT so the caller
+ * gets the same "already running → skipped" feedback as the parallel
+ * path. Slots are released by `pipelineWorker`'s finally as each domain
+ * finishes inside the bulk handler.
+ */
+export function runSequentialBulkPipeline(
+  domains: string[],
+  opts: {
+    skipPurchase?: boolean
+    serverId?: number | null
+    forceNewServer?: boolean
+  } = {},
+): BulkRunResult {
+  const eligible: string[] = []
+  let skipped = 0
+  for (const d of domains) {
+    if (tryAcquireSlot(d)) {
+      eligible.push(d)
+    } else {
+      logPipeline(d, "pipeline", "warning",
+        "Bulk skip — another pipeline already running for this domain")
+      skipped++
+    }
+  }
+  if (eligible.length === 0) {
+    return { job_ids: [], job_id: null, enqueued: 0, skipped }
+  }
+  const jobId = enqueueJob("pipeline.bulk", {
+    domains: eligible,
+    skip_purchase: opts.skipPurchase ?? false,
+    server_id: opts.serverId ?? null,
+    force_new_server: opts.forceNewServer ?? false,
+  })
+  return {
+    job_ids: [jobId],
+    job_id: jobId,
+    enqueued: eligible.length,
+    skipped,
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Job handlers
 // ---------------------------------------------------------------------------
@@ -295,6 +344,20 @@ async function pipelineWorkerImpl(
   forceNewServer: boolean,
 ): Promise<void> {
   try {
+    // Refuse to redo work on a domain that's already at a success status
+    // (hosted/live) unless the operator explicitly asked for a re-run via
+    // start_from. Prevents stale jobs / orphan-recovery / accidental dupes
+    // from re-running step 4 (Spaceship NS) and step 5 (CF zone poll, up
+    // to 2 min) on a domain that's already serving.
+    if (startFrom == null) {
+      const existing = getDomain(domain)
+      if (existing && isSuccessStatus(existing.status)) {
+        logPipeline(domain, "pipeline", "skipped",
+          `Pipeline ignored — domain already at success status='${existing.status}'. ` +
+          `Pass start_from=N explicitly to force a re-run.`)
+        return
+      }
+    }
     addDomain(domain)
     initSteps(domain)
     logPipeline(domain, "pipeline", "running", "Pipeline v2 started")
@@ -856,7 +919,7 @@ async function step10UploadIndexPhp(
 ): Promise<boolean> {
   updateStep(domain, 10, "running", `Writing index.php to ${server.name}...`)
   try {
-    await uploadIndexPhp(server.sa_server_id!, domain, php)
+    await uploadIndexPhp(server.sa_server_id!, domain, php, server.ip ?? undefined)
 
     // Archive the generated content locally so dead-server migration can
     // re-upload it without paying the LLM or waiting on regeneration.

@@ -25,8 +25,8 @@ const fetcher = async (url: string): Promise<StatusResponse> => {
   return r.json()
 }
 
-/** Dashboard polling — every 5s by default. */
-export function useStatus(refreshMs = 5000) {
+/** Dashboard polling — every 8s by default. */
+export function useStatus(refreshMs = 8000) {
   const { data, error, isLoading, mutate } = useSWR<StatusResponse>(
     "/api/status", fetcher,
     { refreshInterval: refreshMs, revalidateOnFocus: false },

@@ -39,7 +39,7 @@ export function useLogs(opts: { domain?: string | null; limit?: number } = {}) {
   const { data, error, isLoading, mutate } = useSWR<{ logs: ApiLog[] }>(
     `/api/logs${qs ? "?" + qs : ""}`,
     fetcher,
-    { refreshInterval: 5000 },
+    { refreshInterval: 8000, revalidateOnFocus: false },
   )
   const events: LogEvent[] = (data?.logs ?? []).map((l) => ({
     id: String(l.id),

@@ -49,7 +49,7 @@ export function useServers() {
   const { data, error, isLoading, mutate } = useSWR<{ servers: ApiServer[] }>(
     "/api/servers",
     fetcher,
-    { refreshInterval: 5000 },
+    { refreshInterval: 8000, revalidateOnFocus: false },
   )
   const rows: ServerRow[] = (data?.servers ?? []).map((s) => ({
     id: String(s.id),

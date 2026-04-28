@@ -67,8 +67,13 @@ describe("pipeline handlers register without conflict", () => {
     expect(() => registerPipelineHandlers()).not.toThrow()
   })
 
-  it("re-registering the same handler throws (matches Flask side)", async () => {
+  it("re-registering the same handler is idempotent (HMR-safe)", async () => {
+    // We intentionally moved off "throw on dupe" to "replace silently" so
+    // Next dev mode's HMR — which re-evaluates instrumentation on every
+    // edit — doesn't spam the console with handler-already-registered
+    // errors. The new contract: re-register is a no-op replace.
     const { registerPipelineHandlers } = await import("@/lib/pipeline")
-    expect(() => registerPipelineHandlers()).toThrow(/already registered/)
+    expect(() => registerPipelineHandlers()).not.toThrow()
+    expect(() => registerPipelineHandlers()).not.toThrow()
   })
 })

@@ -117,11 +117,16 @@ async function orphanDropletSweepOnce(): Promise<void> {
 // Public scheduler — fire both with delays, fire-and-forget
 // ---------------------------------------------------------------------------
 
-let booted = false
+// HMR-safe boot guard: dev-mode module re-evaluation would otherwise let
+// these one-shot sweeps fire repeatedly per edit.
+declare global {
+  // eslint-disable-next-line no-var
+  var __ssrBooted: boolean | undefined
+}
 
 export function scheduleBootHooks(): void {
-  if (booted) return
-  booted = true
+  if (globalThis.__ssrBooted) return
+  globalThis.__ssrBooted = true
   // Same delays Flask uses (5s + 8s) so init + connection pool + first
   // settings reads have settled before we hit external APIs.
   setTimeout(() => { void recoverGreyCloudOnce() }, 5000).unref?.()
@@ -132,6 +137,20 @@ export function scheduleBootHooks(): void {
   void import("./auto-heal").then(({ startAutoHeal }) => startAutoHeal()).catch(() => {
     /* boot is best-effort — never wedge the server */
   })
+  // Live-checker — opt-in via SSR_LIVE_CHECKER=1. OFF by default because
+  // Flask runs its own; running both against the same SQLite DB causes
+  // status thrash (both apps' streak counters race to flip the row).
+  // Skip in test mode so vitest doesn't spawn the loop.
+  if (process.env.SSR_LIVE_CHECKER === "1" && process.env.NODE_ENV !== "test") {
+    void import("./live-checker").then(({ start }) => {
+      start()
+      logPipeline("(live-checker)", "live_check", "running",
+        "Live-checker started (SSR_LIVE_CHECKER=1)")
+    }).catch((e) => {
+      logPipeline("(live-checker)", "live_check", "warning",
+        `Live-checker failed to start: ${(e as Error).message}`)
+    })
+  }
 }
 
 // Exported for tests
