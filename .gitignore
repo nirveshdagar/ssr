@@ -28,6 +28,10 @@ Thumbs.db
 *.log
 logs/
 
+# Node — only template_v0/ has a package.json, but stray probe scripts run
+# from the root sometimes pull deps into a root-level node_modules
+node_modules/
+
 # Build / distribution
 DEPLOY.zip
 dist/
