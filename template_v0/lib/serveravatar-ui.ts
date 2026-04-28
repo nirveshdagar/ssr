@@ -166,31 +166,86 @@ export async function installCustomSslViaUi(
         state: "hidden", timeout: 20_000,
       })
     } catch { /* spinner may never render */ }
-    await page.waitForTimeout(2000)
-
-    // 3. If SSL already installed, click Remove + confirm
+    // Wait for one of two terminal page states: existing-SSL summary view
+    // (shows a Remove button + "Successfully Installed" text) OR fresh-app
+    // tabs view (Auto/Custom installation tabs visible). Race them so we
+    // proceed as soon as EITHER renders, rather than guessing a fixed timeout.
     try {
-      const removeBtn = page.getByRole("button", { name: /Remove SSL Certificate/i }).first()
-      if (await removeBtn.isVisible({ timeout: 3000 })) {
-        logPipeline(opts.domain, "sa_ui_ssl", "running", "Removing existing SSL first")
-        await removeBtn.click({ timeout: 5000 })
-        await page.waitForTimeout(2000)
-        try {
-          await page.getByRole("button", { name: /Yes, I'm sure/i }).first().click({ timeout: 5000 })
-        } catch {
-          for (const name of ["Yes", "Confirm", "Remove", "OK"] as const) {
-            try {
-              await page.getByRole("button", { name: new RegExp(name, "i") }).first().click({ timeout: 2000 })
-              break
-            } catch { /* try next */ }
-          }
-        }
-        try {
-          await page.waitForSelector("text=/Custom Installation/i", { timeout: 30_000 })
-        } catch { /* ignore */ }
-        await page.waitForTimeout(3000)
+      await Promise.race([
+        page.waitForSelector("text=/Remove SSL Certificate/i", { timeout: 20_000 }),
+        page.waitForSelector("text=/Successfully Installed/i", { timeout: 20_000 }),
+        page.waitForSelector("text=/Custom Installation/i", { timeout: 20_000 }),
+      ])
+    } catch {
+      await snap(page, "ssl_page_not_loaded")
+      throw new SADashboardError(
+        "SSL page didn't render any expected element within 20s (Remove/Installed/Custom tab)",
+      )
+    }
+    await page.waitForTimeout(1500)
+    await snap(page, "ssl_page_loaded")
+
+    // 3. Detect "SSL already installed" via multiple signals — the page in
+    //    this state shows a SUMMARY view (no tabs) with only a Remove button.
+    //    The Custom Installation tab does NOT exist until the existing cert
+    //    is removed, so removal is mandatory whenever we detect any of these.
+    const removeBtn = page.locator(
+      'button:has-text("Remove SSL Certificate"), [role="button"]:has-text("Remove SSL Certificate")',
+    ).first()
+    const installedText = page.locator(
+      'text=/SSL Certificate is Successfully Installed/i, text=/^SSL Installed$/i',
+    ).first()
+    const removeVisible = await removeBtn.isVisible({ timeout: 1000 }).catch(() => false)
+    const installedVisible = await installedText.isVisible({ timeout: 1000 }).catch(() => false)
+
+    if (removeVisible || installedVisible) {
+      logPipeline(opts.domain, "sa_ui_ssl", "running",
+        `Existing SSL detected (remove_btn=${removeVisible} installed_text=${installedVisible}) — removing first`)
+      try {
+        await removeBtn.scrollIntoViewIfNeeded({ timeout: 3000 })
+      } catch { /* ignore */ }
+      try {
+        await removeBtn.click({ timeout: 8000 })
+      } catch (e) {
+        await snap(page, "remove_click_fail")
+        throw new SADashboardError(`Couldn't click Remove SSL Certificate: ${(e as Error).message}`)
       }
-    } catch { /* no existing SSL — proceed */ }
+      // Confirmation dialog — try the canonical button name first, fall back
+      // through common alternatives. Wait for the dialog to render before
+      // clicking.
+      await page.waitForTimeout(1500)
+      let confirmed = false
+      for (const name of [
+        /Yes, I'?m sure/i, /^Yes$/i, /Confirm/i, /^Remove$/i, /^Delete$/i, /^OK$/i,
+      ]) {
+        try {
+          await page.getByRole("button", { name }).first().click({ timeout: 3000 })
+          confirmed = true
+          break
+        } catch { /* try next */ }
+      }
+      if (!confirmed) {
+        await snap(page, "no_confirm_button")
+        throw new SADashboardError(
+          "Clicked Remove but the confirmation dialog button wasn't found",
+        )
+      }
+      // Wait for the page to flip out of "SSL Installed" state. This is
+      // the contract — once removed, the Custom Installation tab WILL render.
+      try {
+        await Promise.race([
+          page.waitForSelector("text=/Custom Installation/i", { timeout: 45_000 }),
+          page.waitForSelector("text=/Auto Installation/i", { timeout: 45_000 }),
+        ])
+      } catch {
+        await snap(page, "no_tab_after_remove")
+        throw new SADashboardError(
+          "Removal didn't surface the Custom Installation tab within 45s",
+        )
+      }
+      await page.waitForTimeout(2000)
+      await snap(page, "after_remove")
+    }
 
     // 4. Click "Custom Installation" tab
     let clicked = false
