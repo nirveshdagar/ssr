@@ -190,6 +190,51 @@ export async function setNameservers(domain: string, nameservers: string[]): Pro
   }
 }
 
+/**
+ * Switch the domain's nameservers back to Spaceship's basic/default pool.
+ * Used by full-delete teardown so the registrar isn't left pointing at a
+ * Cloudflare zone we're about to delete.
+ *
+ * Returns:
+ *   { ok: true }                — basic NS restored
+ *   { ok: false, notOurs: true} — Spaceship returned 404 (domain isn't on
+ *                                 this Spaceship account; BYO at another
+ *                                 registrar — operator must reset NS by hand)
+ *   { ok: false, error }        — any other failure (network, auth, etc.)
+ */
+export async function restoreDefaultNameservers(
+  domain: string,
+): Promise<{ ok: boolean; notOurs?: boolean; error?: string }> {
+  logPipeline(domain, "restore_nameservers", "running",
+    "Switching domain back to Spaceship's basic NS pool before CF zone delete")
+  try {
+    const res = await fetch(`${API_BASE}/domains/${domain}/nameservers`, {
+      method: "PUT",
+      headers: headers(),
+      body: JSON.stringify({ provider: "basic" }),
+    })
+    if (res.status === 404) {
+      logPipeline(domain, "restore_nameservers", "warning",
+        "Spaceship returned 404 — domain isn't on this account (BYO at another registrar). " +
+        "Operator must reset NS at the original registrar by hand.")
+      return { ok: false, notOurs: true }
+    }
+    if (!res.ok) {
+      const body = await safeJson(res)
+      const msg = extractMessage(body, `HTTP ${res.status}`)
+      logPipeline(domain, "restore_nameservers", "failed", msg)
+      return { ok: false, error: msg }
+    }
+    logPipeline(domain, "restore_nameservers", "completed",
+      "Domain switched to Spaceship basic NS — registrar will resolve cleanly after CF zone delete")
+    return { ok: true }
+  } catch (e) {
+    const msg = (e as Error).message
+    logPipeline(domain, "restore_nameservers", "failed", msg)
+    return { ok: false, error: msg }
+  }
+}
+
 export async function getDomainInfo(domain: string): Promise<unknown> {
   const res = await fetch(`${API_BASE}/domains/${domain}`, { headers: headers() })
   if (!res.ok) throw new Error(`Spaceship get_domain HTTP ${res.status}`)

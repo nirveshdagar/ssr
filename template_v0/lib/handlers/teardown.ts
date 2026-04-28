@@ -4,11 +4,22 @@
  *   1. Acquire the per-domain pipeline slot (one retry after 5s if busy).
  *   2. Heartbeat ticker pulses last_heartbeat_at every 1s during slow API calls.
  *   3. SA delete_application(server, domain)
- *   4. CF delete_zone(domain)
- *   5. Spaceship deleteDomain(domain) — usually 501 (not implemented), warns.
- *   6. Release CF pool slot (cf_keys.domains_used--)
- *   7. Delete on-disk archive
- *   8. DELETE the domain row
+ *      — removes the application directory on the droplet (incl. /public_html
+ *        with the generated index.php). Server itself is NOT destroyed since
+ *        other domains may still be hosted on it.
+ *   4. Spaceship restoreDefaultNameservers(domain)
+ *      — flips the registrar back to Spaceship's basic NS pool BEFORE the
+ *        CF zone goes away, so the domain doesn't sit pointing at a dead
+ *        nameserver. Skipped (with a warning to the operator) if Spaceship
+ *        returns 404 — that means the domain is BYO at a different registrar
+ *        and the NS reset has to be done by hand there.
+ *   5. CF delete_zone(domain) — kills the zone AND every DNS record in it.
+ *   6. Spaceship deleteDomain(domain) — currently 501 (their API can't
+ *      release the registration); kept for when they add it.
+ *   7. Release CF pool slot (cf_keys.domains_used--)
+ *   8. Delete on-disk archive at data/site_archives/<domain>.tar.gz
+ *      — the cached site bundle used for migration. No more trace.
+ *   9. DELETE the domain row.
  *
  * Each external call is wrapped in try/catch so one provider rejecting a
  * delete doesn't block the rest. Failures are logged but the teardown
@@ -71,7 +82,20 @@ async function teardownOne(domain: string): Promise<void> {
       }
     }
 
-    // 2. CF delete_zone (only if creds are populated)
+    // 2. Spaceship: restore default NS BEFORE deleting the CF zone so the
+    //    registrar isn't left pointing at a dead nameserver. Skipped with a
+    //    warning if Spaceship 404s (BYO at another registrar — operator
+    //    must reset NS by hand at the original registrar).
+    try {
+      const { restoreDefaultNameservers } = await import("../spaceship")
+      await restoreDefaultNameservers(domain)
+    } catch (e) {
+      logPipeline(domain, "teardown", "warning",
+        `Spaceship NS restore: ${(e as Error).message} — proceeding with CF delete anyway`)
+    }
+
+    // 3. CF delete_zone (only if creds are populated). Drops the zone AND
+    //    every DNS record in one call.
     if (d.cf_email && d.cf_global_key) {
       try {
         const { deleteZone } = await import("../cloudflare")
@@ -81,7 +105,8 @@ async function teardownOne(domain: string): Promise<void> {
       }
     }
 
-    // 3. Spaceship delete (returns 501 today — best-effort, just records the attempt)
+    // 4. Spaceship deleteDomain — returns 501 today (their API can't release
+    //    the registration). Kept for when they add it. Best-effort.
     try {
       const { deleteDomain: spaceshipDelete } = await import("../spaceship")
       await spaceshipDelete(domain)
@@ -109,7 +134,9 @@ async function teardownOne(domain: string): Promise<void> {
     deleteDomain(domain)
 
     logPipeline(domain, "teardown", "completed",
-      `${domain} fully removed (SA+CF+Spaceship+DB+pool slot freed)`)
+      `${domain} fully removed: SA app deleted (incl. /public_html files), ` +
+      `Spaceship NS reset to default, CF zone + records gone, ` +
+      `archive removed, CF pool slot freed, DB row dropped`)
   } finally {
     ticker.stop()
     releaseSlot()
