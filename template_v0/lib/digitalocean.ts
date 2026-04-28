@@ -19,7 +19,15 @@ import { addServer, updateServer } from "./repos/servers"
 
 const DO_API = "https://api.digitalocean.com/v2"
 
-const FAILOVER_STATUSES = new Set([401, 403, 500, 502, 503, 504, 520, 521, 522, 523, 524])
+// Failover triggers — try the backup token if the primary returns any of:
+//   401/403  → token revoked / account suspended
+//   422      → "limit exceeded" / quota errors (DO sometimes returns 422 with
+//              a body explaining you've hit your droplet cap); backup account
+//              has an independent quota
+//   429      → rate limit on this account; backup likely has its own bucket
+//   5xx/52x  → DO API or its CDN is degraded; backup may go through a
+//              different upstream so worth a try
+const FAILOVER_STATUSES = new Set([401, 403, 422, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524])
 
 const DEFAULT_MAX_DROPLETS_PER_HOUR = 3
 

@@ -17,6 +17,7 @@ const STRING_FIELDS = [
   "registrant_state", "registrant_zip", "registrant_country",
   "do_api_token", "do_api_token_backup",
   "serveravatar_api_key", "serveravatar_org_id",
+  "serveravatar_api_key_backup", "serveravatar_org_id_backup",
   "sa_dashboard_email", "sa_dashboard_password",
   "llm_provider", "llm_api_key", "llm_model",
   "llm_api_key_anthropic", "llm_api_key_openai",

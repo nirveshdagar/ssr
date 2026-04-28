@@ -5,10 +5,19 @@
  *   2. DELETE the DO droplet (stops billing).
  *   3. DELETE the SA server row from ServerAvatar.
  *   4. DELETE the local servers row.
+ *
+ * ALWAYS SEQUENTIAL — servers are torn down one at a time even though the
+ * worker pool could fan out. Reasons:
+ *   - DO and SA both rate-limit DELETE bursts; sequential keeps us under
+ *     the bucket without needing extra throttle math.
+ *   - If a token gets blocked mid-job, sequential failure is contained to
+ *     one server while saRequest's primary→backup failover handles the
+ *     transient case automatically.
+ *   - Server destroy is rare and irreversible; predictable order makes the
+ *     operator's audit log readable.
  */
 import { all, run } from "../db"
 import { deleteDroplet } from "../digitalocean"
-import { getSetting } from "../repos/settings"
 import { logPipeline } from "../repos/logs"
 
 interface ServerRow {
@@ -42,21 +51,23 @@ export async function destroyAllHandler(_payload: Record<string, unknown>): Prom
           `DO delete: ${(e as Error).message}`)
       }
     }
-    // 2. SA server
+    // 2. SA server — through saRequest so primary→backup token failover
+    //    kicks in if the SA account is rate-limited / suspended.
     const saId = s.sa_server_id
-    const saOrg = s.sa_org_id || getSetting("serveravatar_org_id") || ""
-    const saTok = getSetting("serveravatar_api_key") || ""
-    if (saId && saOrg && saTok) {
+    if (saId) {
       try {
-        await fetch(
-          `https://api.serveravatar.com/organizations/${saOrg}/servers/${saId}`,
-          {
-            method: "DELETE",
-            headers: { Authorization: saTok, Accept: "application/json" },
-            signal: AbortSignal.timeout(30_000),
-          },
-        )
-      } catch { /* best-effort */ }
+        const { saRequest } = await import("../serveravatar")
+        const { res } = await saRequest(`/organizations/{ORG_ID}/servers/${saId}`, {
+          method: "DELETE", timeoutMs: 30_000,
+        })
+        if (!res.ok) {
+          logPipeline(s.name || `srv-${s.id}`, "server_teardown", "warning",
+            `SA delete: HTTP ${res.status}`)
+        }
+      } catch (e) {
+        logPipeline(s.name || `srv-${s.id}`, "server_teardown", "warning",
+          `SA delete: ${(e as Error).message}`)
+      }
     }
     // 3. DB row
     run("DELETE FROM servers WHERE id = ?", s.id)

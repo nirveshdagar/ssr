@@ -3,7 +3,6 @@ import { all, run } from "@/lib/db"
 import { appendAudit } from "@/lib/repos/audit"
 import { logPipeline } from "@/lib/repos/logs"
 import { deleteDroplet } from "@/lib/digitalocean"
-import { getSetting } from "@/lib/repos/settings"
 
 export const runtime = "nodejs"
 
@@ -74,26 +73,22 @@ export async function POST(
     }
   }
 
-  // 2. SA server record (best-effort)
+  // 2. SA server record — via saRequest so primary→backup token failover
+  //    kicks in if the SA account is suspended / rate-limited.
   const saId = row.sa_server_id
-  const saOrg = row.sa_org_id || getSetting("serveravatar_org_id") || ""
-  const saTok = getSetting("serveravatar_api_key") || ""
-  if (saId && saOrg && saTok) {
+  if (saId) {
     try {
-      const r = await fetch(
-        `https://api.serveravatar.com/organizations/${saOrg}/servers/${saId}`,
-        {
-          method: "DELETE",
-          headers: { Authorization: saTok, Accept: "application/json" },
-          signal: AbortSignal.timeout(30_000),
-        },
+      const { saRequest } = await import("@/lib/serveravatar")
+      const { res, label: tokLabel } = await saRequest(
+        `/organizations/{ORG_ID}/servers/${saId}`,
+        { method: "DELETE", timeoutMs: 30_000 },
       )
-      if (r.status >= 400) {
+      if (res.status >= 400) {
         logPipeline(label, "server_teardown", "warning",
-          `SA server delete: HTTP ${r.status} ${(await r.text()).slice(0, 200)}`)
+          `SA server delete (${tokLabel}): HTTP ${res.status} ${(await res.text()).slice(0, 200)}`)
       } else {
         logPipeline(label, "server_teardown", "running",
-          `SA server ${saId} removed`)
+          `SA server ${saId} removed (via ${tokLabel} token)`)
       }
     } catch (e) {
       logPipeline(label, "server_teardown", "warning",

@@ -338,6 +338,27 @@ export default function SettingsPage() {
                 <FieldLabel>Organization ID</FieldLabel>
                 <Input value={get("serveravatar_org_id") ?? ""} onChange={(e) => set("serveravatar_org_id", e.target.value)} placeholder="Org ID" />
               </Field>
+              <Field>
+                <FieldLabel>Backup API key (Bearer) — failover</FieldLabel>
+                <SecretInput
+                  value={get("serveravatar_api_key_backup") ?? ""}
+                  onChange={(v) => set("serveravatar_api_key_backup", v)}
+                  placeholder="Optional — used if primary returns 401/403/429/5xx or times out"
+                />
+                <FieldDescription>
+                  Optional. Mirrors the DO backup-token pattern: if the primary SA account is rate-limited
+                  or suspended mid-migration, calls automatically retry on this token. Leave blank to
+                  disable failover.
+                </FieldDescription>
+              </Field>
+              <Field>
+                <FieldLabel>Backup Organization ID</FieldLabel>
+                <Input
+                  value={get("serveravatar_org_id_backup") ?? ""}
+                  onChange={(e) => set("serveravatar_org_id_backup", e.target.value)}
+                  placeholder="Optional — defaults to primary org id if blank"
+                />
+              </Field>
               <div className="rounded-md border border-status-running/25 bg-status-running/8 px-3 py-2 text-small text-status-running">
                 Dashboard login is only used by the UI-automated SSL install fallback (when SA&apos;s{" "}
                 <code className="font-mono">/ssl</code> API returns 500). Both fields can stay blank if you don&apos;t need that path.

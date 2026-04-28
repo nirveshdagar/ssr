@@ -34,6 +34,7 @@ import {
   listApplications,
   appNameFor,
   sysUserFor,
+  saRequest,
   type SaApp,
   type SaServer,
 } from "./serveravatar"
@@ -125,29 +126,20 @@ async function readIndexViaSaApi(
   saServerId: string,
   appId: string,
 ): Promise<IndexReadResult | null> {
-  let creds
-  try { creds = getCreds() } catch { return null }
-
-  const base =
-    `https://api.serveravatar.com/organizations/${creds.orgId}` +
-    `/servers/${saServerId}/applications/${appId}/file-managers/file`
-  const headers = { Authorization: creds.token, Accept: "application/json" }
+  const basePath =
+    `/organizations/{ORG_ID}/servers/${saServerId}` +
+    `/applications/${appId}/file-managers/file`
   const params = new URLSearchParams({ path: "/public_html/", filename: "index.php" })
 
   // Try the common shapes — first to return a 2xx with a body wins.
-  for (const url of [
-    `${base}?${params.toString()}`,
-    `${base}/show?${params.toString()}`,
-    `${base}/contents?${params.toString()}`,
-  ]) {
+  // Each call goes through saRequest so primary→backup token failover applies.
+  for (const suffix of ["", "/show", "/contents"]) {
     try {
-      const r = await fetch(url, {
-        headers, signal: AbortSignal.timeout(8000),
+      const { res: r } = await saRequest(`${basePath}${suffix}?${params.toString()}`, {
+        timeoutMs: 8000,
       })
       if (!r.ok) continue
       const text = await r.text()
-      // SA usually wraps content in JSON; try to extract. If it's raw text,
-      // the body IS the content.
       let content: string | null = null
       try {
         const j = JSON.parse(text) as Record<string, unknown>
@@ -164,19 +156,15 @@ async function readIndexViaSaApi(
         content,
         bytes: content.length,
         path: "/public_html/index.php (via SA API)",
-        has_backup: false, // SA API doesn't surface backup state — drawer hides Restore until first save
+        has_backup: false,
       }
     } catch { /* try next URL shape */ }
   }
   return null
 }
 
-function getCreds(): { token: string; orgId: string } {
-  const tok = (getSetting("serveravatar_api_key") || "").trim()
-  const org = (getSetting("serveravatar_org_id") || "").trim()
-  if (!tok || !org) throw new Error("SA creds missing")
-  return { token: tok, orgId: org }
-}
+// getCreds removed — all SA calls in this file go through saRequest, which
+// loads + iterates primary/backup tokens internally with org-id substitution.
 
 // ---------------------------------------------------------------------------
 // .htaccess hardening — backup files written next to index.php would
@@ -205,23 +193,16 @@ async function ensureHtaccessDenyBackup(
   appId: string | null,
 ): Promise<void> {
   if (!saServerId || !appId) return
-  let creds
-  try { creds = getCreds() } catch { return }
-  const base =
-    `https://api.serveravatar.com/organizations/${creds.orgId}` +
-    `/servers/${saServerId}/applications/${appId}/file-managers`
-  const headers = {
-    Authorization: creds.token,
-    "Content-Type": "application/json",
-    Accept: "application/json",
-  }
+  const basePath =
+    `/organizations/{ORG_ID}/servers/${saServerId}` +
+    `/applications/${appId}/file-managers`
   const params = new URLSearchParams({ path: "/public_html/", filename: ".htaccess" })
 
   // 1. Try to read current .htaccess
   let current = ""
   try {
-    const r = await fetch(`${base}/file?${params.toString()}`, {
-      headers, signal: AbortSignal.timeout(8000),
+    const { res: r } = await saRequest(`${basePath}/file?${params.toString()}`, {
+      timeoutMs: 8000,
     })
     if (r.ok) {
       const text = await r.text()
@@ -243,19 +224,19 @@ async function ensureHtaccessDenyBackup(
 
   // 2. Create file (idempotent — 500 with "exists" is OK)
   try {
-    await fetch(`${base}/file/create`, {
-      method: "PATCH", headers,
+    await saRequest(`${basePath}/file/create`, {
+      method: "PATCH", json: true,
       body: JSON.stringify({ type: "file", name: ".htaccess", path: "/public_html/" }),
-      signal: AbortSignal.timeout(6000),
+      timeoutMs: 6000,
     })
   } catch { /* ignore */ }
 
   // 3. Write merged content
   try {
-    const w = await fetch(`${base}/file`, {
-      method: "PATCH", headers,
+    const { res: w } = await saRequest(`${basePath}/file`, {
+      method: "PATCH", json: true,
       body: JSON.stringify({ filename: ".htaccess", path: "/public_html/", body: merged }),
-      signal: AbortSignal.timeout(6000),
+      timeoutMs: 6000,
     })
     if (w.ok) {
       logPipeline(domain, "sa_control", "running",
@@ -286,26 +267,17 @@ async function writeIndexViaSaApi(
   newContent: string,
   previousContent: string | null,
 ): Promise<{ bytes_written: number } | null> {
-  let creds
-  try { creds = getCreds() } catch { return null }
+  const basePath =
+    `/organizations/{ORG_ID}/servers/${saServerId}` +
+    `/applications/${appId}/file-managers`
 
-  const base =
-    `https://api.serveravatar.com/organizations/${creds.orgId}` +
-    `/servers/${saServerId}/applications/${appId}/file-managers`
-  const headers = {
-    Authorization: creds.token,
-    "Content-Type": "application/json",
-    Accept: "application/json",
-  }
-
-  async function patch(path: string, body: unknown): Promise<boolean> {
+  async function patch(suffix: string, body: unknown): Promise<boolean> {
     try {
-      const r = await fetch(`${base}${path}`, {
-        method: "PATCH", headers,
+      const { res: r } = await saRequest(`${basePath}${suffix}`, {
+        method: "PATCH", json: true,
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(10_000),
+        timeoutMs: 10_000,
       })
-      // 200/201 = ok; 500 with "already exists" on /file/create is also fine
       if (r.ok) return true
       if (r.status === 500) {
         const txt = await r.text().catch(() => "")
@@ -578,22 +550,15 @@ async function uploadViaSaApi(
   filename: string,
   body: string,
 ): Promise<{ bytes_written: number } | null> {
-  let creds
-  try { creds = getCreds() } catch { return null }
-  const base =
-    `https://api.serveravatar.com/organizations/${creds.orgId}` +
-    `/servers/${saServerId}/applications/${appId}/file-managers`
-  const headers = {
-    Authorization: creds.token,
-    "Content-Type": "application/json",
-    Accept: "application/json",
-  }
+  const basePath =
+    `/organizations/{ORG_ID}/servers/${saServerId}` +
+    `/applications/${appId}/file-managers`
   // Create (idempotent — 500 with "exists" is fine), then write content.
   try {
-    const cr = await fetch(`${base}/file/create`, {
-      method: "PATCH", headers,
+    const { res: cr } = await saRequest(`${basePath}/file/create`, {
+      method: "PATCH", json: true,
       body: JSON.stringify({ type: "file", name: filename, path: "/public_html/" }),
-      signal: AbortSignal.timeout(8000),
+      timeoutMs: 8000,
     })
     if (!cr.ok && cr.status === 500) {
       const txt = await cr.text().catch(() => "")
@@ -601,10 +566,10 @@ async function uploadViaSaApi(
     }
   } catch { return null }
   try {
-    const wr = await fetch(`${base}/file`, {
-      method: "PATCH", headers,
+    const { res: wr } = await saRequest(`${basePath}/file`, {
+      method: "PATCH", json: true,
       body: JSON.stringify({ filename, path: "/public_html/", body }),
-      signal: AbortSignal.timeout(15_000),
+      timeoutMs: 15_000,
     })
     if (!wr.ok) return null
   } catch { return null }

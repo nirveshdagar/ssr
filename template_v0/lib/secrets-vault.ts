@@ -24,7 +24,8 @@ import { all, run } from "./db"
 export const SECRET_KEYS_EXACT = new Set<string>([
   "spaceship_api_key", "spaceship_api_secret",
   "do_api_token", "do_api_token_backup",
-  "serveravatar_api_key", "sa_dashboard_password",
+  "serveravatar_api_key", "serveravatar_api_key_backup",
+  "sa_dashboard_password",
   "smtp_password",
   "telegram_bot_token",
   "whatsapp_apikey", "greenapi_api_token",

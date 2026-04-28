@@ -18,6 +18,8 @@ export interface SettingsValues {
   do_api_token_backup: string
   serveravatar_api_key: string
   serveravatar_org_id: string
+  serveravatar_api_key_backup: string
+  serveravatar_org_id_backup: string
   sa_dashboard_email: string
   sa_dashboard_password: string
   llm_provider: string
