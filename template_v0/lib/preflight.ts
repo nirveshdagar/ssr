@@ -11,6 +11,9 @@
  * so the existing dashboard rendering can consume both.
  */
 
+import { existsSync, readdirSync } from "node:fs"
+import path from "node:path"
+import os from "node:os"
 import { all } from "./db"
 import { getSetting } from "./repos/settings"
 
@@ -170,6 +173,74 @@ export function checkRootPassword(): CheckResult {
   return ok(`Root password set (${pw.length} chars)`)
 }
 
+/**
+ * SSL custom-install fallback chain readiness.
+ *
+ * SA's REST /ssl endpoint returns HTTP 500 ("Something went wrong while
+ * creating custom ssl certificate") for fresh apps — a documented SA-side
+ * bug. The pipeline has a 3-tier API → UI → SSH fallback chain to handle
+ * this. This check verifies the UI tier (the intended workaround) has
+ * everything it needs:
+ *
+ *   1. patchright Chromium binary on disk
+ *   2. sa_dashboard_email + sa_dashboard_password set in DB
+ *   3. iproyal proxy configured (per ops policy: "patchright path uses
+ *      iproyal; never use the bare machine IP")
+ *
+ * Returns `ok: true` regardless — the SSH tier is the unconditional
+ * safety net, so the pipeline always completes. The message tells the
+ * operator whether step 8 will succeed via the IDEAL path (UI, updates
+ * SA dashboard tracker) or DEGRADE to SSH (cert is live but SA shows
+ * "no SSL installed"). Non-blocking: missing patchright/proxy doesn't
+ * stop a run, just downgrades the cosmetics.
+ */
+export function checkSslUiFallback(): CheckResult {
+  // Patchright drops Chromium under <userCache>/ms-playwright/chromium*
+  // — on Windows that's %LOCALAPPDATA%, on Linux/macOS ~/.cache.
+  const candidates = [
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "ms-playwright") : null,
+    path.join(os.homedir(), ".cache", "ms-playwright"),
+    path.join(os.homedir(), "Library", "Caches", "ms-playwright"),
+  ].filter((p): p is string => !!p)
+  let patchrightVersion = ""
+  for (const dir of candidates) {
+    if (!existsSync(dir)) continue
+    const entries = readdirSync(dir).filter((d) => d.startsWith("chromium"))
+    if (entries.length > 0) {
+      patchrightVersion = entries[entries.length - 1]
+      break
+    }
+  }
+
+  const saEmail = (getSetting("sa_dashboard_email") || "").trim()
+  const saPass = (getSetting("sa_dashboard_password") || "").trim()
+  const proxyUrl = (getSetting("iproyal_proxy_url") || "").trim()
+  const proxyServer = (getSetting("iproyal_proxy_server") || "").trim()
+
+  const issues: string[] = []
+  if (!patchrightVersion) {
+    issues.push("patchright Chromium not installed (run: npx patchright install chromium)")
+  }
+  if (!saEmail || !saPass) {
+    issues.push("sa_dashboard_email / sa_dashboard_password missing (UI fallback can't login)")
+  }
+  if (!proxyUrl && !proxyServer) {
+    issues.push("iproyal_proxy_url not set (UI fallback would use bare IP — violates ops policy)")
+  }
+
+  if (issues.length === 0) {
+    return ok(
+      `SSL UI fallback ready (chromium=${patchrightVersion}, SA login + iproyal configured)`,
+    )
+  }
+  // Always non-blocking — SSH tier is the unconditional safety net.
+  return ok(
+    `SSL UI fallback DEGRADED — pipeline will use SSH tier on fresh apps ` +
+    `(cert live, but SA dashboard won't show installed=true). Issues: ${issues.join("; ")}`,
+    { degraded: true, issues, patchrightVersion },
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Aggregate
 // ---------------------------------------------------------------------------
@@ -191,6 +262,7 @@ export async function runAll(opts: { skipPurchase?: boolean } = {}): Promise<Pre
     llm_key:         checkLlmKey(),
     server_capacity: checkServerCapacity(),
     root_password:   checkRootPassword(),
+    ssl_ui_fallback: checkSslUiFallback(),
   }
   return {
     ok: Object.values(checks).every((c) => c.ok),

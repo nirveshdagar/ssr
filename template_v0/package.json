@@ -9,7 +9,8 @@
     "start": "cross-env NODE_OPTIONS=--no-warnings next start",
     "lint": "eslint .",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "postinstall": "patchright install chromium || echo 'patchright chromium install failed — UI fallback for SSL install will be unavailable. Re-run manually: npx patchright install chromium'"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",
