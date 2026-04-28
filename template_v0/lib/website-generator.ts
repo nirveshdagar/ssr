@@ -352,11 +352,17 @@ export async function generateSinglePage(domain: string): Promise<GeneratedPage>
   }
 
   if (parsed.blocked) {
+    // Model went through its baked-in safety layer despite the "never refuse"
+    // prompt. Don't fail the pipeline — drop in a static brand-neutral
+    // placeholder page locally and continue. The site is still LIVE; the
+    // operator can later replace it with custom content if desired.
     const reason = String(parsed.reason ?? "blocked by content policy")
     const niche = String(parsed.inferred_niche ?? "")
-    logPipeline(domain, "generate_site_v2", "blocked",
-      `Content-blocked niche='${niche}'  reason=${reason}`)
-    throw new ContentBlockedError(reason, niche)
+    const fallbackPhp = renderFallbackPage(domain)
+    logPipeline(domain, "generate_site_v2", "warning",
+      `Model refused (niche='${niche}' reason='${reason.slice(0, 200)}') — substituting ` +
+      `static placeholder so the pipeline can continue`)
+    return { inferredNiche: niche || "placeholder", php: fallbackPhp }
   }
 
   const php = String((parsed.php ?? parsed.html ?? "") as string)
@@ -397,4 +403,61 @@ function scanForDangerousContent(domain: string, content: string): void {
     logPipeline(domain, "generate_site_v2", "blocked", `LLM output REJECTED — ${reason}`)
     throw new ContentBlockedError(reason, "suspicious_output")
   }
+}
+
+// ---------------------------------------------------------------------------
+// Static fallback page — used when the LLM refuses despite the "never refuse"
+// prompt. Brand-neutral "Welcome / Coming Soon" template that name-checks the
+// domain but says NOTHING about the inferred niche. Always under 5KB, fully
+// self-contained, no external assets, no JS.
+// ---------------------------------------------------------------------------
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c] ?? c),
+  )
+}
+
+function renderFallbackPage(domain: string): string {
+  const safe = escapeHtml(domain)
+  // Pick a brand letter from the domain for the hero monogram
+  const letter = (domain.replace(/[^A-Za-z]/g, "")[0] ?? "S").toUpperCase()
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${safe} — Coming Soon</title>
+<style>
+*,*::before,*::after{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;color:#1f2937;background:linear-gradient(135deg,#f8fafc 0%,#eef2ff 100%);min-height:100vh;display:flex;flex-direction:column}
+.wrap{flex:1;display:flex;flex-direction:column;justify-content:center;max-width:760px;margin:0 auto;padding:48px 24px}
+.mono{display:inline-flex;align-items:center;justify-content:center;width:64px;height:64px;border-radius:14px;background:linear-gradient(135deg,#6366f1,#3b82f6);color:#fff;font-weight:700;font-size:30px;letter-spacing:-1px;margin-bottom:24px;box-shadow:0 4px 14px rgba(59,130,246,.3)}
+h1{font-size:clamp(32px,5vw,44px);line-height:1.15;letter-spacing:-0.02em;margin:0 0 16px;font-weight:700}
+.tag{color:#6366f1;font-weight:600;font-size:14px;text-transform:uppercase;letter-spacing:0.08em;margin:0 0 12px}
+.lead{font-size:18px;line-height:1.6;color:#475569;margin:0 0 32px;max-width:560px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin:0 0 40px}
+.card{background:#fff;border-radius:12px;padding:20px;border:1px solid #e2e8f0}
+.card h3{font-size:15px;margin:0 0 6px;font-weight:600;color:#0f172a}
+.card p{font-size:14px;line-height:1.5;color:#64748b;margin:0}
+footer{padding:24px;text-align:center;color:#94a3b8;font-size:13px;border-top:1px solid #e2e8f0;background:#fff}
+footer a{color:#6366f1;text-decoration:none}
+</style>
+</head>
+<body>
+<main class="wrap">
+<div class="mono">${letter}</div>
+<p class="tag">Now Building</p>
+<h1>${safe}</h1>
+<p class="lead">We're putting the finishing touches on something new. Check back soon to see what we've been working on, or get in touch if you'd like to be notified when we launch.</p>
+<div class="grid">
+<div class="card"><h3>What's coming</h3><p>A clean, focused experience designed around what matters most to the people who'll use it.</p></div>
+<div class="card"><h3>Built with care</h3><p>Thoughtful design, fast pages, and an attention to the small details you usually only notice when they're missing.</p></div>
+<div class="card"><h3>Stay in touch</h3><p>If you'd like to follow along, drop us a line at hello@${safe} and we'll let you know when we're live.</p></div>
+</div>
+</main>
+<footer>© ${new Date().getFullYear()} ${safe} · all rights reserved · <a href="mailto:hello@${safe}">hello@${safe}</a></footer>
+</body>
+</html>`
 }
