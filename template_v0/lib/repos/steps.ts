@@ -68,16 +68,60 @@ export function startHeartbeat(
 // step_tracker — reset per pipeline start, then update_step on each transition
 // ---------------------------------------------------------------------------
 
+/**
+ * Insert step_tracker rows for every step on first sight, AND reset only
+ * incomplete steps to 'pending' on subsequent calls.
+ *
+ * Critical: a previously-`completed` (or `skipped`) step is left alone, so
+ * a retry of a partially-failed pipeline doesn't "unlock" already-done
+ * work. Without this preservation, every retry would re-run step 8's
+ * 1-minute SA UI SSL install just because step 9 hiccuped, etc.
+ *
+ * Step idempotency checks at the top of each step function read
+ * step_tracker; combined with this preservation, "completed" becomes a
+ * sticky lock that survives retries.
+ */
 export function initSteps(domain: string): void {
   for (const [numStr, name] of Object.entries(PIPELINE_STEPS)) {
     run(
       `INSERT INTO step_tracker(domain, step_num, step_name, status, message)
        VALUES(?, ?, ?, 'pending', '')
        ON CONFLICT(domain, step_num)
-       DO UPDATE SET status='pending', message='', started_at=NULL, finished_at=NULL`,
+       DO UPDATE SET
+         status = CASE
+           WHEN step_tracker.status IN ('completed', 'skipped') THEN step_tracker.status
+           ELSE 'pending'
+         END,
+         message = CASE
+           WHEN step_tracker.status IN ('completed', 'skipped') THEN step_tracker.message
+           ELSE ''
+         END,
+         started_at = CASE
+           WHEN step_tracker.status IN ('completed', 'skipped') THEN step_tracker.started_at
+           ELSE NULL
+         END,
+         finished_at = CASE
+           WHEN step_tracker.status IN ('completed', 'skipped') THEN step_tracker.finished_at
+           ELSE NULL
+         END`,
       domain, parseInt(numStr, 10), name,
     )
   }
+}
+
+/**
+ * Operator-facing reset: explicitly clear step N (and all later steps)
+ * back to 'pending'. Called when the operator hits "Run from step N" so
+ * the lock from prior runs of those steps is released and they can re-run.
+ * Steps 1..N-1 are deliberately preserved as-is.
+ */
+export function resetStepsFrom(domain: string, fromStep: number): void {
+  run(
+    `UPDATE step_tracker
+        SET status='pending', message='', started_at=NULL, finished_at=NULL
+      WHERE domain = ? AND step_num >= ?`,
+    domain, fromStep,
+  )
 }
 
 /**

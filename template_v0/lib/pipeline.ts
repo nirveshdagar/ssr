@@ -119,6 +119,40 @@ function checkCancel(domain: string): void {
   if (d?.cancel_requested) throw new PipelineCanceled()
 }
 
+/**
+ * Step-level lock: returns true if step N was already completed (or
+ * intentionally skipped) in a prior run AND the operator didn't
+ * explicitly target this step via start_from. The caller treats a true
+ * return as "skip the heavy work, just record the skip in step_tracker."
+ *
+ * Intent: a retry after a step-9 failure shouldn't re-do step 8's
+ * 1-minute SA UI SSL install, etc. Once a step reaches 'completed' it
+ * stays locked across pipeline restarts (see initSteps' preservation
+ * of completed/skipped rows).
+ *
+ * Exception: when the operator hits "Run from step N", they want
+ * step N specifically to re-execute even if previously completed —
+ * that's the whole point of explicitly choosing it. Steps AFTER N
+ * still respect the lock.
+ */
+function isStepLocked(
+  domain: string, stepNum: number, startFrom: number | null | undefined,
+): boolean {
+  // Operator explicitly chose this exact step → force re-run.
+  if (startFrom === stepNum) return false
+  const r = stepLockOne<{ status: string }>(
+    "SELECT status FROM step_tracker WHERE domain = ? AND step_num = ?",
+    domain, stepNum,
+  )
+  return r?.status === "completed" || r?.status === "skipped"
+}
+
+// Local one() to avoid importing from db at top of file (already imported
+// further below via `one` from "./db"; alias here for readability).
+function stepLockOne<T>(sql: string, ...params: unknown[]): T | undefined {
+  return one<T>(sql, ...params)
+}
+
 // ---------------------------------------------------------------------------
 // Heartbeat ticker — pulses every 1s while a worker runs
 // ---------------------------------------------------------------------------
@@ -374,38 +408,73 @@ async function pipelineWorkerImpl(
     initSteps(domain)
     logPipeline(domain, "pipeline", "running", "Pipeline v2 started")
 
+    // Per-step lock helper: returns true if the wrapper SHOULD run the
+    // step body, false if locked (already completed in a prior run AND
+    // operator didn't explicitly target this step via start_from).
+    const shouldRun = (n: number): boolean => {
+      if (isStepLocked(domain, n, startFrom)) {
+        updateStep(domain, n, "skipped",
+          "Locked from prior completed run — pass start_from=" + n + " to force re-run")
+        return false
+      }
+      return true
+    }
+
     checkCancel(domain)
     if (startFrom == null || startFrom <= 1) {
-      if (!await step1BuyOrDetect(domain, skipPurchase)) return
+      if (shouldRun(1)) {
+        if (!await step1BuyOrDetect(domain, skipPurchase)) return
+      }
     } else {
       updateStep(domain, 1, "skipped", "start_from > 1")
     }
 
     checkCancel(domain)
     if (startFrom == null || startFrom <= 2) {
-      if (!step2AssignCfKey(domain)) return
+      if (shouldRun(2)) {
+        if (!step2AssignCfKey(domain)) return
+      }
     }
 
     checkCancel(domain)
     if (startFrom == null || startFrom <= 3) {
-      if (!await step3CreateZone(domain)) return
+      if (shouldRun(3)) {
+        if (!await step3CreateZone(domain)) return
+      }
     }
 
     checkCancel(domain)
     if (startFrom == null || startFrom <= 4) {
-      if (!await step4SetNameservers(domain)) return
+      if (shouldRun(4)) {
+        if (!await step4SetNameservers(domain)) return
+      }
     }
 
     checkCancel(domain)
     if (startFrom == null || startFrom <= 5) {
-      await step5WaitZoneActive(domain, 120_000, 15_000)
+      if (shouldRun(5)) {
+        await step5WaitZoneActive(domain, 120_000, 15_000)
+      }
     }
 
     checkCancel(domain)
     let server: ServerRow | null
     if (startFrom == null || startFrom <= 6) {
-      server = await step6GetOrProvisionServer(domain, serverId, forceNewServer)
-      if (!server) return
+      if (shouldRun(6)) {
+        server = await step6GetOrProvisionServer(domain, serverId, forceNewServer)
+        if (!server) return
+      } else {
+        // Step 6 was locked — read the persisted server_id off the
+        // domain row (set by the original step 6 run that completed).
+        const resumeId = serverId ?? getDomain(domain)?.server_id ?? null
+        server = resumeId ? findServer(resumeId) : null
+        if (!server) {
+          logPipeline(domain, "pipeline", "failed",
+            `Step 6 locked but no server_id on domain row — inconsistent state.`)
+          updateDomain(domain, { status: "terminal_error" })
+          return
+        }
+      }
     } else {
       const resumeId = serverId ?? getDomain(domain)?.server_id ?? null
       server = resumeId ? findServer(resumeId) : null
@@ -420,34 +489,48 @@ async function pipelineWorkerImpl(
 
     checkCancel(domain)
     if (startFrom == null || startFrom <= 7) {
-      if (!await step7CreateAppAndDns(domain, server)) return
+      if (shouldRun(7)) {
+        if (!await step7CreateAppAndDns(domain, server)) return
+      }
     }
 
     checkCancel(domain)
     if (startFrom == null || startFrom <= 8) {
-      // SSL is warn-on-fail — domain still works on Flexible SSL
-      await step8IssueAndInstallSsl(domain, server)
+      if (shouldRun(8)) {
+        // SSL is warn-on-fail — domain still works on Flexible SSL
+        await step8IssueAndInstallSsl(domain, server)
+      }
     }
 
     checkCancel(domain)
     let php: string | null = null
     if (startFrom == null || startFrom <= 9) {
-      php = await step9GenerateContent(domain)
-      if (php == null) return
-    } else {
+      if (shouldRun(9)) {
+        php = await step9GenerateContent(domain)
+        if (php == null) return
+      } else {
+        // Step 9 locked from prior completion — read cached site_html
+        // off the domain row (step 9 persists it there on success).
+        const d = getDomain(domain)
+        php = d?.site_html ?? null
+      }
+    }
+    // If we got here without php (start_from > 9, or step 9 was locked
+    // but site_html was cleared somehow), fall back to disk archive then
+    // hard-fail with a clear message pointing the operator at step 9.
+    if (!php || php.length < 100) {
       const d = getDomain(domain)
       php = d?.site_html ?? null
       if (!php || php.length < 100) {
-        // Fall back to the on-disk archive
         try {
           const { readArchive } = await import("./migration")
           const archived = await readArchive(domain)
           if (archived) php = archived.php
-        } catch { /* archive missing — fall through to hard fail below */ }
+        } catch { /* archive missing — fall through */ }
       }
       if (!php || php.length < 100) {
         logPipeline(domain, "pipeline", "failed",
-          `Cannot resume from step 10: no generated content found ` +
+          `Cannot proceed to step 10: no generated content found ` +
           `(site_html empty AND no archive). Re-run from step 9 to regenerate.`)
         updateDomain(domain, { status: "terminal_error" })
         return
@@ -456,7 +539,9 @@ async function pipelineWorkerImpl(
 
     checkCancel(domain)
     if (startFrom == null || startFrom <= 10) {
-      if (!await step10UploadIndexPhp(domain, server, php!)) return
+      if (shouldRun(10)) {
+        if (!await step10UploadIndexPhp(domain, server, php!)) return
+      }
     }
 
     logPipeline(domain, "pipeline", "completed", `Pipeline v2 complete for ${domain}`)
@@ -823,21 +908,9 @@ async function step7CreateAppAndDns(domain: string, server: ServerRow): Promise<
 }
 
 async function step8IssueAndInstallSsl(domain: string, server: ServerRow): Promise<boolean> {
-  // Idempotency check: only skip if step_tracker explicitly says step 8
-  // completed before. Don't trust domain.status alone — status='live' just
-  // means CF returns 200 to a probe, which can be true even when origin
-  // HTTPS is broken (CF's Universal SSL handles visitor↔CF; if origin
-  // SSL never installed, CF falls back to SA's default HTTPS vhost and
-  // serves the SA welcome page with a 200 status). Only step_tracker
-  // proves the cert was actually installed.
-  const stepRow = one<{ status: string }>(
-    "SELECT status FROM step_tracker WHERE domain = ? AND step_num = 8",
-    domain,
-  )
-  if (stepRow?.status === "completed") {
-    updateStep(domain, 8, "skipped", "SSL already installed (step_tracker confirms)")
-    return true
-  }
+  // Note: idempotency / lock is handled by the wrapper-level isStepLocked
+  // check in pipelineWorkerImpl. By the time this function runs, the
+  // wrapper has already confirmed step 8 isn't already-completed.
 
   updateStep(domain, 8, "running", "Issuing Origin CA cert (15y) from Cloudflare...")
   let bundle: { certificate: string; private_key: string; chain: string; id: string; expires_on: string }
