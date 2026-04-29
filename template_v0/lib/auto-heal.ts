@@ -255,7 +255,12 @@ export function autoRetryRetryable(): RetryResult {
     1,
     Number.parseInt(process.env.SSR_AUTOHEAL_RETRY_MAX_PER_DAY ?? "", 10) || DEFAULT_RETRY_MAX_PER_DAY,
   )
-  const cooldownThreshold = new Date(Date.now() - cooldownMs).toISOString().replace(/\.\d{3}Z$/, "")
+  // SQLite stores timestamps as "YYYY-MM-DD HH:MM:SS" (space separator) so
+  // we MUST match that format for the lexicographic comparison. Using JS's
+  // toISOString ("YYYY-MM-DDTHH:MM:SS") would sort space < T and treat
+  // every fresh heartbeat as older than the threshold — making the cooldown
+  // a no-op and letting auto-heal stomp on freshly-failed runs every tick.
+  const cooldownThreshold = new Date(Date.now() - cooldownMs).toISOString().slice(0, 19).replace("T", " ")
 
   for (const d of listDomains()) {
     if (!isRetryableError(d.status)) continue
@@ -273,11 +278,16 @@ export function autoRetryRetryable(): RetryResult {
     }
     // Per-domain 24h cap on failed runs — stops infinite retry loops on
     // genuinely broken domains.
-    const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString().replace(/\.\d{3}Z$/, "")
+    //
+    // pipeline_runs.ended_at is a REAL (unix epoch seconds) — use a numeric
+    // comparison, NOT an ISO string. SQLite would otherwise parseFloat the
+    // string "2026-..." → 2026, making the comparison always true and the
+    // 24h cap a no-op.
+    const sinceEpoch = (Date.now() - 24 * 3600 * 1000) / 1000
     const failedRow = all<{ n: number }>(
       `SELECT COUNT(*) AS n FROM pipeline_runs
         WHERE domain = ? AND status = 'failed' AND ended_at >= ?`,
-      d.domain, since,
+      d.domain, sinceEpoch,
     )
     const failed24h = failedRow[0]?.n ?? 0
     if (failed24h >= maxPerDay) {
@@ -333,7 +343,12 @@ export function autoFixBrokenSsl(): BrokenSslResult {
     60_000,
     Number.parseInt(process.env.SSR_AUTOFIX_SSL_COOLDOWN_MS ?? "", 10) || 15 * 60_000,
   )
-  const cooldownThreshold = new Date(Date.now() - cooldownMs).toISOString().replace(/\.\d{3}Z$/, "")
+  // SQLite stores timestamps as "YYYY-MM-DD HH:MM:SS" (space separator) so
+  // we MUST match that format for the lexicographic comparison. Using JS's
+  // toISOString ("YYYY-MM-DDTHH:MM:SS") would sort space < T and treat
+  // every fresh heartbeat as older than the threshold — making the cooldown
+  // a no-op and letting auto-heal stomp on freshly-failed runs every tick.
+  const cooldownThreshold = new Date(Date.now() - cooldownMs).toISOString().slice(0, 19).replace("T", " ")
 
   // Domains where step 8 has explicitly FAILED or never ran (NULL row).
   // Excludes:

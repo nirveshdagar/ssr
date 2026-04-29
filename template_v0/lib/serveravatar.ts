@@ -22,6 +22,7 @@
 // `ssh2-df016e52d1a2696f` cannot-find-module crash). The Client constructor
 // is loaded lazily inside SshSession.connect().
 import type { Client as SshClient, ConnectConfig, ClientChannel, SFTPWrapper } from "ssh2"
+import { connect as tlsConnect, type PeerCertificate } from "node:tls"
 import { one } from "./db"
 import { getSetting } from "./repos/settings"
 import { logPipeline } from "./repos/logs"
@@ -124,8 +125,28 @@ export async function saRequest(
     }
     if (res.ok) return { res, orgId: c.orgId, label: c.label }
     if (SA_FAILOVER_STATUSES.has(res.status)) {
-      const body = (await res.text()).slice(0, 200).replace(/\n/g, " ")
-      attempts.push([c.label, `HTTP ${res.status} — ${body}`])
+      // Read the body once. Response bodies are one-shot streams in undici
+      // (Node 22 fetch) — clone-then-read-both has had subtle bugs over
+      // releases. Drain into a string and rebuild a fresh Response on the
+      // surface-to-caller path so the caller's `await res.text()` always
+      // works regardless of internal stream state.
+      const bodyText = await res.text()
+      // SA's file-managers REST returns HTTP 500 with `{"message":"File or
+      // folder name already exists."}` for PATCH /file/create when the file
+      // is already there — benign duplicate, NOT a transient server error,
+      // so don't retry on the backup token. Surface the response so the
+      // caller's exists-check can fall through to PATCH /file (write).
+      // Documented in ssr_technical_gotchas memory.
+      if (res.status === 500 && /already exists/i.test(bodyText)) {
+        const surfaced = new Response(bodyText, {
+          status: res.status,
+          statusText: res.statusText,
+          headers: res.headers,
+        })
+        return { res: surfaced, orgId: c.orgId, label: c.label }
+      }
+      const sample = bodyText.slice(0, 200).replace(/\n/g, " ")
+      attempts.push([c.label, `HTTP ${res.status} — ${sample}`])
       continue
     }
     // Real (non-failover) HTTP error — surface to caller without retrying
@@ -815,6 +836,21 @@ export async function installCustomSsl(opts: InstallSslOpts): Promise<{ ok: bool
   const apiResult = await tryApiSslFlow(sslPath, opts)
   if (apiResult.ok) return apiResult
 
+  // The API path's documented failure mode is HTTP 500 with the body
+  // `{"message":"Something went wrong while creating custom ssl certificate."}`
+  // (ssr_technical_gotchas #3 — SA backend bug, the UI/SSH tiers exist
+  // exactly because of it). When that's why we're falling through, log it
+  // as a separate "info" line for forensics rather than dumping a scary
+  // "API flow exception" string into the eventual success message.
+  const apiBenign = /something went wrong while creating custom ssl/i.test(apiResult.message)
+  if (opts.domain) {
+    logPipeline(opts.domain, "ssl_install", apiBenign ? "info" : "warning",
+      apiBenign
+        ? "SA API custom-SSL endpoint returned its known 500 — falling through to UI/SSH path"
+        : `SA API path failed (${apiResult.message.slice(0, 200)}) — falling through to UI/SSH`,
+    )
+  }
+
   // UI fallback (patchright + iproyal proxy if configured) — drives SA's
   // dashboard like a human. Heavy: only loaded when API has actually failed.
   // For UI fallback we need a concrete org id — use the primary's since
@@ -841,7 +877,7 @@ export async function installCustomSsl(opts: InstallSslOpts): Promise<{ ok: bool
       if (ui.ok) {
         return {
           ok: true,
-          message: `UI install OK (${ui.message}). API failed: ${apiResult.message}`,
+          message: `Installed via SA UI${apiBenign ? "" : " (API path unavailable)"}`,
         }
       }
       uiMsg = ui.message
@@ -863,13 +899,92 @@ export async function installCustomSsl(opts: InstallSslOpts): Promise<{ ok: bool
   if (ssh.ok) {
     return {
       ok: true,
-      message: `SSH fallback OK (${ssh.message}). API failed: ${apiResult.message}  UI failed: ${uiMsg}`,
+      message: `Installed via SSH (API + UI fallbacks unavailable)`,
     }
   }
   throw new Error(
     `All three SSL install paths failed. API: ${apiResult.message}  ` +
     `UI: ${uiMsg}  SSH: ${ssh.message}`,
   )
+}
+
+/**
+ * Post-install verification — TLS-probes the origin IP directly (SNI=domain)
+ * and inspects the peer cert's issuer. Confirms our CF Origin CA cert is the
+ * one actually serving on the SA box, not SA's auto-issued Let's Encrypt.
+ *
+ * Connecting via the public domain would hit the CF edge (which uses CF's
+ * Universal/LE cert and doesn't reveal the origin cert). We connect to the
+ * server IP directly so the SA-installed cert is what comes back.
+ *
+ * `rejectUnauthorized: false` because the CF Origin CA cert is signed by a
+ * CF-private root that's not in Node's trust store — we're checking the
+ * issuer, not validating the chain.
+ *
+ * Failure modes:
+ *   - probe ok + issuer matches CF Origin CA → ok=true (cert verified)
+ *   - probe ok + issuer is something else (Let's Encrypt, etc.) → ok=false
+ *     (the install reported success but a different cert is serving)
+ *   - probe fails (timeout, ECONNREFUSED) → returns ok=null so the caller
+ *     can decide; we don't fail step 8 on a transient network blip.
+ */
+export interface OriginCertProbeResult {
+  ok: boolean | null
+  issuerCN: string | null
+  subjectCN: string | null
+  message: string
+}
+
+export async function verifyOriginCertIsCustom(
+  serverIp: string, domain: string, timeoutMs = 10_000,
+): Promise<OriginCertProbeResult> {
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (r: OriginCertProbeResult) => {
+      if (settled) return
+      settled = true
+      try { socket.end() } catch { /* ignore */ }
+      resolve(r)
+    }
+    const timer = setTimeout(() => {
+      finish({ ok: null, issuerCN: null, subjectCN: null,
+        message: `verify probe timed out after ${Math.round(timeoutMs / 1000)}s` })
+    }, timeoutMs)
+    const socket = tlsConnect({
+      host: serverIp,
+      port: 443,
+      servername: domain,
+      rejectUnauthorized: false,
+      timeout: timeoutMs,
+    }, () => {
+      clearTimeout(timer)
+      const cert: PeerCertificate = socket.getPeerCertificate(false)
+      const issuer = cert?.issuer ?? {}
+      const subject = cert?.subject ?? {}
+      const issuerCN = (issuer as { CN?: string }).CN ?? null
+      const issuerOU = (issuer as { OU?: string }).OU ?? ""
+      const subjectCN = (subject as { CN?: string }).CN ?? null
+      // Match either issuer CN or OU — CF's Origin CA cert has:
+      //   issuer: O=CloudFlare, Inc., OU=CloudFlare Origin SSL Certificate Authority, ...
+      //   (CN is sometimes "Origin SSL ECC Certificate Authority" or absent)
+      const isCustom =
+        /cloudflare origin/i.test(issuerCN ?? "") ||
+        /cloudflare origin/i.test(issuerOU)
+      finish({
+        ok: isCustom,
+        issuerCN: issuerCN || issuerOU || null,
+        subjectCN,
+        message: isCustom
+          ? `verified — issuer=${issuerCN || issuerOU}`
+          : `WRONG ISSUER — expected CF Origin CA, got ${issuerCN || issuerOU || "(unknown)"} (subject=${subjectCN ?? "?"})`,
+      })
+    })
+    socket.on("error", (e) => {
+      clearTimeout(timer)
+      finish({ ok: null, issuerCN: null, subjectCN: null,
+        message: `verify probe error: ${(e as NodeJS.ErrnoException).code ?? ""} ${e.message}`.trim() })
+    })
+  })
 }
 
 async function tryApiSslFlow(
@@ -1016,17 +1131,34 @@ export async function uploadIndexPhp(
       `/organizations/{ORG_ID}/servers/${saServerId}` +
       `/applications/${appId}/file-managers`
 
-    // 1. Create + write index.php
-    const { res: createRes } = await saRequest(`${basePath}/file/create`, {
-      method: "PATCH", json: true,
-      body: JSON.stringify({ type: "file", name: "index.php", path: "/public_html/" }),
-    })
-    if (createRes.status === 500) {
-      const body = await safeJson(createRes)
-      const msg = saErrorMessage(body, "")
-      if (!msg.toLowerCase().includes("exists")) {
-        throw new Error(`index.php create HTTP 500: ${msg}`)
+    // 1. Create + write index.php.
+    //
+    // The create step is allowed to fail with "already exists" — that's the
+    // normal case on a re-run. Wrap it in its own try/catch so:
+    //  - HTTP 500 with "exists" body → swallow, proceed to write
+    //  - SAAllTokensFailed thrown by saRequest containing "exists" → also
+    //    swallow (belt-and-suspenders in case saRequest's peek doesn't
+    //    recognize the pattern for some reason)
+    //  - Anything else → rethrow, outer catch falls back to SFTP
+    try {
+      const { res: createRes } = await saRequest(`${basePath}/file/create`, {
+        method: "PATCH", json: true,
+        body: JSON.stringify({ type: "file", name: "index.php", path: "/public_html/" }),
+      })
+      if (createRes.status === 500) {
+        const body = await safeJson(createRes)
+        const msg = saErrorMessage(body, "")
+        if (!msg.toLowerCase().includes("exists")) {
+          throw new Error(`index.php create HTTP 500: ${msg}`)
+        }
       }
+    } catch (createErr) {
+      const msg = (createErr as Error).message
+      if (!/already exists|folder name already/i.test(msg)) {
+        throw createErr
+      }
+      logPipeline(domain, "upload_index_php", "running",
+        "index.php already exists on SA — skipping create, going straight to write")
     }
     const { res: writeRes } = await saRequest(`${basePath}/file`, {
       method: "PATCH", json: true,
@@ -1076,6 +1208,161 @@ export async function uploadIndexPhp(
     logPipeline(domain, "upload_index_php", "warning",
       `SA API path failed (${(e as Error).message}); falling back to full SFTP upload`)
     return uploadIndexPhpViaSftp(domain, phpContent, serverIp)
+  }
+}
+
+/**
+ * Multi-file upload for sites where the LLM produced more than just an
+ * index. Walks the provided files array, creates parent directories as
+ * needed via SA's File Manager API, then writes each file's content via
+ * `PATCH /file`. After all files succeed, removes the default 15KB SA
+ * welcome `index.html` (same logic as uploadIndexPhp).
+ *
+ * On any per-file API failure, falls through to the existing SFTP upload
+ * path for the WHOLE batch (uploadFilesViaSftp). Per-file partial-upload
+ * recovery isn't worth the complexity — re-running step 10 retries cleanly.
+ *
+ * Path format expectation (already validated by validateGeneratedFiles):
+ *   "index.php"           → /public_html/index.php
+ *   "style.css"           → /public_html/style.css
+ *   "assets/logo.svg"     → /public_html/assets/logo.svg
+ *   "css/main.css"        → /public_html/css/main.css
+ */
+export async function uploadAppFiles(
+  saServerId: string,
+  domain: string,
+  files: { path: string; content: string }[],
+  serverIp?: string,
+): Promise<boolean> {
+  const indexFile = files.find((f) => f.path === "index.php")
+    ?? files.find((f) => f.path === "index.html")
+    ?? files[0]
+
+  logPipeline(domain, "upload_index_php", "running",
+    `Multi-file upload to /public_html/: ${files.length} file(s) — ` +
+    `${files.map((f) => f.path).slice(0, 8).join(", ")}` +
+    (files.length > 8 ? ` ...+${files.length - 8} more` : ""))
+
+  try {
+    const appId = await findAppId(saServerId, domain)
+    if (!appId) throw new Error(`App not found on SA server ${saServerId}`)
+    const basePath =
+      `/organizations/{ORG_ID}/servers/${saServerId}` +
+      `/applications/${appId}/file-managers`
+
+    // Create every parent directory once. Sort by depth so /assets exists
+    // before /assets/icons. SA returns 500 with "exists" on a re-run —
+    // treat that as success.
+    const dirs = new Set<string>()
+    for (const f of files) {
+      const segs = f.path.split("/")
+      for (let i = 1; i < segs.length; i++) {
+        dirs.add(segs.slice(0, i).join("/"))
+      }
+    }
+    const dirList = [...dirs].sort((a, b) => a.split("/").length - b.split("/").length)
+    for (const dir of dirList) {
+      const parent = dir.includes("/") ? dir.slice(0, dir.lastIndexOf("/")) : ""
+      const name = dir.includes("/") ? dir.slice(dir.lastIndexOf("/") + 1) : dir
+      try {
+        const { res } = await saRequest(`${basePath}/file/create`, {
+          method: "PATCH", json: true,
+          body: JSON.stringify({
+            type: "directory",
+            name,
+            path: `/public_html/${parent}${parent ? "/" : ""}`,
+          }),
+        })
+        if (res.status === 500) {
+          const body = await safeJson(res)
+          const msg = saErrorMessage(body, "")
+          if (!msg.toLowerCase().includes("exists")) {
+            throw new Error(`mkdir '${dir}' HTTP 500: ${msg}`)
+          }
+        }
+      } catch (e) {
+        const m = (e as Error).message
+        if (!/already exists|folder name already/i.test(m)) throw e
+      }
+    }
+
+    // Create + write every file. Same exists-is-fine pattern as uploadIndexPhp.
+    for (const f of files) {
+      const segs = f.path.split("/")
+      const name = segs[segs.length - 1]
+      const dir = segs.slice(0, -1).join("/")
+      try {
+        const { res } = await saRequest(`${basePath}/file/create`, {
+          method: "PATCH", json: true,
+          body: JSON.stringify({
+            type: "file", name,
+            path: `/public_html/${dir}${dir ? "/" : ""}`,
+          }),
+        })
+        if (res.status === 500) {
+          const body = await safeJson(res)
+          const msg = saErrorMessage(body, "")
+          if (!msg.toLowerCase().includes("exists")) {
+            throw new Error(`create '${f.path}' HTTP 500: ${msg}`)
+          }
+        }
+      } catch (e) {
+        const m = (e as Error).message
+        if (!/already exists|folder name already/i.test(m)) throw e
+      }
+      const { res: writeRes } = await saRequest(`${basePath}/file`, {
+        method: "PATCH", json: true,
+        body: JSON.stringify({
+          filename: name,
+          path: `/public_html/${dir}${dir ? "/" : ""}`,
+          body: f.content,
+        }),
+      })
+      if (!writeRes.ok) {
+        throw new Error(`write '${f.path}' HTTP ${writeRes.status}: ${(await writeRes.text()).slice(0, 200)}`)
+      }
+    }
+
+    // Remove the default SA welcome index.html ONLY if the operator's files
+    // didn't already include an index.html (otherwise we'd delete what we
+    // just wrote). Same multi-verb-fallback as uploadIndexPhp.
+    const operatorWroteIndexHtml = files.some((f) => f.path === "index.html")
+    if (!operatorWroteIndexHtml) {
+      let deletedViaApi = false
+      const deleteTargets: { method: string; pathSuffix: string }[] = [
+        { method: "DELETE", pathSuffix: "/file" },
+        { method: "PATCH", pathSuffix: "/file/delete" },
+        { method: "POST", pathSuffix: "/file/delete" },
+      ]
+      for (const t of deleteTargets) {
+        try {
+          const { res: r } = await saRequest(`${basePath}${t.pathSuffix}`, {
+            method: t.method, json: true,
+            body: JSON.stringify({ filename: "index.html", path: "/public_html/" }),
+          })
+          if (r.ok) { deletedViaApi = true; break }
+        } catch { /* try next */ }
+      }
+      if (!deletedViaApi) {
+        try {
+          await deleteIndexHtmlViaSsh(domain, serverIp)
+        } catch (sshErr) {
+          logPipeline(domain, "upload_index_php", "warning",
+            `Could not delete default index.html (${(sshErr as Error).message}) — ` +
+            `overwriting with redirect to /index.php`)
+          await overwriteIndexHtmlViaApi(basePath, indexFile.content)
+        }
+      }
+    }
+
+    logPipeline(domain, "upload_index_php", "completed",
+      `${files.length} file(s) uploaded to /public_html/`)
+    return true
+  } catch (e) {
+    logPipeline(domain, "upload_index_php", "warning",
+      `SA API multi-file path failed (${(e as Error).message}); ` +
+      `falling back to SFTP for whole batch`)
+    return uploadFilesViaSftp(domain, files, serverIp)
   }
 }
 
@@ -1235,6 +1522,101 @@ export async function uploadIndexPhpViaSftp(
       `Could not find any public_html for ${appName} (or ${domain}) under /home or /var/www — ` +
       `SA layout may have changed; manual SSH inspection needed`,
     )
+  } finally {
+    ssh?.close()
+  }
+}
+
+/**
+ * Multi-file SFTP fallback. Same public_html-discovery logic as
+ * uploadIndexPhpViaSftp, but writes the entire files array (creating parent
+ * directories with `mkdir -p` first) and removes index.html only if the
+ * operator's files don't already include it.
+ */
+export async function uploadFilesViaSftp(
+  domain: string,
+  files: { path: string; content: string }[],
+  serverIp?: string,
+): Promise<boolean> {
+  const ip = serverIp ?? lookupServerIp(domain)
+  if (!ip) throw new Error("No server IP found for SFTP upload")
+  const rootPass = getSetting("server_root_password") || ""
+  if (!rootPass) throw new Error("server_root_password not set")
+
+  const appName = appNameFor(domain)
+  const sysUser = sysUserFor(domain)
+  const candidates = [
+    `/home/${sysUser}/${appName}/public_html`,
+    `/home/${sysUser}/public_html`,
+    `/home/master/${appName}/public_html`,
+    `/var/www/${domain}/public_html`,
+  ]
+
+  let ssh: SshSession | null = null
+  try {
+    ssh = await SshSession.connect({
+      host: ip, username: "root", password: rootPass, port: 22, readyTimeout: 30_000,
+    })
+
+    // Locate the public_html dir using the same fast path → search fallback
+    // as uploadIndexPhpViaSftp.
+    let pub: string | null = null
+    for (const c of candidates) {
+      if (await ssh.sftpStat(c)) { pub = c; break }
+    }
+    if (!pub) {
+      const find = await ssh.exec(
+        `find /home /var/www -maxdepth 6 -type d -name public_html ` +
+        `\\( -path '*${appName}*' -o -path '*${domain}*' \\) 2>/dev/null | head -3`,
+        { timeoutMs: 15_000 },
+      )
+      pub = find.stdout.split("\n").map((l) => l.trim()).filter(Boolean)[0] ?? null
+    }
+    if (!pub) {
+      throw new Error(
+        `Could not find any public_html for ${appName} (or ${domain}) under /home or /var/www`,
+      )
+    }
+
+    // Resolve the actual owner of public_html — sysUser may be wrong if SA
+    // re-used an existing user.
+    const stat = await ssh.exec(`stat -c '%U' ${pub}`, { timeoutMs: 5000 })
+    const realUser = stat.stdout.trim() || sysUser
+
+    // Pre-create every parent directory in one shot.
+    const dirs = new Set<string>()
+    for (const f of files) {
+      const segs = f.path.split("/")
+      for (let i = 1; i < segs.length; i++) {
+        dirs.add(segs.slice(0, i).join("/"))
+      }
+    }
+    if (dirs.size > 0) {
+      const mkdirCmd = [...dirs]
+        .map((d) => `mkdir -p ${pub}/${d}`)
+        .join(" && ")
+      await ssh.exec(mkdirCmd, { timeoutMs: 15_000 })
+    }
+
+    // Write each file via SFTP, then chown the whole batch in one pass.
+    for (const f of files) {
+      await ssh.sftpWriteFile(`${pub}/${f.path}`, f.content)
+    }
+    await ssh.exec(
+      `chown -R ${realUser}:${realUser} ${pub} 2>/dev/null; ` +
+      `find ${pub} -type f -exec chmod 644 {} +`,
+      { timeoutMs: 15_000 },
+    )
+
+    // Remove default index.html if operator didn't write one.
+    const operatorWroteIndexHtml = files.some((f) => f.path === "index.html")
+    if (!operatorWroteIndexHtml) {
+      try { await ssh.sftpRemoveFile(`${pub}/index.html`) } catch { /* may not exist */ }
+    }
+
+    logPipeline(domain, "upload_index_php", "completed",
+      `${files.length} file(s) written to ${pub} via SFTP fallback (owner=${realUser})`)
+    return true
   } finally {
     ssh?.close()
   }

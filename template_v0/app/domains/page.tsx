@@ -58,6 +58,7 @@ import {
   Select, SelectTrigger, SelectValue, SelectContent, SelectGroup, SelectLabel, SelectItem,
 } from "@/components/ui/select"
 import { OperatorDialog } from "@/components/ssr/operator-dialog"
+import { ModelPicker } from "@/components/ssr/model-picker"
 import { Field, FieldLabel, FieldDescription } from "@/components/ui/field"
 import { Textarea } from "@/components/ui/textarea"
 import { PIPELINE_STEPS } from "@/lib/status-taxonomy"
@@ -146,6 +147,11 @@ function DomainsPageInner() {
   // Bulk-run options (Flask's bulk form has skip_purchase + server picker)
   const [bulkSkipPurchase, setBulkSkipPurchase] = React.useState(false)
   const [bulkServerId, setBulkServerId] = React.useState<string>("")
+  // Per-bulk LLM override — same shape as the single-run modal. Lets the
+  // operator route step 9 across the whole batch to a fallback provider when
+  // the default one is rate-limited.
+  const [bulkCustomProvider, setBulkCustomProvider] = React.useState<string>("")
+  const [bulkCustomModel, setBulkCustomModel] = React.useState<string>("")
 
   // CF credentials password show/hide (Flask has the eye toggle)
   const [cfShowKey, setCfShowKey] = React.useState(false)
@@ -156,7 +162,8 @@ function DomainsPageInner() {
   const [runModalDomain, setRunModalDomain] = React.useState<string | null>(null)
   const [runOpts, setRunOpts] = React.useState<{
     skipPurchase: boolean; startFrom: string; serverId: string
-  }>({ skipPurchase: false, startFrom: "", serverId: "" })
+    customProvider: string; customModel: string
+  }>({ skipPurchase: false, startFrom: "", serverId: "", customProvider: "", customModel: "" })
   const [preflightResult, setPreflightResult] = React.useState<
     { ok: boolean; checks: Record<string, { ok: boolean; message: string }> } | null
   >(null)
@@ -164,7 +171,7 @@ function DomainsPageInner() {
 
   function openRunModal(domain: string) {
     setRunModalDomain(domain)
-    setRunOpts({ skipPurchase: false, startFrom: "", serverId: "" })
+    setRunOpts({ skipPurchase: false, startFrom: "", serverId: "", customProvider: "", customModel: "" })
     setPreflightResult(null)
     setRunResult(null)
   }
@@ -184,12 +191,16 @@ function DomainsPageInner() {
       serverId?: number
       startFrom?: number
       forceNewServer?: boolean
+      customProvider?: string
+      customModel?: string
     } = {
       skipPurchase: runOpts.skipPurchase,
     }
     if (runOpts.serverId === "__new__") opts.forceNewServer = true
     else if (runOpts.serverId) opts.serverId = Number(runOpts.serverId)
     if (runOpts.startFrom) opts.startFrom = Number(runOpts.startFrom)
+    if (runOpts.customProvider) opts.customProvider = runOpts.customProvider
+    if (runOpts.customModel.trim()) opts.customModel = runOpts.customModel.trim()
     const r = await domainActions.runPipeline(runModalDomain, opts)
     if (r.ok) {
       setRunModalDomain(null)
@@ -313,20 +324,35 @@ function DomainsPageInner() {
     show(r.ok ? "ok" : "err", r.message ?? r.error ?? "")
     await refresh(); setBusy(null)
   }
+  function describeBulkOverrides(): string {
+    const parts: string[] = []
+    if (bulkSkipPurchase) parts.push("Skip purchase = ON")
+    if (bulkServerId === "__new__") parts.push("Server = NEW droplet")
+    else if (bulkServerId) parts.push(`Server = #${bulkServerId}`)
+    if (bulkCustomProvider) parts.push(`LLM = ${bulkCustomProvider}${bulkCustomModel ? ` / ${bulkCustomModel}` : ""}`)
+    return parts.length ? `\n\nOverrides: ${parts.join(", ")}` : ""
+  }
   async function bulkRun() {
     if (!confirm(
       `Run pipeline on ${selected.size} domain(s) IN PARALLEL?\n\n` +
       `Up to SSR_JOB_WORKERS (default 4, configurable) run at the same time. ` +
-      `Best when domains are spread across multiple CF keys / servers.`,
+      `Best when domains are spread across multiple CF keys / servers.` +
+      describeBulkOverrides(),
     )) return
     setBusy("bulk")
-    const opts: { skipPurchase?: boolean; serverId?: number; forceNewServer?: boolean } = {}
+    const opts: {
+      skipPurchase?: boolean; serverId?: number; forceNewServer?: boolean
+      customProvider?: string; customModel?: string
+    } = {}
     if (bulkSkipPurchase) opts.skipPurchase = true
     if (bulkServerId === "__new__") opts.forceNewServer = true
     else if (bulkServerId) opts.serverId = Number(bulkServerId)
+    if (bulkCustomProvider) opts.customProvider = bulkCustomProvider
+    if (bulkCustomModel.trim()) opts.customModel = bulkCustomModel.trim()
     const r = await domainActions.runBulk([...selected], opts) as { ok?: boolean; message?: string; error?: string }
     show(r.ok ? "ok" : "err", String(r.message ?? r.error ?? ""))
     setSelected(new Set()); setBulkSkipPurchase(false); setBulkServerId("")
+    setBulkCustomProvider(""); setBulkCustomModel("")
     await refresh(); setBusy(null)
   }
   async function bulkRunSequential() {
@@ -335,16 +361,23 @@ function DomainsPageInner() {
       `Domains process in order — the next starts only after the previous ` +
       `finishes (or fails). Smallest blast radius on external APIs; longest ` +
       `total wall-time. Good for small batches (5–10) or when you want a ` +
-      `predictable order.`,
+      `predictable order.` +
+      describeBulkOverrides(),
     )) return
     setBusy("bulk")
-    const opts: { skipPurchase?: boolean; serverId?: number; forceNewServer?: boolean } = {}
+    const opts: {
+      skipPurchase?: boolean; serverId?: number; forceNewServer?: boolean
+      customProvider?: string; customModel?: string
+    } = {}
     if (bulkSkipPurchase) opts.skipPurchase = true
     if (bulkServerId === "__new__") opts.forceNewServer = true
     else if (bulkServerId) opts.serverId = Number(bulkServerId)
+    if (bulkCustomProvider) opts.customProvider = bulkCustomProvider
+    if (bulkCustomModel.trim()) opts.customModel = bulkCustomModel.trim()
     const r = await domainActions.runBulkSequential([...selected], opts) as { ok?: boolean; message?: string; error?: string }
     show(r.ok ? "ok" : "err", String(r.message ?? r.error ?? ""))
     setSelected(new Set()); setBulkSkipPurchase(false); setBulkServerId("")
+    setBulkCustomProvider(""); setBulkCustomModel("")
     await refresh(); setBusy(null)
   }
   // ---- Bulk migrate-to-server dialog ----
@@ -970,6 +1003,35 @@ function DomainsPageInner() {
                 ))}
               </SelectContent>
             </Select>
+            <Select
+              value={bulkCustomProvider || "__default__"}
+              onValueChange={(v) => setBulkCustomProvider(v === "__default__" ? "" : v)}
+            >
+              <SelectTrigger
+                size="sm" className="h-8 min-w-[180px] text-small"
+                title="Override the default LLM provider for step 9 across this entire batch — useful when the default key is rate-limited"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__default__">LLM: default (from Settings)</SelectItem>
+                <SelectItem value="anthropic">LLM: Anthropic (Claude)</SelectItem>
+                <SelectItem value="openai">LLM: OpenAI (GPT)</SelectItem>
+                <SelectItem value="gemini">LLM: Google Gemini</SelectItem>
+                <SelectItem value="openrouter">LLM: OpenRouter</SelectItem>
+                <SelectItem value="moonshot">LLM: Moonshot Kimi</SelectItem>
+                <SelectItem value="cloudflare">LLM: Cloudflare Workers AI</SelectItem>
+                <SelectItem value="cloudflare_pool">LLM: Cloudflare Workers AI POOL</SelectItem>
+              </SelectContent>
+            </Select>
+            <div className="w-[220px]" title="Override the model id for step 9 across this batch. Empty = provider default.">
+              <ModelPicker
+                provider={bulkCustomProvider || "anthropic"}
+                value={bulkCustomModel}
+                onChange={setBulkCustomModel}
+                size="sm"
+              />
+            </div>
 
             <ButtonGroup>
               <Button
@@ -1104,6 +1166,37 @@ function DomainsPageInner() {
               ))}
             </SelectContent>
           </Select>
+        </Field>
+        <Field>
+          <FieldLabel>Step 9 LLM override</FieldLabel>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <Select
+              value={runOpts.customProvider || "__default__"}
+              onValueChange={(v) => setRunOpts((o) => ({ ...o, customProvider: v === "__default__" ? "" : v }))}
+            >
+              <SelectTrigger size="sm" className="h-8 text-small"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__default__">(use default from Settings)</SelectItem>
+                <SelectItem value="anthropic">Anthropic (Claude)</SelectItem>
+                <SelectItem value="openai">OpenAI (GPT)</SelectItem>
+                <SelectItem value="gemini">Google Gemini</SelectItem>
+                <SelectItem value="openrouter">OpenRouter</SelectItem>
+                <SelectItem value="moonshot">Moonshot Kimi</SelectItem>
+                <SelectItem value="cloudflare">Cloudflare Workers AI (single)</SelectItem>
+                <SelectItem value="cloudflare_pool">Cloudflare Workers AI POOL</SelectItem>
+              </SelectContent>
+            </Select>
+            <ModelPicker
+              provider={runOpts.customProvider || "anthropic"}
+              value={runOpts.customModel}
+              onChange={(v) => setRunOpts((o) => ({ ...o, customModel: v }))}
+              size="sm"
+            />
+          </div>
+          <FieldDescription>
+            Routes step 9 to a different LLM than the default for this run only — useful when your
+            primary key is rate-limited. Empty model = provider default.
+          </FieldDescription>
         </Field>
         <div className="rounded-md border border-border/60 p-3">
           <div className="flex items-center justify-between gap-2">

@@ -4,14 +4,43 @@ import { listDomains } from "@/lib/repos/domains"
 
 export const runtime = "nodejs"
 
-/** Bulk pipeline by domain ID list. */
+/**
+ * Bulk pipeline by domain ID list. Accepts BOTH FormData (legacy /domains
+ * page client) AND JSON (any new client wanting to send custom_provider /
+ * custom_model). Same field shape either way.
+ */
 export async function POST(req: NextRequest): Promise<Response> {
-  const form = await req.formData().catch(() => null)
-  const domainIds = (form?.getAll("domain_ids") ?? []).map((v) => String(v))
-  const skipPurchase = ((form?.get("skip_purchase") as string | null) || "") === "on"
-  const serverIdRaw = ((form?.get("server_id") as string | null) || "").trim()
-  const serverId = serverIdRaw ? Number.parseInt(serverIdRaw, 10) : null
-  const forceNewServer = ((form?.get("force_new_server") as string | null) || "") === "on"
+  const ct = req.headers.get("content-type") ?? ""
+  let domainIds: string[] = []
+  let skipPurchase = false
+  let serverId: number | null = null
+  let forceNewServer = false
+  let customProvider: string | null = null
+  let customModel: string | null = null
+  const trimOrNull = (v: unknown): string | null => {
+    if (typeof v !== "string") return null
+    const t = v.trim()
+    return t || null
+  }
+  if (ct.includes("application/json")) {
+    const body = (await req.json().catch(() => ({}))) as Record<string, unknown>
+    domainIds = Array.isArray(body.domain_ids) ? (body.domain_ids as unknown[]).map(String) : []
+    skipPurchase = body.skip_purchase === true || body.skip_purchase === "on"
+    forceNewServer = body.force_new_server === true || body.force_new_server === "on"
+    const sid = trimOrNull(body.server_id)
+    serverId = sid ? Number.parseInt(sid, 10) : null
+    customProvider = trimOrNull(body.custom_provider)
+    customModel = trimOrNull(body.custom_model)
+  } else {
+    const form = await req.formData().catch(() => null)
+    domainIds = (form?.getAll("domain_ids") ?? []).map((v) => String(v))
+    skipPurchase = ((form?.get("skip_purchase") as string | null) || "") === "on"
+    forceNewServer = ((form?.get("force_new_server") as string | null) || "") === "on"
+    const sid = trimOrNull(form?.get("server_id"))
+    serverId = sid ? Number.parseInt(sid, 10) : null
+    customProvider = trimOrNull(form?.get("custom_provider"))
+    customModel = trimOrNull(form?.get("custom_model"))
+  }
   const idSet = new Set(domainIds)
   const domainsList = listDomains()
     .filter((d) => idSet.has(String(d.id)))
@@ -19,7 +48,9 @@ export async function POST(req: NextRequest): Promise<Response> {
   if (!domainsList.length) {
     return NextResponse.json({ ok: false, error: "No matching domains" }, { status: 400 })
   }
-  const result = runBulkPipeline(domainsList, { skipPurchase, serverId, forceNewServer })
+  const result = runBulkPipeline(domainsList, {
+    skipPurchase, serverId, forceNewServer, customProvider, customModel,
+  })
   if (result.enqueued === 0) {
     return NextResponse.json({
       ok: false,

@@ -10,6 +10,7 @@ import {
   Cloud,
   Globe,
   Upload,
+  Trash2,
   ShieldCheck,
   Zap,
   MoreHorizontal,
@@ -90,6 +91,10 @@ interface ZonesListResult {
 export default function CloudflarePage() {
   const [expanded, setExpanded] = React.useState<string | null>(null)
   const [selected, setSelected] = React.useState<Set<string>>(new Set())
+  // Row-level checkbox selection of CF KEYS (separate from `selected` which
+  // tracks selected DOMAINS within an expanded key's panel for the bulk
+  // IP / SSL forms).
+  const [keysSelected, setKeysSelected] = React.useState<Set<number>>(new Set())
   const { rows: CF_KEYS, domainsByKey, refresh } = useCfKeys()
   const [busy, setBusy] = React.useState<string | null>(null)
   const [flash, setFlash] = React.useState<{ kind: "ok" | "err"; text: string } | null>(null)
@@ -270,6 +275,121 @@ export default function CloudflarePage() {
     }
   }
 
+  // ---- Bulk add CF keys (CSV paste OR file upload) ----
+  // CSV header: email,api_key,alias  (alias optional; `name` accepted as alias)
+  const [bulkAddOpen, setBulkAddOpen] = React.useState(false)
+  const [bulkAddText, setBulkAddText] = React.useState("")
+  const [bulkAddFile, setBulkAddFile] = React.useState<File | null>(null)
+  const [bulkAddResult, setBulkAddResult] = React.useState<
+    { added: number; errored: number; results: { email: string; ok: boolean; error?: string }[] } | null
+  >(null)
+  function openBulkAdd() {
+    setBulkAddText("")
+    setBulkAddFile(null)
+    setBulkAddResult(null)
+    setBulkAddOpen(true)
+  }
+  async function submitBulkAdd() {
+    if (!bulkAddFile && !bulkAddText.trim()) {
+      show("err", "Paste CSV or pick a file first")
+      return
+    }
+    setBusy("bulk-add")
+    const r = await cfKeyActions.bulkAddCsv(bulkAddText, bulkAddFile ?? undefined) as
+      { ok?: boolean; submitted?: number; added?: number; errored?: number;
+        results?: { email: string; ok: boolean; error?: string }[]; error?: string; message?: string }
+    if (!r.ok) {
+      show("err", r.error ?? "Bulk add failed")
+    } else {
+      show(r.errored && r.errored > 0 ? "err" : "ok", r.message ?? "")
+      setBulkAddResult({
+        added: r.added ?? 0, errored: r.errored ?? 0, results: r.results ?? [],
+      })
+    }
+    await refresh()
+    setBusy(null)
+  }
+
+  // ---- Bulk delete CF keys (selected via row checkboxes) ----
+  async function bulkDeleteKeys() {
+    const ids = [...keysSelected]
+    if (ids.length === 0) return
+    if (!confirm(
+      `Delete ${ids.length} CF key(s)?\n\n` +
+      `Keys with referencing domains stay (can't strand a domain by yanking its key). ` +
+      `Soft-delete those domains first if you really want the keys gone.`,
+    )) return
+    setBusy("bulk-del-keys")
+    const r = await cfKeyActions.bulkDelete(ids) as
+      { ok?: boolean; deleted?: number; blocked?: number; message?: string; error?: string;
+        results?: { id: number; email?: string | null; alias?: string | null; ok: boolean; reason?: string }[] }
+    if (!r.ok) {
+      show("err", r.error ?? "Bulk delete failed")
+    } else {
+      const blocked = r.results?.filter((x) => !x.ok) ?? []
+      const blockedDetail = blocked.length
+        ? blocked.slice(0, 3)
+            .map((x) => `${x.alias ?? x.email ?? x.id} — ${x.reason ?? "?"}`)
+            .join(" · ") +
+          (blocked.length > 3 ? ` (+${blocked.length - 3} more)` : "")
+        : ""
+      show(blocked.length ? "err" : "ok",
+        (r.message ?? "") + (blockedDetail ? ` · ${blockedDetail}` : ""))
+    }
+    setKeysSelected(new Set())
+    await refresh()
+    setBusy(null)
+  }
+
+  // ---- Sync from CF — drift report across every active key ----
+  // Walks the CF API for every active key, lists its zones, and surfaces
+  // three classes of drift against the domains table:
+  //   - SSR orphans (DB row claims cf_zone_id but CF doesn't list it)
+  //   - CF zones not tracked in DB
+  //   - Backfillable: DB cf_zone_id is null but a name match exists on CF
+  //     (auto-fixed in place; the "completed" toast counts how many flipped)
+  async function syncFromCf() {
+    if (!confirm(
+      "Walk every active CF key, list zones, and reconcile against the domains table?\n\n" +
+      "Auto-fixes: backfills cf_zone_id when a name match exists on CF.\n" +
+      "Reports (manual review): SSR rows whose CF zone is gone, and CF zones not tracked in DB.",
+    )) return
+    setBusy("cfsync")
+    const r = await cfKeyActions.sync() as {
+      ok?: boolean
+      summary?: { keys_synced: number; ssr_orphans: number; cf_untracked: number; backfilled: number; errors: number }
+      message?: string
+      error?: string
+    }
+    if (!r.ok) {
+      show("err", r.error ?? "Sync failed")
+    } else {
+      show("ok", r.message ?? "Sync complete")
+    }
+    await refresh(); setBusy(null)
+  }
+
+  // ---- Operator-initiated status refresh ----
+  // Probes every hosted/live domain under a CF key once and flips status
+  // based on the response. Decisive (single 2xx/3xx → live) because the
+  // operator explicitly asked. Solves the gap when the background live-
+  // checker is OFF (Flask-side default).
+  const [statusRefreshing, setStatusRefreshing] = React.useState<Record<number, boolean>>({})
+  async function refreshStatus(keyId: number) {
+    setStatusRefreshing((m) => ({ ...m, [keyId]: true }))
+    try {
+      const r = await fetch(`/api/cf-keys/${keyId}/refresh-status`, {
+        method: "POST", credentials: "same-origin",
+      })
+      const j = (await r.json()) as { ok?: boolean; message?: string; flipped?: number; error?: string }
+      if (!r.ok || !j.ok) { show("err", j.error ?? "Status refresh failed"); return }
+      show("ok", j.message ?? `Refreshed ${j.flipped ?? 0} flipped`)
+      await refresh()
+    } finally {
+      setStatusRefreshing((m) => ({ ...m, [keyId]: false }))
+    }
+  }
+
   // ---- Per-key inline bulk forms (A-record / SSL+HTTPS) ----
   const [ipDraft, setIpDraft] = React.useState<{ keyId: number | null; ip: string; proxied: boolean }>(
     { keyId: null, ip: "", proxied: true },
@@ -359,6 +479,22 @@ export default function CloudflarePage() {
           >
             <RefreshCw className={cn("h-3.5 w-3.5", busy === "refresh" && "animate-spin")} /> Refresh Account IDs
           </Button>
+          <Button
+            variant="outline" size="sm"
+            className="gap-1.5 hidden sm:inline-flex btn-soft-warning"
+            onClick={syncFromCf} disabled={busy === "cfsync"}
+            title="Walk every active CF key, list its zones, reconcile against the domains table — auto-backfills cf_zone_id when name matches CF, reports orphans + untracked zones for review"
+          >
+            <RefreshCw className={cn("h-3.5 w-3.5", busy === "cfsync" && "animate-spin")} /> Sync from CF
+          </Button>
+          <Button
+            variant="outline" size="sm"
+            className="gap-1.5 hidden sm:inline-flex btn-soft-warning"
+            onClick={openBulkAdd}
+            title="Paste a CSV (or upload a file) of multiple CF keys at once. Header row needs email + api_key, optional alias."
+          >
+            <Upload className="h-3.5 w-3.5" /> Bulk add
+          </Button>
           <Button size="sm" className="gap-1.5 btn-warning" onClick={openAdd}>
             <Plus className="h-3.5 w-3.5" /> Add CF Key
           </Button>
@@ -427,9 +563,59 @@ export default function CloudflarePage() {
             </div>
           </DataTableToolbar>
 
+          {keysSelected.size > 0 && (
+            <div className="sticky top-[56px] z-10 -mx-1 mb-2 flex flex-wrap items-center gap-3 rounded-md border border-status-terminal/40 bg-status-terminal/5 px-3 py-2 text-small">
+              <span className="font-medium">
+                {keysSelected.size} key{keysSelected.size === 1 ? "" : "s"} selected
+              </span>
+              <span className="mx-1 h-4 w-px bg-border" aria-hidden />
+              <Button
+                size="sm" variant="outline"
+                className="gap-1.5 btn-soft-destructive"
+                onClick={bulkDeleteKeys} disabled={busy === "bulk-del-keys"}
+                title="Delete the selected CF keys (rows with referencing domains will be skipped)"
+              >
+                <Trash2 className="h-3.5 w-3.5" /> Delete selected
+              </Button>
+              <Button
+                size="sm" variant="ghost" className="ml-auto"
+                onClick={() => setKeysSelected(new Set())}
+                title="Clear selection"
+              >
+                Clear
+              </Button>
+            </div>
+          )}
+
           <DataTable>
             <DataTableHead>
               <DataTableRow>
+                <DataTableHeaderCell className="w-8">
+                  <input
+                    type="checkbox"
+                    aria-label="Select all keys on this page"
+                    checked={
+                      filteredKeys.length > 0 &&
+                      filteredKeys.every((k) => keysSelected.has(Number(k.id)))
+                    }
+                    ref={(el) => {
+                      if (!el) return
+                      const allOn = filteredKeys.length > 0 &&
+                        filteredKeys.every((k) => keysSelected.has(Number(k.id)))
+                      const someOn = filteredKeys.some((k) => keysSelected.has(Number(k.id)))
+                      el.indeterminate = !allOn && someOn
+                    }}
+                    onChange={(e) => {
+                      const next = new Set(keysSelected)
+                      if (e.target.checked) {
+                        for (const k of filteredKeys) next.add(Number(k.id))
+                      } else {
+                        for (const k of filteredKeys) next.delete(Number(k.id))
+                      }
+                      setKeysSelected(next)
+                    }}
+                  />
+                </DataTableHeaderCell>
                 <DataTableHeaderCell className="w-9" />
                 <DataTableHeaderCell>Key label</DataTableHeaderCell>
                 <DataTableHeaderCell>Email</DataTableHeaderCell>
@@ -453,6 +639,19 @@ export default function CloudflarePage() {
                 return (
                   <React.Fragment key={k.id}>
                     <DataTableRow selected={isOpen}>
+                      <DataTableCell>
+                        <input
+                          type="checkbox"
+                          aria-label={`Select ${k.alias || k.email}`}
+                          checked={keysSelected.has(Number(k.id))}
+                          onChange={(e) => {
+                            const next = new Set(keysSelected)
+                            if (e.target.checked) next.add(Number(k.id))
+                            else next.delete(Number(k.id))
+                            setKeysSelected(next)
+                          }}
+                        />
+                      </DataTableCell>
                       <DataTableCell>
                         <button
                           onClick={() => toggleRow(k.id)}
@@ -561,7 +760,7 @@ export default function CloudflarePage() {
 
                     {isOpen && (
                       <tr>
-                        <td colSpan={8} className="bg-muted/30 p-0 border-b border-border">
+                        <td colSpan={9} className="bg-muted/30 p-0 border-b border-border">
                           <div className="px-4 py-3">
                             <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
                               <div className="flex items-center gap-2">
@@ -603,6 +802,15 @@ export default function CloudflarePage() {
                                 >
                                   <RefreshCw className={cn("h-3.5 w-3.5", zoneLoading[Number(k.id)] && "animate-spin")} />
                                   Load CF settings
+                                </Button>
+                                <Button
+                                  variant="outline" size="sm" className="gap-1.5 btn-soft-success"
+                                  onClick={() => refreshStatus(Number(k.id))}
+                                  disabled={statusRefreshing[Number(k.id)]}
+                                  title="HTTPS-probe every hosted/live domain under this key and flip status to 'live' (or back to 'hosted' on failure). Use when the background live-checker is OFF and rows show 'hosted' even though the sites respond 200."
+                                >
+                                  <RefreshCw className={cn("h-3.5 w-3.5", statusRefreshing[Number(k.id)] && "animate-spin")} />
+                                  Refresh status
                                 </Button>
                               </ButtonGroup>
 
@@ -825,7 +1033,7 @@ export default function CloudflarePage() {
               })}
               {filteredKeys.length === 0 && CF_KEYS.length > 0 && (
                 <tr>
-                  <td colSpan={8} className="px-4 py-8 text-center text-small text-muted-foreground">
+                  <td colSpan={9} className="px-4 py-8 text-center text-small text-muted-foreground">
                     No keys match {JSON.stringify(search)}.
                   </td>
                 </tr>
@@ -891,6 +1099,77 @@ export default function CloudflarePage() {
           />
           <FieldDescription>For your own labeling — shown in the Alias column.</FieldDescription>
         </Field>
+      </OperatorDialog>
+
+      {/* ---------- Bulk add CF keys (CSV paste / file upload) ---------- */}
+      <OperatorDialog
+        open={bulkAddOpen}
+        onOpenChange={(o) => { if (!o) setBulkAddOpen(false) }}
+        title="Bulk add CF keys"
+        description="Paste a CSV or upload a file. Header row needs columns: email, api_key, alias (alias is optional; `name` accepted as alias). Each row is verified against CF /accounts before insert — bad rows fail individually without aborting the batch."
+        submitLabel={bulkAddResult ? "Done" : "Add all"}
+        onSubmit={bulkAddResult ? () => setBulkAddOpen(false) : submitBulkAdd}
+      >
+        {!bulkAddResult ? (
+          <>
+            <Field>
+              <FieldLabel>CSV file</FieldLabel>
+              <input
+                type="file"
+                accept=".csv,text/csv,text/plain"
+                onChange={(e) => setBulkAddFile(e.target.files?.[0] ?? null)}
+                className="text-small"
+              />
+              <FieldDescription>
+                Or paste below — file takes precedence if both are provided.
+              </FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>Or paste CSV text</FieldLabel>
+              <textarea
+                value={bulkAddText}
+                onChange={(e) => setBulkAddText(e.target.value)}
+                rows={10}
+                placeholder={"email,api_key,alias\ncf1@example.com,abcdef0123…,CF1\ncf2@example.com,fedcba9876…,CF2"}
+                className="w-full rounded-md border border-border/60 bg-background p-2 font-mono text-small"
+              />
+              <FieldDescription>
+                Header row is required. Empty lines and blank rows are skipped automatically.
+              </FieldDescription>
+            </Field>
+          </>
+        ) : (
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center gap-3 rounded-md border border-border/60 px-3 py-2 text-small">
+              <span className="text-status-completed font-semibold">✓ {bulkAddResult.added} added</span>
+              {bulkAddResult.errored > 0 && (
+                <span className="text-status-terminal font-semibold">✗ {bulkAddResult.errored} errored</span>
+              )}
+            </div>
+            <div className="max-h-[40vh] overflow-y-auto rounded-md border border-border/60">
+              <table className="w-full text-small">
+                <thead className="border-b border-border/60 bg-muted/40">
+                  <tr>
+                    <th className="px-2 py-1 text-left font-medium">Email</th>
+                    <th className="px-2 py-1 text-left font-medium">Result</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {bulkAddResult.results.map((r, i) => (
+                    <tr key={i} className="border-b border-border/30 last:border-0">
+                      <td className="px-2 py-1 font-mono text-micro">{r.email}</td>
+                      <td className="px-2 py-1 text-micro">
+                        {r.ok
+                          ? <span className="text-status-completed">added</span>
+                          : <span className="text-status-terminal" title={r.error}>{r.error ?? "failed"}</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
       </OperatorDialog>
 
       {/* ---------- Edit CF key dialog ---------- */}

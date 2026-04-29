@@ -22,6 +22,10 @@ const STRING_FIELDS = [
   "llm_provider", "llm_api_key", "llm_model",
   "llm_api_key_anthropic", "llm_api_key_openai",
   "llm_api_key_gemini", "llm_api_key_openrouter",
+  "llm_api_key_moonshot",
+  "llm_timeout_ms",
+  "llm_max_output_tokens",
+  "cloudflare_account_id", "cloudflare_workers_ai_token",
   "smtp_server", "smtp_port", "smtp_email", "smtp_password", "notify_email",
   "telegram_bot_token", "telegram_chat_id",
   "whatsapp_provider", "whatsapp_phone", "whatsapp_apikey",
@@ -43,6 +47,12 @@ const CHECKBOX_FIELDS = [
   "whatsapp_enabled",
   "sms_enabled",
   "migrate_always_provision_new",
+  // Only openai (codex) has a CLI panel now. The gemini CLI panel was
+  // removed because gemini-cli ≥ 0.38 hard-rejects non-interactive OAuth.
+  // The setting key llm_cli_enabled_gemini is no longer accepted on writes
+  // — any stale "1" left in the DB is harmless because website-generator's
+  // CLI_CAPABLE_PROVIDERS no longer includes "gemini" so cliMode can't fire.
+  "llm_cli_enabled_openai",
 ] as const
 
 /**

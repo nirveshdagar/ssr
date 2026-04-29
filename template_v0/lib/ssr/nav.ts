@@ -8,6 +8,7 @@ import {
   ShieldCheck,
   Settings,
   Boxes,
+  Sparkles,
   type LucideIcon,
 } from "lucide-react"
 
@@ -23,7 +24,7 @@ export type NavAccent =
   | "sa"
 
 /** Keys the sidebar can pull from /api/status counts to render a live badge. */
-export type NavBadgeKey = "domains" | "servers" | "cf_keys" | "active_watchers"
+export type NavBadgeKey = "domains" | "servers" | "cf_keys" | "active_watchers" | "watcher_runs"
 
 export type NavItem = {
   label: string
@@ -44,11 +45,12 @@ export type NavItem = {
  */
 export const NAV_ITEMS: NavItem[] = [
   { label: "Dashboard", href: "/", icon: LayoutDashboard, accent: "dashboard" },
+  { label: "AI Generator", href: "/ai-generator", icon: Sparkles, accent: "domains" },
   { label: "Domains", href: "/domains", icon: Globe, badgeKey: "domains", accent: "domains" },
   { label: "Servers", href: "/servers", icon: Server, badgeKey: "servers", accent: "servers" },
   { label: "ServerAvatar", href: "/serveravatar", icon: Boxes, accent: "sa" },
   { label: "Cloudflare", href: "/cloudflare", icon: Cloud, badgeKey: "cf_keys", accent: "cloudflare" },
-  { label: "Watcher", href: "/watcher", icon: Activity, badgeKey: "active_watchers", accent: "watcher" },
+  { label: "Watcher", href: "/watcher", icon: Activity, badgeKey: "watcher_runs", accent: "watcher" },
   { label: "Logs", href: "/logs", icon: ScrollText, accent: "logs" },
   { label: "Audit Log", href: "/audit", icon: ShieldCheck, accent: "audit" },
   { label: "Settings", href: "/settings", icon: Settings, accent: "settings" },

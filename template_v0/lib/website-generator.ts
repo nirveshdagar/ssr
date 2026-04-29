@@ -14,8 +14,16 @@
  */
 
 import { getSetting } from "./repos/settings"
+import { getMasterPrompt } from "./master-prompt"
 import { logPipeline } from "./repos/logs"
 import { withSemaphore, getSemaphore } from "./concurrency"
+import { runLlmCli, type CliProvider } from "./llm-cli"
+import {
+  AiPoolExhausted,
+  getNextAiKey,
+  recordAiKeyCall,
+  recordAiKeyError,
+} from "./cf-ai-pool"
 
 // Cap concurrent LLM calls so a 50-fan-out doesn't blow per-account RPM/TPM
 // quotas. Override with SSR_LLM_CONCURRENCY (min 1).
@@ -24,6 +32,22 @@ const LLM_CAP = Math.max(
   Number.parseInt(process.env.SSR_LLM_CONCURRENCY ?? "", 10) || 8,
 )
 
+/**
+ * Per-call HTTP timeout for LLM API calls. Default 5 min — reasoning models
+ * (K2.6, deepseek-r1) routinely spend 60-120s on chain-of-thought BEFORE
+ * emitting the first answer token, so the previous 120s ceiling was tripping
+ * legitimate slow generations. Override via SSR_LLM_TIMEOUT_MS or the
+ * `llm_timeout_ms` setting (setting wins). Min 30s, max 15 min.
+ */
+function getLlmTimeoutMs(): number {
+  const fromSetting = parseInt(getSetting("llm_timeout_ms") || "", 10)
+  const fromEnv = parseInt(process.env.SSR_LLM_TIMEOUT_MS ?? "", 10)
+  const raw = Number.isFinite(fromSetting) && fromSetting > 0
+    ? fromSetting
+    : Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : 300_000
+  return Math.min(Math.max(raw, 30_000), 15 * 60_000)
+}
+
 // ---------------------------------------------------------------------------
 // Provider config
 // ---------------------------------------------------------------------------
@@ -31,19 +55,182 @@ const LLM_CAP = Math.max(
 interface LlmConfig {
   provider: string
   apiKey: string
+  /** When true, ignore apiKey and shell out to the provider's local CLI
+   *  (gemini / codex). Only valid for providers in CLI_CAPABLE_PROVIDERS. */
+  cliMode: boolean
 }
 
-function getLlmConfig(): LlmConfig {
-  const provider = (getSetting("llm_provider") || "anthropic").trim().toLowerCase()
+// Only OpenAI's codex CLI gets the spawn-based login flow now. Gemini was
+// removed because gemini-cli ≥ 0.38 hard-rejects non-interactive OAuth and
+// the dashboard-handled OAuth fallback was fragile across version bumps.
+// Gemini still works via API-key path (settings → llm_api_key_gemini).
+const CLI_CAPABLE_PROVIDERS: ReadonlySet<string> = new Set(["openai"])
+
+function isCliEnabled(provider: string): boolean {
+  if (!CLI_CAPABLE_PROVIDERS.has(provider)) return false
+  return (getSetting(`llm_cli_enabled_${provider}`) || "0") === "1"
+}
+
+function getLlmConfig(providerOverride?: string | null): LlmConfig {
+  // Per-call override (e.g. the Regenerate dialog picked a specific provider
+  // for this run only) wins over the global setting. Empty / null falls back
+  // to the configured default.
+  const override = (providerOverride ?? "").trim().toLowerCase()
+  const provider = override || (getSetting("llm_provider") || "anthropic").trim().toLowerCase()
+  const cliMode = isCliEnabled(provider)
+  if (cliMode) {
+    return { provider, apiKey: "", cliMode: true }
+  }
+  // Cloudflare Workers AI uses its own settings keys (cloudflare_account_id +
+  // cloudflare_workers_ai_token) — surface the token through the same apiKey
+  // field so the downstream branch doesn't need a second config call.
+  if (provider === "cloudflare") {
+    const apiKey = (getSetting("cloudflare_workers_ai_token") || "").trim()
+    if (!apiKey) {
+      throw new Error(
+        "cloudflare_workers_ai_token is empty — set it in Settings → LLM " +
+        "(create a Workers AI token at dash.cloudflare.com → My Profile → API Tokens)",
+      )
+    }
+    return { provider, apiKey, cliMode: false }
+  }
+  // cloudflare_pool: per-call credentials come from cf-ai-pool.getNextAiKey().
+  // No apiKey at config time; the generation branch picks one per attempt and
+  // retries against the next row on 429/quota errors.
+  if (provider === "cloudflare_pool") {
+    return { provider, apiKey: "", cliMode: false }
+  }
   const perProvider = getSetting(`llm_api_key_${provider}`) || ""
   const apiKey = perProvider || getSetting("llm_api_key") || ""
   if (!apiKey) {
     throw new Error(
       `No API key set for provider '${provider}'. ` +
-      `Paste one into Settings → llm_api_key_${provider} (or the generic llm_api_key).`,
+      `Paste one into Settings → llm_api_key_${provider} (or the generic llm_api_key), ` +
+      `or enable Use-local-CLI-auth for gemini/openai.`,
     )
   }
-  return { provider, apiKey }
+  return { provider, apiKey, cliMode: false }
+}
+
+// ---------------------------------------------------------------------------
+// Cloudflare Workers AI helper — shared between the single-account
+// `cloudflare` branch and the round-robin `cloudflare_pool` branch.
+// ---------------------------------------------------------------------------
+
+interface CloudflareCallArgs {
+  accountId: string
+  token: string
+  model: string
+  systemMsg: string
+  userMsg: string
+  maxTokens: number
+}
+
+async function callCloudflareWorkersAi(args: CloudflareCallArgs): Promise<{
+  text: string
+  usage: UsageInfo
+}> {
+  const { accountId, token, model, systemMsg, userMsg, maxTokens } = args
+  // K2.6 (and other reasoning models on CF Workers AI) split their output
+  // budget between `reasoning_content` (chain-of-thought) and `content`
+  // (the actual answer). With max_completion_tokens=3500 and a long brief,
+  // the reasoning eats the whole budget — content stays null and the call
+  // returns finish_reason="length" with nothing usable.
+  // Bump the cap for reasoning models so reasoning + answer both fit.
+  const isReasoningModel = /kimi-k2|deepseek-r1|qwq|reasoning/i.test(model)
+  const effectiveMaxTokens = isReasoningModel ? Math.max(maxTokens, 16_000) : maxTokens
+  const res = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${model}`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messages: [
+          { role: "system", content: systemMsg },
+          { role: "user", content: userMsg },
+        ],
+        max_completion_tokens: effectiveMaxTokens,
+      }),
+      signal: AbortSignal.timeout(getLlmTimeoutMs()),
+    },
+  )
+  if (!res.ok) {
+    throw new Error(`cloudflare HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`)
+  }
+  // CF Workers AI returns TWO different shapes depending on the model:
+  //   - Older / "function" models: { result: { response: "..." | choices: [...] }, success, errors }
+  //   - Newer chat-completion models (K2.6, llama-3.1-instruct, etc): top-level
+  //     OpenAI shape — { id, model, choices: [{ message: { content } }], usage }
+  //     with NO result envelope and NO success flag.
+  // We try both. If neither yields text, log the raw body so the next pass
+  // shows us what shape we got.
+  type Choice = {
+    message?: { content?: string | null; reasoning_content?: string | null }
+    finish_reason?: string
+  }
+  type Usage = { prompt_tokens?: number; completion_tokens?: number }
+  const apiBody = (await res.json()) as {
+    success?: boolean
+    errors?: { message?: string }[]
+    result?: { response?: string; choices?: Choice[]; usage?: Usage }
+    // Top-level OpenAI shape:
+    choices?: Choice[]
+    usage?: Usage
+    response?: string
+  }
+  if (apiBody.success === false) {
+    const msg = (apiBody.errors ?? []).map((e) => e.message).filter(Boolean).join("; ") || "unknown"
+    throw new Error(`cloudflare workers-ai error: ${msg}`)
+  }
+  const r = apiBody.result ?? {}
+  const choice = r.choices?.[0] ?? apiBody.choices?.[0]
+  const text = (choice?.message?.content ?? r.response ?? apiBody.response ?? "") || ""
+  const u: Usage = (r.usage ?? apiBody.usage ?? {}) as Usage
+  if (!text) {
+    // Reasoning model overflow detection — the model spent all its tokens
+    // on `reasoning_content` and never wrote the actual answer. Specific
+    // error so the operator (or future me) doesn't have to dig the JSON.
+    const reasoning = choice?.message?.reasoning_content
+    const finish = choice?.finish_reason
+    if (finish === "length" && reasoning) {
+      throw new Error(
+        `cloudflare workers-ai: ${model} ran out of tokens during reasoning ` +
+        `(finish_reason=length, reasoning_content=${reasoning.length} chars, content=null). ` +
+        `Bump llm_max_output_tokens in /settings to 16000+, OR switch to a non-reasoning model ` +
+        `(@cf/meta/llama-3.3-70b-instruct, @cf/google/gemma-3-27b-it).`,
+      )
+    }
+    const sample = JSON.stringify(apiBody).slice(0, 600)
+    throw new Error(`cloudflare workers-ai returned empty content. Body: ${sample}`)
+  }
+  return {
+    text,
+    usage: {
+      input_tokens: u.prompt_tokens ?? null,
+      output_tokens: u.completion_tokens ?? null,
+    },
+  }
+}
+
+/**
+ * Detect failures that mean "this row is rate-limited or out of free-tier
+ * neurons" — the only class we want the pool to retry with a different row.
+ * Surface message can be the HTTP status string or CF's success=false body.
+ */
+function isCloudflareQuotaError(msg: string): boolean {
+  const m = msg.toLowerCase()
+  return (
+    m.includes("http 429") ||
+    m.includes("rate limit") ||
+    m.includes("rate-limit") ||
+    m.includes("quota") ||
+    m.includes("neuron") ||
+    m.includes("daily limit") ||
+    m.includes("usage limit")
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -90,11 +277,18 @@ export async function generateWebsite(
   style = "modern",
 ): Promise<string> {
   logPipeline(domain, "generate_site", "running", `Generating site (${niche}, ${style})`)
-  const { provider, apiKey } = getLlmConfig()
+  const { provider, apiKey, cliMode } = getLlmConfig()
   const prompt = LEGACY_PROMPT_TEMPLATE(domain, niche, style)
   try {
     let html: string
-    if (provider === "openai") {
+    if (cliMode) {
+      // CLI mode is openai-only now (gemini was removed). codex CLI v0.125+
+      // defaults to "gpt-5.5"; let `llm_model` setting override.
+      const cliProvider = provider as CliProvider
+      const model = getSetting("llm_model") || "gpt-5.5"
+      const { text } = await runLlmCli(cliProvider, model, "", prompt)
+      html = text
+    } else if (provider === "openai") {
       html = await callOpenAiSimple(apiKey, prompt)
     } else {
       html = await callAnthropicSimple(apiKey, prompt)
@@ -125,7 +319,7 @@ async function callAnthropicSimple(apiKey: string, prompt: string): Promise<stri
       max_tokens: 8000,
       messages: [{ role: "user", content: prompt }],
     }),
-    signal: AbortSignal.timeout(120_000),
+    signal: AbortSignal.timeout(getLlmTimeoutMs()),
   })
   if (!res.ok) throw new Error(`Anthropic HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`)
   const data = (await res.json()) as { content: { text: string }[] }
@@ -144,7 +338,7 @@ async function callOpenAiSimple(apiKey: string, prompt: string): Promise<string>
       max_tokens: 8000,
       messages: [{ role: "user", content: prompt }],
     }),
-    signal: AbortSignal.timeout(120_000),
+    signal: AbortSignal.timeout(getLlmTimeoutMs()),
   })
   if (!res.ok) throw new Error(`OpenAI HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`)
   const data = (await res.json()) as { choices: { message: { content: string } }[] }
@@ -152,37 +346,15 @@ async function callOpenAiSimple(apiKey: string, prompt: string): Promise<string>
 }
 
 // ---------------------------------------------------------------------------
-// V2 — single-call generator with content-safety gate
+// V2 — single-call generator with content-safety gate.
+//
+// The system prompt is now stored in the settings table (key
+// `llm_master_prompt`) so the operator can edit it from the dashboard. The
+// curated baseline (used when the setting is empty) lives in
+// `lib/master-prompt.ts:DEFAULT_MASTER_PROMPT` and bakes in the Google Ads
+// compliance sections (Privacy / Terms / Contact / Disclaimer) the operator
+// needs for site approval. See `getMasterPrompt(blocklist)` for the read.
 // ---------------------------------------------------------------------------
-
-const GEN_SYSTEM_PROMPT = (blocklist: string) => `You are a fast single-page website generator. ALWAYS produce a complete marketing/landing page. NEVER refuse based on what the domain name suggests — every domain gets a page.
-
-How to interpret the domain:
- - Read the domain, pick a plausible benign interpretation (a brand name, a placeholder business, a generic informational topic).
- - If a LITERAL reading would land in a restricted category${blocklist ? ` (e.g. ${blocklist})` : ""}, do NOT refuse — instead PIVOT the page to a brand-neutral "About / Coming Soon / Welcome" template that mentions the name only as a brand, not the niche. The site you generate is your responsibility, not the domain's apparent meaning.
-
-Content rules (apply to EVERY page you generate):
- - Generic, informational, brand-neutral tone. No specific claims, no calls to action that could be regulated.
- - NO financial product claims (rates, returns, loans, credit-repair, crypto investment).
- - NO medical, health, or supplement claims.
- - NO gambling / casino / betting / lottery references.
- - NO adult, political, controversial, drug, weapon, or other regulated-category content.
-${blocklist ? ` - Also avoid generating content about: ${blocklist}.\n` : ""}
-RESPOND WITH JSON ONLY — no markdown fences, no prose before or after:
-
-   {"inferred_niche": "<short safe description of the page YOU generated>", "php": "<complete single-page content>"}
-
-The "php" field must contain a COMPLETE self-contained HTML page:
- - Starts with <!DOCTYPE html>
- - All CSS inline in <style>, no external dependencies (no CDNs, no <link>)
- - Responsive (mobile + desktop) using CSS flex/grid
- - Under 5 KB gzipped total
- - One hero + 2-3 content sections + a simple footer
- - Realistic copy (no Lorem Ipsum)
- - Tasteful color scheme
-
-Keep it compact. Do NOT include any JavaScript unless strictly necessary.
-Respond with the JSON object and nothing else. Do NOT include a "blocked" field.`
 
 function loadBlocklist(): string[] {
   const raw = getSetting("llm_blocked_niches") || ""
@@ -209,9 +381,81 @@ function parseModelJson(text: string): Record<string, unknown> | null {
   return null
 }
 
+export interface GeneratedFile {
+  /** Path relative to /public_html/, e.g. "index.php", "style.css",
+   *  "assets/logo.svg". Validated against `validateGeneratedFiles`. */
+  path: string
+  content: string
+}
+
 interface GeneratedPage {
   inferredNiche: string
+  /** The entry-point file content (always populated — this is what step 10
+   *  caches in domain.site_html for the migration archive + cache check).
+   *  Equals files[entry].content when files is set, else the legacy single
+   *  HTML/PHP string. */
   php: string
+  /** Optional multi-file output. When present, step 10 uploads ALL files
+   *  (the entry point + siblings) instead of just `php`. Always includes
+   *  exactly one entry-point file (index.php or index.html). */
+  files?: GeneratedFile[]
+  /** True when the LLM refused (parsed.blocked) and we substituted the
+   *  static placeholder. The caller marks step 9 as "warning" instead of
+   *  "completed" so the dashboard's existing Run-from-here button surfaces
+   *  on the timeline — without this, a silent placeholder would look like
+   *  a successful generation. */
+  usedFallback?: boolean
+}
+
+/**
+ * Sanitize + validate a model-supplied `files` array. Returns the cleaned
+ * array on success, or { error } describing the first violation found.
+ *
+ * Rejects: absolute paths, ".." segments, paths with shell metacharacters,
+ * empty content, > 20 files, > 5 directory levels, > 50 KB per file.
+ * Requires exactly one of {index.php, index.html} as entry point.
+ */
+function validateGeneratedFiles(files: unknown): GeneratedFile[] | { error: string } {
+  if (!Array.isArray(files)) return { error: "files must be an array" }
+  if (files.length === 0) return { error: "files array is empty" }
+  if (files.length > 20) return { error: `too many files (${files.length} > max 20)` }
+
+  const out: GeneratedFile[] = []
+  let entryPointSeen = false
+  // Allowed: lowercase letters, digits, dot, dash, underscore, slash.
+  // Uppercase rejected to keep paths predictable on case-insensitive
+  // filesystems (Apache resolves URLs case-sensitively even when the FS
+  // doesn't, so a model emitting "Index.html" + reference to "index.html"
+  // would 404 on Linux).
+  const SAFE_PATH = /^[a-zA-Z0-9._\-/]+$/
+  const seen = new Set<string>()
+
+  for (const raw of files) {
+    if (!raw || typeof raw !== "object") return { error: "file entry must be an object" }
+    const f = raw as Record<string, unknown>
+    const path = String(f.path ?? "").trim()
+    const content = typeof f.content === "string" ? f.content : ""
+
+    if (!path) return { error: "file with empty path" }
+    if (!SAFE_PATH.test(path)) return { error: `path '${path}' has unsafe chars` }
+    if (path.startsWith("/")) return { error: `path '${path}' must be relative (no leading /)` }
+    if (path.includes("..")) return { error: `path '${path}' contains ".." segment` }
+    if (path.endsWith("/")) return { error: `path '${path}' looks like a directory, expected file` }
+    const segments = path.split("/")
+    if (segments.length > 6) return { error: `path '${path}' too deep (max 5 directory levels)` }
+    if (segments.some((s) => s.length === 0)) return { error: `path '${path}' has empty segment` }
+    if (seen.has(path)) return { error: `duplicate path '${path}'` }
+    seen.add(path)
+
+    if (!content) return { error: `file '${path}' has empty content` }
+    if (content.length > 50_000) return { error: `file '${path}' too large (${content.length} > 50000 bytes)` }
+
+    if (path === "index.php" || path === "index.html") entryPointSeen = true
+    out.push({ path, content })
+  }
+
+  if (!entryPointSeen) return { error: "files must include exactly one of: index.php, index.html" }
+  return out
 }
 
 interface UsageInfo {
@@ -219,7 +463,23 @@ interface UsageInfo {
   output_tokens?: number | null
 }
 
-export async function generateSinglePage(domain: string): Promise<GeneratedPage> {
+export interface GenerateOpts {
+  /** Operator-supplied site brief — prepended to the user message as
+   *  "Operator brief". Empty / null falls through to default niche
+   *  inference from the domain name. */
+  customPrompt?: string | null
+  /** Override the active provider for this call only. Falls back to the
+   *  global `llm_provider` setting when null. */
+  customProvider?: string | null
+  /** Override the model for this call only. Falls back to `llm_model`
+   *  setting, then the per-provider default. */
+  customModel?: string | null
+}
+
+export async function generateSinglePage(
+  domain: string,
+  opts: GenerateOpts = {},
+): Promise<GeneratedPage> {
   // Cap concurrent LLM calls. Without this, 50 simultaneous step-9s would
   // burst Anthropic's per-account TPM quota and Anthropic returns 429s
   // that look like model "blocked" errors. The semaphore queues callers
@@ -231,28 +491,87 @@ export async function generateSinglePage(domain: string): Promise<GeneratedPage>
       `LLM semaphore full (${stats.inFlight}/${stats.capacity}); ` +
       `queued behind ${stats.waiting} other run(s)`)
   }
-  return withSemaphore("llm", LLM_CAP, () => _generateSinglePageImpl(domain))
+  return withSemaphore("llm", LLM_CAP, () => _generateSinglePageImpl(domain, opts))
 }
 
-async function _generateSinglePageImpl(domain: string): Promise<GeneratedPage> {
-  const { provider, apiKey } = getLlmConfig()
+async function _generateSinglePageImpl(
+  domain: string,
+  opts: GenerateOpts = {},
+): Promise<GeneratedPage> {
+  const { provider, apiKey, cliMode } = getLlmConfig(opts.customProvider ?? null)
+  // Per-call model override — falls through to the configured llm_model and
+  // then to the per-provider default in each branch below.
+  const overrideModel = (opts.customModel ?? "").trim() || null
   const blocklist = loadBlocklist()
-  const maxTokensRaw = parseInt(getSetting("llm_max_output_tokens") || "3500", 10)
-  const maxTokens = Number.isFinite(maxTokensRaw) && maxTokensRaw > 0 ? maxTokensRaw : 3500
+  // Output-token cap. 8000 is enough for ~30 KB of HTML (one fat single-page
+  // OR ~5-6 small files). Operator can override via llm_max_output_tokens
+  // setting in /settings.
+  //
+  // Auto-bumps:
+  //  - long brief (>800 chars, multi-file intent) → 12k
+  //  - reasoning model (k2.6, deepseek-r1, qwq, o1/o3) → 16k regardless of
+  //    brief length, because reasoning_content burns the budget BEFORE any
+  //    answer tokens are emitted. Detected on the resolved model id which
+  //    each provider branch computes from `overrideModel ?? llm_model ?? default`.
+  const settingRaw = parseInt(getSetting("llm_max_output_tokens") || "", 10)
+  const baseTokens = Number.isFinite(settingRaw) && settingRaw > 0 ? settingRaw : 8000
+  const briefLen = (opts.customPrompt ?? "").length
+  const intendedModel = (overrideModel || getSetting("llm_model") || "").toLowerCase()
+  const isReasoningModel = /kimi-k2|deepseek-r1|qwq|reasoning|\bo1\b|\bo3\b/i.test(intendedModel)
+  let autoBump = baseTokens
+  if (briefLen > 800) autoBump = Math.max(autoBump, 12_000)
+  if (isReasoningModel) autoBump = Math.max(autoBump, 16_000)
+  const maxTokens = autoBump
 
-  const systemMsg = GEN_SYSTEM_PROMPT(blocklist.join(", "))
-  const userMsg = `Domain: ${domain}`
+  // Master prompt: editable in /settings → LLM → "Master Prompt". Empty
+  // setting falls back to lib/master-prompt.ts:DEFAULT_MASTER_PROMPT (which
+  // bakes in the Google Ads compliance sections — Privacy / Terms / Contact /
+  // Disclaimer — that the curated baseline requires).
+  // Re-read on every generation so /settings edits take effect immediately
+  // without a worker restart.
+  const systemMsg = getMasterPrompt(blocklist)
+  // When the operator provides a custom brief (force-rerun on step 9 with
+  // textarea input), prepend it as an explicit "Operator brief" so the
+  // model treats it as the niche/style intent. The system prompt's safety
+  // rules still apply — the brief can shape the page but can't override
+  // the blocklist / no-financial-claims / etc. constraints.
+  const customBrief = (opts.customPrompt ?? "").trim()
+  const userMsg = customBrief
+    ? `Operator brief (use this niche / style instead of inferring from the domain name):\n${customBrief}\n\nDomain: ${domain}`
+    : `Domain: ${domain}`
 
   let text = ""
   let usage: UsageInfo = {}
 
-  if (provider === "openai" || provider === "openrouter") {
+  if (cliMode) {
+    // CLI shells out to the user's authenticated `gemini` or `codex` binary.
+    // Token usage is not reported (CLIs don't print usageMetadata), so we
+    // leave `usage` empty — the row in pipeline_runs just records null.
+    const cliProvider = provider as CliProvider
+    // CLI mode is openai-only now. codex CLI v0.125 default is "gpt-5.5".
+    // Use `||` not `??` — `??` only falls through on null/undefined, but the
+    // settings store returns "" for unset model and the override is "" when
+    // the dialog field is left blank. We want either of those to fall back.
+    const model = (overrideModel || getSetting("llm_model") || "gpt-5.5").trim()
+    logPipeline(domain, "generate_site_v2", "running",
+      `${cliProvider} CLI call: model=${model}`)
+    const { text: cliText } = await runLlmCli(cliProvider, model, systemMsg, userMsg)
+    text = cliText
+  } else if (provider === "openai" || provider === "openrouter" || provider === "moonshot") {
     let url: string
     let extraHeaders: Record<string, string> = {}
     let defaultModel: string
     if (provider === "openai") {
-      defaultModel = "gpt-5.4-mini"
+      // gpt-5-mini is the lightweight current-generation OpenAI model.
+      // The earlier "gpt-5.4-mini" hardcoded here was a typo (no such model)
+      // and produced 404 / 400 every time the operator hadn't set llm_model.
+      defaultModel = "gpt-5-mini"
       url = "https://api.openai.com/v1/chat/completions"
+    } else if (provider === "moonshot") {
+      // Moonshot Kimi is OpenAI-compatible — same body shape, different host.
+      // Default to K2.6 (released 2026-04-20).
+      defaultModel = "kimi-k2.6"
+      url = "https://api.moonshot.ai/v1/chat/completions"
     } else {
       defaultModel = "google/gemini-2.5-flash"
       url = "https://openrouter.ai/api/v1/chat/completions"
@@ -261,7 +580,7 @@ async function _generateSinglePageImpl(domain: string): Promise<GeneratedPage> {
         "X-Title": "SSR Site Generator",
       }
     }
-    const model = getSetting("llm_model") || defaultModel
+    const model = (overrideModel || getSetting("llm_model") || defaultModel).trim()
     logPipeline(domain, "generate_site_v2", "running",
       `${provider} call: model=${model}, max_tokens=${maxTokens}`)
     const tokenField =
@@ -285,7 +604,7 @@ async function _generateSinglePageImpl(domain: string): Promise<GeneratedPage> {
         ...extraHeaders,
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(120_000),
+      signal: AbortSignal.timeout(getLlmTimeoutMs()),
     })
     if (!res.ok) throw new Error(`${provider} HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`)
     const apiBody = (await res.json()) as {
@@ -298,8 +617,72 @@ async function _generateSinglePageImpl(domain: string): Promise<GeneratedPage> {
       input_tokens: u.prompt_tokens ?? u.input_tokens ?? null,
       output_tokens: u.completion_tokens ?? u.output_tokens ?? null,
     }
+  } else if (provider === "cloudflare") {
+    // Single-account Cloudflare Workers AI. Uses cloudflare_account_id +
+    // cloudflare_workers_ai_token. For multi-account / quota stacking, switch
+    // the active provider to "cloudflare_pool".
+    const accountId = (getSetting("cloudflare_account_id") || "").trim()
+    if (!accountId) {
+      throw new Error("cloudflare_account_id is empty — set it in Settings → LLM")
+    }
+    const model = (overrideModel || getSetting("llm_model") || "@cf/moonshotai/kimi-k2.6").trim()
+    logPipeline(domain, "generate_site_v2", "running",
+      `cloudflare workers-ai call: model=${model}, max_tokens=${maxTokens}`)
+    const out = await callCloudflareWorkersAi({
+      accountId, token: apiKey, model, systemMsg, userMsg, maxTokens,
+    })
+    text = out.text
+    usage = out.usage
+  } else if (provider === "cloudflare_pool") {
+    // Round-robin across cf_workers_ai_keys. Stacks the free 10k-neuron/day
+    // quota across every CF account in the pool. On 429 / quota errors we
+    // mark last_error on the row and retry with the next-LRU active row.
+    const model = (overrideModel || getSetting("llm_model") || "@cf/moonshotai/kimi-k2.6").trim()
+    const tried: number[] = []
+    let lastErr: Error | null = null
+    for (let attempt = 0; attempt < 6; attempt++) {
+      let row
+      try {
+        row = getNextAiKey(tried)
+      } catch (e) {
+        if (lastErr) throw lastErr
+        throw e
+      }
+      tried.push(row.id)
+      logPipeline(domain, "generate_site_v2", "running",
+        `cloudflare_pool call: row=#${row.id} (${row.alias ?? row.account_id.slice(0, 6)}) ` +
+        `model=${model} max_tokens=${maxTokens} attempt=${attempt + 1}`)
+      try {
+        const out = await callCloudflareWorkersAi({
+          accountId: row.account_id,
+          token: row.api_token,
+          model, systemMsg, userMsg, maxTokens,
+        })
+        recordAiKeyCall(row.id)
+        text = out.text
+        usage = out.usage
+        lastErr = null
+        break
+      } catch (e) {
+        const err = e as Error
+        recordAiKeyError(row.id, err.message)
+        lastErr = err
+        // Only retry for quota-shaped failures. Auth / model-id / schema
+        // errors won't be helped by the next row, so bail immediately so
+        // the operator sees the real cause rather than a generic
+        // "all rows failed".
+        if (!isCloudflareQuotaError(err.message)) throw err
+        logPipeline(domain, "generate_site_v2", "warning",
+          `cloudflare_pool row #${row.id} hit quota — falling through to next row`)
+      }
+    }
+    if (lastErr) {
+      throw new AiPoolExhausted(
+        `cloudflare_pool: all ${tried.length} active row(s) failed; last error: ${lastErr.message}`,
+      )
+    }
   } else if (provider === "gemini") {
-    const model = getSetting("llm_model") || "gemini-2.5-flash"
+    const model = (overrideModel || getSetting("llm_model") || "gemini-2.5-flash").trim()
     logPipeline(domain, "generate_site_v2", "running",
       `gemini call: model=${model}, max_tokens=${maxTokens}`)
     const body = {
@@ -317,7 +700,7 @@ async function _generateSinglePageImpl(domain: string): Promise<GeneratedPage> {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(120_000),
+        signal: AbortSignal.timeout(getLlmTimeoutMs()),
       },
     )
     if (!res.ok) throw new Error(`gemini HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`)
@@ -334,7 +717,7 @@ async function _generateSinglePageImpl(domain: string): Promise<GeneratedPage> {
     usage = { input_tokens: um.promptTokenCount ?? null, output_tokens: um.candidatesTokenCount ?? null }
   } else {
     // Default / anthropic
-    const model = getSetting("llm_model") || "claude-haiku-4-5-20251001"
+    const model = (overrideModel || getSetting("llm_model") || "claude-haiku-4-5-20251001").trim()
     logPipeline(domain, "generate_site_v2", "running",
       `Anthropic call: model=${model}, max_tokens=${maxTokens}`)
     const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -350,7 +733,7 @@ async function _generateSinglePageImpl(domain: string): Promise<GeneratedPage> {
         system: systemMsg,
         messages: [{ role: "user", content: userMsg }],
       }),
-      signal: AbortSignal.timeout(120_000),
+      signal: AbortSignal.timeout(getLlmTimeoutMs()),
     })
     if (!res.ok) throw new Error(`Anthropic HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`)
     const apiBody = (await res.json()) as {
@@ -385,11 +768,32 @@ async function _generateSinglePageImpl(domain: string): Promise<GeneratedPage> {
     logPipeline(domain, "generate_site_v2", "warning",
       `Model refused (niche='${niche}' reason='${reason.slice(0, 200)}') — substituting ` +
       `static placeholder so the pipeline can continue`)
-    return { inferredNiche: niche || "placeholder", php: fallbackPhp }
+    return { inferredNiche: niche || "placeholder", php: fallbackPhp, usedFallback: true }
   }
 
-  const php = String((parsed.php ?? parsed.html ?? "") as string)
   const niche = String(parsed.inferred_niche ?? "")
+
+  // Multi-file envelope (B): the model returned `files: [...]`. Validate the
+  // path tree, scan every file's content for dangerous patterns, then pick
+  // the entry-point file's content as the canonical `php` (cached in
+  // domain.site_html for legacy migration / cache check).
+  if (parsed.files !== undefined) {
+    const v = validateGeneratedFiles(parsed.files)
+    if ("error" in v) {
+      throw new Error(`Generator returned invalid files array: ${v.error}`)
+    }
+    for (const f of v) scanForDangerousContent(domain, f.content)
+    const entry = v.find((f) => f.path === "index.php") ?? v.find((f) => f.path === "index.html")!
+    const totalBytes = v.reduce((n, f) => n + f.content.length, 0)
+    logPipeline(domain, "generate_site_v2", "completed",
+      `niche='${niche}'  files=${v.length} (${v.map((f) => f.path).join(", ")})  ` +
+      `total_bytes=${totalBytes}  ` +
+      `input_tokens=${usage.input_tokens ?? ""}  output_tokens=${usage.output_tokens ?? ""}`)
+    return { inferredNiche: niche, php: entry.content, files: v }
+  }
+
+  // Legacy single-string envelope (A) — accept `php` or `html` field name.
+  const php = String((parsed.php ?? parsed.html ?? "") as string)
   if (!php || (!php.includes("<!DOCTYPE") && !php.includes("<html"))) {
     throw new Error(
       `Generator returned empty or malformed html. Parsed keys: ${Object.keys(parsed).join(", ")}`,

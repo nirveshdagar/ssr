@@ -106,23 +106,32 @@ describe("startHeartbeat ticker", () => {
 })
 
 describe("/api/status active_watchers", () => {
-  it("includes domains with last_heartbeat_at within the last 5s", async () => {
-    const { run, all } = await import("@/lib/db")
-    const { heartbeat } = await import("@/lib/repos/steps")
+  it("includes domains with at least one step_tracker row in 'running' state", async () => {
+    // Bug fix 2026-04-29: badge previously used last_heartbeat_at, which
+    // dropped to 0 whenever a long blocking step (LLM/SSH) outlasted the
+    // 5s window. Now mirrors getAllActiveWatchers() so the sidebar matches
+    // what the watcher page renders.
+    const { run } = await import("@/lib/db")
+    const { getAllActiveWatchers } = await import("@/lib/repos/steps")
+    run("DELETE FROM step_tracker")
     run("INSERT INTO domains(domain) VALUES('active-1.example.com')")
     run("INSERT INTO domains(domain) VALUES('active-2.example.com')")
-    run("INSERT INTO domains(domain) VALUES('stale.example.com')")
-    heartbeat("active-1.example.com")
-    heartbeat("active-2.example.com")
-    // stale.example.com was never heartbeated
+    run("INSERT INTO domains(domain) VALUES('idle.example.com')")
+    run(
+      "INSERT INTO step_tracker(domain, step_num, step_name, status) VALUES(?,?,?,?)",
+      "active-1.example.com", 5, "DNS lookup", "running",
+    )
+    run(
+      "INSERT INTO step_tracker(domain, step_num, step_name, status) VALUES(?,?,?,?)",
+      "active-2.example.com", 7, "Create app", "running",
+    )
+    run(
+      "INSERT INTO step_tracker(domain, step_num, step_name, status) VALUES(?,?,?,?)",
+      "idle.example.com", 3, "Buy domain", "completed",
+    )
 
-    // Replicate the /api/status query exactly
-    const fiveSecAgo = new Date(Date.now() - 5_000).toISOString().replace("T", " ").slice(0, 19)
-    const active = all<{ domain: string }>(
-      `SELECT domain FROM domains WHERE last_heartbeat_at > ?`, fiveSecAgo,
-    ).map((r) => r.domain)
-
+    const active = getAllActiveWatchers()
     expect(active.sort()).toEqual(["active-1.example.com", "active-2.example.com"])
-    expect(active).not.toContain("stale.example.com")
+    expect(active).not.toContain("idle.example.com")
   })
 })

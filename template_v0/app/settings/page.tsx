@@ -37,6 +37,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { cn } from "@/lib/utils"
 import { useSettings, saveSettings, type SettingsValues } from "@/hooks/use-settings"
 import { domainActions } from "@/lib/api-actions"
+import { CfAiPoolCard } from "@/components/ssr/cf-ai-pool-card"
+import { ModelPicker } from "@/components/ssr/model-picker"
+import { MasterPromptCard } from "@/components/ssr/master-prompt-card"
 
 // Section icon tints — pulled straight from the per-page-accent CSS vars so
 // every section reads in the same SaaSflow palette as the rest of the app.
@@ -58,12 +61,21 @@ type SectionId = typeof SECTIONS[number]["id"]
 type FormState = Partial<SettingsValues>
 
 interface ProviderInfo {
-  id: "anthropic" | "openai" | "gemini" | "openrouter"
+  id: "anthropic" | "openai" | "gemini" | "openrouter" | "moonshot"
   label: string
   prefix: string
   url: string
   consoleName: string
   modelExample: string
+  /** Name of the CLI binary that does its own OAuth login. When present,
+   *  the row gets an install + sign-in panel that bypasses the API key. */
+  cli?: {
+    bin: string
+    /** Verb shown on the Sign-in button — varies per provider since they
+     *  use different identity providers (Google vs ChatGPT). */
+    loginLabel: string
+    cliKey: keyof SettingsValues
+  }
 }
 
 const LLM_PROVIDERS: ProviderInfo[] = [
@@ -82,8 +94,18 @@ const LLM_PROVIDERS: ProviderInfo[] = [
     url: "https://platform.openai.com/api-keys",
     consoleName: "OpenAI Platform",
     modelExample: "gpt-5.4-mini",
+    cli: {
+      bin: "codex",
+      loginLabel: "Sign in with ChatGPT",
+      cliKey: "llm_cli_enabled_openai",
+    },
   },
   {
+    // Gemini: API key only. The CLI direct-OAuth panel was removed because
+    // gemini-cli ≥ 0.38 hard-rejects non-interactive OAuth and the workaround
+    // (dashboard-handled OAuth writing oauth_creds.json) didn't reliably work
+    // across CLI version bumps. Operators paste an AI Studio API key instead
+    // — same free quota, none of the spawn / browser-redirect fragility.
     id: "gemini",
     label: "Gemini key",
     prefix: "AIza…",
@@ -98,6 +120,14 @@ const LLM_PROVIDERS: ProviderInfo[] = [
     url: "https://openrouter.ai/keys",
     consoleName: "OpenRouter",
     modelExample: "google/gemini-2.5-flash",
+  },
+  {
+    id: "moonshot",
+    label: "Moonshot Kimi key",
+    prefix: "sk-…",
+    url: "https://platform.moonshot.ai/console/api-keys",
+    consoleName: "Moonshot Platform",
+    modelExample: "kimi-k2.6",
   },
 ]
 
@@ -395,7 +425,7 @@ export default function SettingsPage() {
             <FieldGroup>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <Field>
-                  <FieldLabel>Active provider</FieldLabel>
+                  <FieldLabel>Default LLM provider for site generation</FieldLabel>
                   <Select value={get("llm_provider") || "anthropic"} onValueChange={(v) => set("llm_provider", v)}>
                     <SelectTrigger className="h-8 text-small"><SelectValue /></SelectTrigger>
                     <SelectContent>
@@ -403,58 +433,194 @@ export default function SettingsPage() {
                       <SelectItem value="openai">OpenAI (GPT)</SelectItem>
                       <SelectItem value="gemini">Google Gemini</SelectItem>
                       <SelectItem value="openrouter">OpenRouter</SelectItem>
+                      <SelectItem value="moonshot">Moonshot Kimi</SelectItem>
+                      <SelectItem value="cloudflare">Cloudflare Workers AI (free, single)</SelectItem>
+                      <SelectItem value="cloudflare_pool">Cloudflare Workers AI POOL (free, stacked)</SelectItem>
                     </SelectContent>
                   </Select>
+                  <FieldDescription>
+                    Used by step 9 (LLM site generation) on every new domain pipeline. Each
+                    Run-pipeline / Bulk-run / Regenerate dialog can override this for a single
+                    run if your default provider's API key is rate-limited or down.
+                  </FieldDescription>
                 </Field>
                 <Field>
-                  <FieldLabel>Model</FieldLabel>
-                  <Input
+                  <FieldLabel>Default model</FieldLabel>
+                  <ModelPicker
+                    provider={get("llm_provider") || "anthropic"}
                     value={get("llm_model") ?? ""}
-                    onChange={(e) => set("llm_model", e.target.value)}
-                    placeholder="auto (provider default)"
+                    onChange={(v) => set("llm_model", v)}
+                  />
+                  <FieldDescription>
+                    Lists the most common models for the active provider. Pick
+                    {" "}<em>(use provider default)</em>{" "}to clear the override and let the per-provider default kick in
+                    (e.g. <code className="font-mono">claude-haiku-4-5-20251001</code> for Anthropic), or
+                    {" "}<em>(custom)</em>{" "}to type a model id not in the list (fine-tuned variants, brand-new models).
+                  </FieldDescription>
+                </Field>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <Field>
+                  <FieldLabel>Max output tokens</FieldLabel>
+                  <Input
+                    type="number" min={1000} max={64000} step={1000}
+                    value={get("llm_max_output_tokens") ?? ""}
+                    onChange={(e) => set("llm_max_output_tokens", e.target.value)}
+                    placeholder="8000 (default)"
                     className="font-mono text-small"
                   />
                   <FieldDescription>
-                    Examples — Anthropic: <code className="font-mono">claude-haiku-4-5-20251001</code>{" "}
-                    · OpenAI: <code className="font-mono">gpt-5.4-mini</code>{" "}
-                    · Gemini: <code className="font-mono">gemini-2.5-flash</code>{" "}
-                    · OpenRouter: <code className="font-mono">google/gemini-2.5-flash</code>
+                    Cap on what step 9 can <em>generate</em> in one call (input briefs aren't
+                    affected — those go up to the model's context window). Default{" "}
+                    <code className="font-mono">8000</code> covers a fat single-page or 5-6 small files.
+                    Auto-bumped to <strong>12 000</strong> when the brief is &gt;800 chars (multi-file intent),
+                    and to <strong>16 000</strong> for reasoning models (K2.6, DeepSeek R1) regardless.
+                    Bump to <code className="font-mono">32000</code> if the model truncates with <code>finish_reason=length</code>.
+                  </FieldDescription>
+                </Field>
+                <Field>
+                  <FieldLabel>Generation timeout (ms)</FieldLabel>
+                  <Input
+                    type="number" min={30000} max={900000} step={30000}
+                    value={get("llm_timeout_ms") ?? ""}
+                    onChange={(e) => set("llm_timeout_ms", e.target.value)}
+                    placeholder="300000 (5 min default)"
+                    className="font-mono text-small"
+                  />
+                  <FieldDescription>
+                    Per-LLM-call HTTP timeout. Reasoning models (K2.6, R1) often spend
+                    60–120 s on chain-of-thought before the first token. Bump to{" "}
+                    <code className="font-mono">600000</code> (10 min) for very long briefs.
+                    Min 30 s, max 15 min.
                   </FieldDescription>
                 </Field>
               </div>
 
-              {/* Per-provider keys — each with its own Test button + console link. */}
+              {/* Per-provider keys — each with its own Test button + console link.
+                  Providers with a CLI also get a "Use local CLI auth" toggle that
+                  bypasses the API key and shells out to the locally-logged-in binary. */}
               <div className="flex flex-col gap-3">
-                {LLM_PROVIDERS.map((p) => (
-                  <Field key={p.id}>
-                    <FieldLabel>
-                      <span className="inline-flex items-center justify-between gap-2 w-full">
-                        <span>{p.label}</span>
-                        <a
-                          href={p.url} target="_blank" rel="noopener noreferrer"
-                          className="text-micro text-status-running hover:underline inline-flex items-center gap-1"
-                          title={`Open ${p.consoleName} in a new tab`}
-                        >
-                          <ExternalLink className="h-3 w-3" /> {p.consoleName}
-                        </a>
-                      </span>
-                    </FieldLabel>
-                    <div className="flex items-start gap-2">
-                      <div className="flex-1">
-                        <SecretInput
-                          value={(get(`llm_api_key_${p.id}` as keyof SettingsValues) as string) ?? ""}
-                          onChange={(v) => set(`llm_api_key_${p.id}` as keyof SettingsValues, v as never)}
-                          placeholder={p.prefix}
+                {LLM_PROVIDERS.map((p) => {
+                  const cliKey = p.cli?.cliKey
+                  const cliEnabled = cliKey ? Boolean(get(cliKey)) : false
+                  return (
+                    <Field key={p.id}>
+                      <FieldLabel>
+                        <span className="inline-flex items-center justify-between gap-2 w-full">
+                          <span>{p.label}</span>
+                          <a
+                            href={p.url} target="_blank" rel="noopener noreferrer"
+                            className="text-micro text-status-running hover:underline inline-flex items-center gap-1"
+                            title={`Open ${p.consoleName} in a new tab`}
+                          >
+                            <ExternalLink className="h-3 w-3" /> {p.consoleName}
+                          </a>
+                        </span>
+                      </FieldLabel>
+
+                      {p.cli && cliKey && (
+                        <CliAuthPanel
+                          provider={p.id as "openai" | "gemini"}
+                          cliBin={p.cli.bin}
+                          loginLabel={p.cli.loginLabel ?? `Sign in with ${p.cli.bin}`}
+                          enabled={cliEnabled}
+                          onToggle={(v) => set(cliKey, v as never)}
+                        />
+                      )}
+
+                      <div className="flex items-start gap-2">
+                        <div className="flex-1">
+                          {cliEnabled ? (
+                            <div className="rounded-md border border-status-completed/30 bg-status-completed/5 px-3 py-2 text-small text-muted-foreground">
+                              API key ignored — calls go through{" "}
+                              <code className="font-mono">{p.cli?.bin}</code> CLI.
+                            </div>
+                          ) : (
+                            <SecretInput
+                              value={(get(`llm_api_key_${p.id}` as keyof SettingsValues) as string) ?? ""}
+                              onChange={(v) => set(`llm_api_key_${p.id}` as keyof SettingsValues, v as never)}
+                              placeholder={p.prefix}
+                            />
+                          )}
+                        </div>
+                        <LlmKeyTestButton
+                          provider={p.id}
+                          keyValue={(get(`llm_api_key_${p.id}` as keyof SettingsValues) as string) ?? ""}
+                          cliMode={cliEnabled}
+                          cliBin={p.cli?.bin}
                         />
                       </div>
-                      <LlmKeyTestButton
-                        provider={p.id}
-                        keyValue={(get(`llm_api_key_${p.id}` as keyof SettingsValues) as string) ?? ""}
+                    </Field>
+                  )
+                })}
+              </div>
+
+              {/* Cloudflare Workers AI — separate shape (account ID + token), runs
+                  Kimi K2.6 on CF's free 10k-neurons/day tier. Selected by setting
+                  the active provider above to "cloudflare". */}
+              <Field>
+                <FieldLabel>
+                  <span className="inline-flex items-center justify-between gap-2 w-full">
+                    <span className="inline-flex items-center gap-1.5">
+                      Cloudflare Workers AI
+                      <span className="rounded bg-status-completed/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-status-completed">
+                        free tier · K2.6
+                      </span>
+                    </span>
+                    <a
+                      href="https://dash.cloudflare.com/profile/api-tokens"
+                      target="_blank" rel="noopener noreferrer"
+                      className="text-micro text-status-running hover:underline inline-flex items-center gap-1"
+                      title="Create a Workers AI scoped token in the Cloudflare dashboard"
+                    >
+                      <ExternalLink className="h-3 w-3" /> Cloudflare API Tokens
+                    </a>
+                  </span>
+                </FieldLabel>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <Input
+                    value={get("cloudflare_account_id") ?? ""}
+                    onChange={(e) => set("cloudflare_account_id", e.target.value)}
+                    placeholder="account ID (32-char hex)"
+                    className="font-mono text-small"
+                  />
+                  <div className="flex items-start gap-2">
+                    <div className="flex-1">
+                      <SecretInput
+                        value={get("cloudflare_workers_ai_token") ?? ""}
+                        onChange={(v) => set("cloudflare_workers_ai_token", v)}
+                        placeholder="Workers AI API token"
                       />
                     </div>
-                  </Field>
-                ))}
-              </div>
+                    <LlmKeyTestButton
+                      provider="cloudflare"
+                      keyValue={get("cloudflare_workers_ai_token") ?? ""}
+                      extraFields={{
+                        cloudflare_account_id: (get("cloudflare_account_id") ?? "").trim(),
+                      }}
+                    />
+                  </div>
+                </div>
+                <FieldDescription>
+                  Free plan = 10 000 neurons/day ≈ 2–5M Kimi K2.6 tokens. Token needs the
+                  <code className="font-mono mx-1">Workers AI</code>read scope. Default model is{" "}
+                  <code className="font-mono">@cf/moonshotai/kimi-k2.6</code>; override in the Model field above.
+                  For multi-account quota stacking, use the pool below and set Active provider to{" "}
+                  <code className="font-mono">cloudflare_pool</code>.
+                </FieldDescription>
+              </Field>
+
+              {/* Multi-account Cloudflare Workers AI pool — round-robins K2.6 calls
+                  across N accounts so the free 10k-neuron/day tier stacks N×.
+                  Each row holds its own (account_id, token); rotation is LRU. */}
+              <CfAiPoolCard />
+
+              {/* Master prompt editor — the system prompt sent to the LLM at
+                  step 9. Stored in DB (llm_master_prompt) so edits take
+                  effect on the next generation, no restart needed. Includes
+                  Google Ads compliance baseline (Privacy / Terms / Contact /
+                  Disclaimer). */}
+              <MasterPromptCard />
 
               {/* Legacy single-key fallback — collapsible just like Flask */}
               <details className="rounded-md border border-border/60 px-3 py-2">
@@ -1057,18 +1223,35 @@ function DoTestButton({ primary, backup }: { primary: string; backup: string }) 
 
 /* --------------- LLM per-provider test --------------- */
 
-function LlmKeyTestButton({ provider, keyValue }: { provider: ProviderInfo["id"]; keyValue: string }) {
+function LlmKeyTestButton({
+  provider, keyValue, cliMode = false, cliBin, extraFields,
+}: {
+  provider: ProviderInfo["id"] | "cloudflare"
+  keyValue: string
+  cliMode?: boolean
+  cliBin?: string
+  /** Extra form fields to include in the POST — used by the Cloudflare card
+   *  to send `cloudflare_account_id` alongside the token. */
+  extraFields?: Record<string, string>
+}) {
   const [busy, setBusy] = React.useState(false)
   const [result, setResult] = React.useState<{ ok: boolean; msg: string } | null>(null)
   async function run() {
-    if (!keyValue.trim()) {
+    if (!cliMode && !keyValue.trim()) {
       setResult({ ok: false, msg: "Paste a key above first" }); return
     }
     setBusy(true); setResult(null)
     try {
       const fd = new FormData()
       fd.set("provider", provider)
-      fd.set("llm_api_key", keyValue.trim())
+      if (cliMode) {
+        fd.set("mode", "cli")
+      } else {
+        fd.set("llm_api_key", keyValue.trim())
+      }
+      if (extraFields) {
+        for (const [k, v] of Object.entries(extraFields)) fd.set(k, v)
+      }
       const r = await fetch("/api/settings/test-llm-key", {
         method: "POST", body: fd, credentials: "same-origin",
       })
@@ -1081,7 +1264,8 @@ function LlmKeyTestButton({ provider, keyValue }: { provider: ProviderInfo["id"]
         if (j.usage) detail = `in=${j.usage.input_tokens ?? "?"}, out=${j.usage.output_tokens ?? "?"}`
         else if (j.info) detail = j.info
         else if (j.label) detail = `label=${j.label}`
-        setResult({ ok: true, msg: `Valid · ${detail || "ok"}` })
+        const prefix = cliMode ? `${cliBin ?? "cli"} OK` : "Valid"
+        setResult({ ok: true, msg: `${prefix} · ${detail || "ok"}` })
       } else {
         setResult({ ok: false, msg: (j.error ?? "Rejected").slice(0, 140) })
       }
@@ -1096,7 +1280,11 @@ function LlmKeyTestButton({ provider, keyValue }: { provider: ProviderInfo["id"]
       <Button
         type="button" variant="outline" size="sm" onClick={run} disabled={busy}
         className="gap-1.5 btn-soft-info"
-        title={`Validate the ${provider} API key against its provider's auth endpoint`}
+        title={
+          cliMode
+            ? `Run a one-token probe through the ${cliBin ?? "cli"} binary`
+            : `Validate the ${provider} API key against its provider's auth endpoint`
+        }
       >
         {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
         Test
@@ -1108,6 +1296,268 @@ function LlmKeyTestButton({ provider, keyValue }: { provider: ProviderInfo["id"]
         )}>
           {result.msg}
         </span>
+      )}
+    </div>
+  )
+}
+
+/* --------------- LLM CLI install + sign-in panel --------------- */
+
+interface CliStatusResp {
+  provider: "gemini" | "openai"
+  bin: string
+  installed: boolean
+  binaryPath: string | null
+  loggedIn: boolean
+  credsPath: string
+  account: string | null
+  loginInProgress: boolean
+  loginStartedAt: number | null
+  loginFailure: string | null
+}
+
+/**
+ * Drives the install / sign-in / sign-out flow for one LLM CLI from inside
+ * the dashboard so the operator never has to drop into a terminal.
+ *
+ * Polls /api/llm-cli/status every 2s while a login is in progress (the
+ * detached child waits for the OAuth callback in the user's browser); idle
+ * state polls every 12s as a cheap drift check. On loginInProgress true,
+ * the user is told to complete the sign-in in the browser tab the CLI just
+ * opened; on success the credentials file appears, the panel flips to
+ * "Signed in", and the parent toggle becomes flippable.
+ */
+function CliAuthPanel({
+  provider, cliBin, loginLabel, enabled, onToggle,
+}: {
+  provider: "gemini" | "openai"
+  cliBin: string
+  loginLabel: string
+  enabled: boolean
+  onToggle: (v: boolean) => void
+}) {
+  const [status, setStatus] = React.useState<CliStatusResp | null>(null)
+  const [busy, setBusy] = React.useState<"install" | "login" | "signout" | "cancel" | null>(null)
+  const [actionMsg, setActionMsg] = React.useState<string | null>(null)
+  const pollTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const refresh = React.useCallback(async () => {
+    try {
+      const r = await fetch(`/api/llm-cli/status?provider=${provider}`, { credentials: "same-origin" })
+      if (!r.ok) return
+      const j = (await r.json()) as CliStatusResp
+      setStatus(j)
+    } catch { /* leave previous status */ }
+  }, [provider])
+
+  React.useEffect(() => {
+    refresh()
+    return () => { if (pollTimer.current) clearTimeout(pollTimer.current) }
+  }, [refresh])
+
+  // Adaptive polling: tight while the OAuth flow is in flight (the user is
+  // mid-login and we want the panel to flip to "Signed in" the instant the
+  // creds file appears), slow otherwise so an idle settings page doesn't
+  // hammer the route every couple of seconds.
+  React.useEffect(() => {
+    if (pollTimer.current) clearTimeout(pollTimer.current)
+    const delay = status?.loginInProgress ? 2000 : 12_000
+    pollTimer.current = setTimeout(refresh, delay)
+    return () => { if (pollTimer.current) clearTimeout(pollTimer.current) }
+  }, [status, refresh])
+
+  // When login flips from in-progress to signed-in, auto-enable the toggle
+  // so the user doesn't have to hunt for it. Only does this on the actual
+  // transition; doesn't re-enable if the user explicitly turned it off.
+  const wasInProgress = React.useRef(false)
+  React.useEffect(() => {
+    if (!status) return
+    if (wasInProgress.current && status.loggedIn && !enabled) {
+      onToggle(true)
+    }
+    wasInProgress.current = status.loginInProgress
+  }, [status, enabled, onToggle])
+
+  async function postJson(path: string, body: object): Promise<{ ok: boolean; error?: string }> {
+    const r = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify(body),
+    })
+    return (await r.json()) as { ok: boolean; error?: string }
+  }
+
+  async function onInstall() {
+    setBusy("install"); setActionMsg("Installing — this can take 10-30s on a cold npm cache.")
+    try {
+      const r = await postJson("/api/llm-cli/install", { provider })
+      setActionMsg(r.ok ? "Installed." : `Install failed: ${r.error ?? "unknown"}`)
+      await refresh()
+    } catch (e) {
+      setActionMsg(`Install failed: ${(e as Error).message}`)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function onLogin() {
+    setBusy("login"); setActionMsg("Opening your browser — complete the sign-in there.")
+    try {
+      const r = await postJson("/api/llm-cli/login", { provider })
+      if (!r.ok) {
+        setActionMsg(`Sign-in could not start: ${r.error ?? "unknown"}`)
+      }
+      await refresh()
+    } catch (e) {
+      setActionMsg(`Sign-in failed: ${(e as Error).message}`)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function onCancel() {
+    setBusy("cancel"); setActionMsg(null)
+    try {
+      await fetch(`/api/llm-cli/login?provider=${provider}`, {
+        method: "DELETE", credentials: "same-origin",
+      })
+      await refresh()
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function onSignOut() {
+    if (!confirm(
+      `Sign out of ${cliBin}? The credentials file will be deleted; ` +
+      `you'll need to sign in again before generation calls work.`,
+    )) return
+    setBusy("signout"); setActionMsg(null)
+    try {
+      const r = await postJson("/api/llm-cli/signout", { provider })
+      setActionMsg(r.ok ? "Signed out." : `Sign-out failed: ${r.error ?? "unknown"}`)
+      if (r.ok && enabled) onToggle(false)  // CLI mode is meaningless without creds
+      await refresh()
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  // ----- Render -----
+
+  if (!status) {
+    return (
+      <div className="flex items-center justify-between gap-3 rounded-md border border-border/60 bg-muted/30 px-3 py-2 mb-2 text-micro text-muted-foreground">
+        <span className="inline-flex items-center gap-1.5">
+          <Loader2 className="h-3 w-3 animate-spin" />
+          Checking <code className="font-mono">{cliBin}</code> install + sign-in state…
+        </span>
+      </div>
+    )
+  }
+
+  // Three primary states drive the right-hand action area:
+  //   1. Not installed → Install button
+  //   2. Installed, not signed in → Sign in (or Cancel, while in progress)
+  //   3. Signed in → toggle + Sign out
+  let stateBadge: React.ReactNode
+  let action: React.ReactNode
+
+  if (!status.installed) {
+    stateBadge = <span className="text-status-terminal">Not installed</span>
+    action = (
+      <Button
+        size="sm" variant="outline" onClick={onInstall} disabled={busy !== null}
+        className="gap-1.5 btn-soft-info"
+        title={`npm install -g the ${cliBin} CLI globally`}
+      >
+        {busy === "install" ? <Loader2 className="h-3 w-3 animate-spin" /> : <KeyRound className="h-3.5 w-3.5" />}
+        Install <code className="font-mono">{cliBin}</code>
+      </Button>
+    )
+  } else if (status.loginInProgress) {
+    stateBadge = (
+      <span className="inline-flex items-center gap-1.5 text-status-running">
+        <Loader2 className="h-3 w-3 animate-spin" />
+        Waiting for browser sign-in…
+      </span>
+    )
+    action = (
+      <Button
+        size="sm" variant="outline" onClick={onCancel} disabled={busy !== null}
+        className="gap-1.5"
+        title="Kill the background CLI process and reset the panel"
+      >
+        Cancel
+      </Button>
+    )
+  } else if (!status.loggedIn) {
+    stateBadge = <span className="text-status-waiting">Installed, not signed in</span>
+    action = (
+      <Button
+        size="sm" variant="outline" onClick={onLogin} disabled={busy !== null}
+        className="gap-1.5 btn-soft-info"
+        title={`Open the OAuth flow in your default browser`}
+      >
+        {busy === "login" ? <Loader2 className="h-3 w-3 animate-spin" /> : <ExternalLink className="h-3.5 w-3.5" />}
+        {loginLabel}
+      </Button>
+    )
+  } else {
+    stateBadge = (
+      <span className="inline-flex items-center gap-1.5 text-status-completed">
+        <Check className="h-3 w-3" />
+        Signed in{status.account ? ` as ${status.account}` : ""}
+      </span>
+    )
+    action = (
+      <div className="flex items-center gap-2">
+        <Switch
+          checked={enabled}
+          onCheckedChange={onToggle}
+          aria-label={`Use ${cliBin} CLI auth`}
+          title={`Toggle CLI auth via ${cliBin}`}
+        />
+        <Button
+          size="sm" variant="ghost" onClick={onSignOut} disabled={busy !== null}
+          className="gap-1.5 text-muted-foreground hover:text-status-terminal"
+          title="Delete the cached credentials file"
+        >
+          {busy === "signout" ? <Loader2 className="h-3 w-3 animate-spin" /> : <LogOut className="h-3 w-3" />}
+          Sign out
+        </Button>
+      </div>
+    )
+  }
+
+  return (
+    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2 mb-2">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-[12px] font-medium inline-flex items-center gap-1.5">
+            <Terminal className="h-3 w-3" />
+            Local CLI auth (<code className="font-mono">{cliBin}</code>)
+            <span className="text-muted-foreground font-normal">·</span>
+            <span className="text-micro font-normal">{stateBadge}</span>
+          </div>
+          <p className="mt-0.5 text-micro text-muted-foreground">
+            Skip the API key and let the dashboard call your locally-installed{" "}
+            <code className="font-mono">{cliBin}</code> binary. Uses your free / consumer tier — no separate API billing.
+          </p>
+        </div>
+        <div className="shrink-0">{action}</div>
+      </div>
+
+      {(actionMsg || status.loginFailure) && (
+        <p
+          className={cn(
+            "mt-2 text-micro",
+            status.loginFailure ? "text-status-terminal" : "text-muted-foreground",
+          )}
+        >
+          {status.loginFailure ?? actionMsg}
+        </p>
       )}
     </div>
   )

@@ -81,26 +81,70 @@ export const domainActions = {
       serverId?: number
       startFrom?: number
       forceNewServer?: boolean
+      customProvider?: string
+      customModel?: string
     } = {},
   ) => postForm(`/api/domains/${domain}/run-pipeline`, {
     skip_purchase: opts.skipPurchase ? "on" : undefined,
     server_id: opts.serverId != null ? String(opts.serverId) : undefined,
     start_from: opts.startFrom != null ? String(opts.startFrom) : undefined,
     force_new_server: opts.forceNewServer ? "on" : undefined,
+    custom_provider: opts.customProvider || undefined,
+    custom_model: opts.customModel || undefined,
   }),
-  runFromStep: (domain: string, step: number, skipPurchase = false) =>
-    postForm(`/api/domains/${domain}/run-from/${step}`, {
-      skip_purchase: skipPurchase ? "on" : undefined,
-    }),
+  /**
+   * Re-run the pipeline starting from `step`. The optional `customPrompt` /
+   * `customProvider` / `customModel` are only meaningful when step <= 9 —
+   * the orchestrator threads them into step 9's LLM call so the operator
+   * can override the auto-inferred niche, the active provider, or the model
+   * for this run only. Empty fields fall through to global settings.
+   */
+  runFromStep: async (
+    domain: string, step: number,
+    opts: {
+      skipPurchase?: boolean
+      customPrompt?: string | null
+      customProvider?: string | null
+      customModel?: string | null
+    } = {},
+  ): Promise<ActionResult> => {
+    try {
+      const r = await fetch(`/api/domains/${domain}/run-from/${step}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({
+          skip_purchase: opts.skipPurchase ? "on" : undefined,
+          custom_prompt: opts.customPrompt ?? undefined,
+          custom_provider: opts.customProvider ?? undefined,
+          custom_model: opts.customModel ?? undefined,
+        }),
+      })
+      const j = (await r.json().catch(() => ({}))) as Record<string, unknown>
+      return {
+        ok: r.ok && (j.ok !== false),
+        message: typeof j.message === "string" ? j.message : undefined,
+        error: typeof j.error === "string" ? j.error : undefined,
+        data: j,
+      }
+    } catch (e) {
+      return { ok: false, error: (e as Error).message }
+    }
+  },
   runBulk: (
     domainIds: string[],
-    opts: { skipPurchase?: boolean; serverId?: number; forceNewServer?: boolean } = {},
+    opts: {
+      skipPurchase?: boolean; serverId?: number; forceNewServer?: boolean
+      customProvider?: string; customModel?: string
+    } = {},
   ) => {
     const fd = new FormData()
     for (const id of domainIds) fd.append("domain_ids", id)
     if (opts.skipPurchase) fd.set("skip_purchase", "on")
     if (opts.serverId != null) fd.set("server_id", String(opts.serverId))
     if (opts.forceNewServer) fd.set("force_new_server", "on")
+    if (opts.customProvider) fd.set("custom_provider", opts.customProvider)
+    if (opts.customModel) fd.set("custom_model", opts.customModel)
     return fetch("/api/domains/run-bulk", { method: "POST", body: fd, credentials: "same-origin" })
       .then(async (r) => ({ ok: r.ok, ...((await r.json()) as Record<string, unknown>) }))
   },
@@ -112,13 +156,18 @@ export const domainActions = {
    */
   runBulkSequential: (
     domainIds: string[],
-    opts: { skipPurchase?: boolean; serverId?: number; forceNewServer?: boolean } = {},
+    opts: {
+      skipPurchase?: boolean; serverId?: number; forceNewServer?: boolean
+      customProvider?: string; customModel?: string
+    } = {},
   ) => {
     const fd = new FormData()
     for (const id of domainIds) fd.append("domain_ids", id)
     if (opts.skipPurchase) fd.set("skip_purchase", "on")
     if (opts.serverId != null) fd.set("server_id", String(opts.serverId))
     if (opts.forceNewServer) fd.set("force_new_server", "on")
+    if (opts.customProvider) fd.set("custom_provider", opts.customProvider)
+    if (opts.customModel) fd.set("custom_model", opts.customModel)
     return fetch("/api/domains/run-bulk-sequential", { method: "POST", body: fd, credentials: "same-origin" })
       .then(async (r) => ({ ok: r.ok, ...((await r.json()) as Record<string, unknown>) }))
   },
@@ -217,6 +266,38 @@ export const cfKeyActions = {
     }),
   toggle: (id: number) => postForm(`/api/cf-keys/${id}/toggle`),
   refreshAccounts: () => postForm("/api/cf-keys/refresh-accounts"),
+  /** Sync — walks every active CF key, lists zones, reconciles drift
+   *  against the domains table. Auto-backfills cf_zone_id when a name
+   *  match exists; reports orphans + untracked zones for operator review.
+   *  dryRun=true skips the backfill writes (still surfaces the report). */
+  sync: (dryRun = false) =>
+    postForm("/api/cloudflare/sync", { dry_run: dryRun ? "on" : undefined }),
+  /** Bulk add CF keys — CSV paste/upload OR JSON rows[]. Per-row CF /accounts
+   *  verification before insert; per-row results returned in `results[]`. */
+  bulkAdd: (rows: { email: string; api_key: string; alias?: string }[]) =>
+    fetch("/api/cf-keys/bulk-add", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ rows }),
+    }).then(async (r) => ({ ok: r.ok, ...((await r.json()) as Record<string, unknown>) })),
+  /** Bulk add via CSV file/text — used by the modal's CSV upload tab. */
+  bulkAddCsv: (csvText: string, csvFile?: File) => {
+    const fd = new FormData()
+    if (csvFile) fd.set("csv_file", csvFile)
+    else fd.set("csv_text", csvText)
+    return fetch("/api/cf-keys/bulk-add", {
+      method: "POST", body: fd, credentials: "same-origin",
+    }).then(async (r) => ({ ok: r.ok, ...((await r.json()) as Record<string, unknown>) }))
+  },
+  /** Bulk delete — checks per-row that no domain still references the key. */
+  bulkDelete: (ids: number[]) =>
+    fetch("/api/cf-keys/bulk-delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ ids }),
+    }).then(async (r) => ({ ok: r.ok, ...((await r.json()) as Record<string, unknown>) })),
   /** Diagnostic — create a throwaway zone with this key and immediately delete
    *  it. Confirms the (email, api_key, cf_account_id) triple can mint zones. */
   testCreateZone: (id: number) => postForm(`/api/cf-keys/${id}/test-create-zone`),

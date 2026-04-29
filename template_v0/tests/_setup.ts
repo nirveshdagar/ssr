@@ -71,6 +71,21 @@ CREATE TABLE IF NOT EXISTS cf_keys (
     last_used_at    TEXT
 );
 
+CREATE TABLE IF NOT EXISTS cf_workers_ai_keys (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id      TEXT NOT NULL,
+    api_token       TEXT NOT NULL,
+    alias           TEXT,
+    is_active       INTEGER NOT NULL DEFAULT 1,
+    calls_today     INTEGER NOT NULL DEFAULT 0,
+    calls_total     INTEGER NOT NULL DEFAULT 0,
+    last_call_at    TEXT,
+    last_call_date  TEXT,
+    last_error      TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    UNIQUE(account_id, api_token)
+);
+
 CREATE TABLE IF NOT EXISTS pipeline_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     domain      TEXT NOT NULL,

@@ -16,6 +16,23 @@ import { domainActions } from "@/lib/api-actions"
 import { PIPELINE_STEPS as TAXONOMY_STEPS } from "@/lib/status-taxonomy"
 import { cn } from "@/lib/utils"
 
+/**
+ * Stronger-warning text for force-rerun on destructive steps. Mirrors the
+ * helper in /domains/[domain]/client.tsx — kept in sync by hand because both
+ * pages need it inline and a shared util adds an unneeded import path.
+ */
+function forceRerunWarning(stepNum: number): string | null {
+  switch (stepNum) {
+    case 1: return "Step 1 BUYS THE DOMAIN at the registrar — costs real money. " +
+      "Only force this if the buy was rolled back / the domain row is bring-your-own."
+    case 4: return "Step 4 sets nameservers at Spaceship — rapid retries can rate-limit " +
+      "your registrar account. Wait at least a few minutes between forced retries."
+    case 6: return "Step 6 PROVISIONS A NEW DROPLET on DigitalOcean — costs real money " +
+      "and takes 5–15 minutes. Only force this if the existing server is dead."
+    default: return null
+  }
+}
+
 type WatchedRun = {
   pipelineId: string
   domain: string
@@ -132,6 +149,22 @@ export default function WatcherPage() {
     setPerStepBusy(stepNum); setActionMsg("")
     const r = await domainActions.runFromStep(active.domain, stepNum)
     setActionMsg(r.message ?? r.error ?? `Run from step ${stepNum} requested`)
+    setPerStepBusy(null)
+  }
+  // Force re-run on completed/skipped/pending steps. Same backend call as
+  // onRunFromStep — the difference is the destructive-step warning shown to
+  // the operator before unleashing the lock-override.
+  async function onForceRerun(stepNum: number, stepName: string) {
+    if (active.domain === "No active runs") return
+    const destructive = forceRerunWarning(stepNum)
+    const baseMsg =
+      `Force re-run from step ${stepNum} (${stepName}) on ${active.domain}?\n\n` +
+      `This replays step ${stepNum} and every step after, IGNORING the ` +
+      `completion lock that normally prevents redoing finished work.`
+    if (!confirm(destructive ? `${baseMsg}\n\n⚠ ${destructive}` : baseMsg)) return
+    setPerStepBusy(stepNum); setActionMsg("")
+    const r = await domainActions.runFromStep(active.domain, stepNum)
+    setActionMsg(r.message ?? r.error ?? `Forced re-run from step ${stepNum}`)
     setPerStepBusy(null)
   }
 
@@ -462,6 +495,23 @@ export default function WatcherPage() {
                               >
                                 <RotateCw className={cn("h-3 w-3", perStepBusy === num && "animate-spin")} />
                                 Run from here
+                              </Button>
+                            )}
+                            {(isCompleted || isSkipped || isPending) && active.domain !== "No active runs" && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-6 gap-1 px-1.5 text-micro text-muted-foreground hover:text-status-terminal"
+                                onClick={() => onForceRerun(num, stepName)}
+                                disabled={perStepBusy === num}
+                                title={
+                                  forceRerunWarning(num)
+                                    ? `Force re-run step ${num} — destructive, see warning`
+                                    : `Force re-run step ${num} (overrides completion lock)`
+                                }
+                              >
+                                <RotateCw className={cn("h-3 w-3", perStepBusy === num && "animate-spin")} />
+                                Force
                               </Button>
                             )}
                           </div>

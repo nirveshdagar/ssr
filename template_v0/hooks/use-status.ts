@@ -9,7 +9,13 @@ export interface StatusCounts {
   cf_keys: number
   active_jobs: number
   queued_jobs: number
+  /** Domains with a step_tracker row in 'running' state — i.e. in-flight
+   *  pipelines only. Used by the dashboard "currently active" tile. */
   active_watchers: number
+  /** Domains the /watcher page renders (in-flight + retryable + terminal
+   *  + waiting + canceled). Used by the Watcher sidebar badge so its count
+   *  matches the "Active runs" header on the page. */
+  watcher_runs: number
 }
 
 export interface StatusResponse {

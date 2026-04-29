@@ -12,9 +12,18 @@ import {
   Heart,
   Copy,
   ExternalLink,
+  Sparkles,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { ButtonGroup } from "@/components/ui/button-group"
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
+  DialogFooter,
+} from "@/components/ui/dialog"
+import { Textarea } from "@/components/ui/textarea"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Checkbox } from "@/components/ui/checkbox"
+import { ModelPicker } from "@/components/ssr/model-picker"
 import { StatusBadge } from "@/components/ssr/status-badge"
 import { PipelineProgress } from "@/components/ssr/pipeline-progress"
 import { MonoCode } from "@/components/ssr/data-table"
@@ -29,6 +38,22 @@ import type { StepTrackerRow } from "@/lib/repos/steps"
 import type { PipelineLogRow } from "@/lib/repos/logs"
 import type { PipelineStatus } from "@/lib/ssr/mock-data"
 import { cn } from "@/lib/utils"
+
+/**
+ * Stronger-warning text for force-rerun on destructive steps. null = no
+ * extra warning (default confirm copy is enough).
+ */
+function forceRerunWarning(stepNum: number): string | null {
+  switch (stepNum) {
+    case 1: return "Step 1 BUYS THE DOMAIN at the registrar — costs real money. " +
+      "Only force this if the buy was rolled back / the domain row is bring-your-own."
+    case 4: return "Step 4 sets nameservers at Spaceship — rapid retries can rate-limit " +
+      "your registrar account. Wait at least a few minutes between forced retries."
+    case 6: return "Step 6 PROVISIONS A NEW DROPLET on DigitalOcean — costs real money " +
+      "and takes 5–15 minutes. Only force this if the existing server is dead."
+    default: return null
+  }
+}
 
 interface Props {
   domain: string
@@ -98,18 +123,56 @@ export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, i
     setFlash({ kind, text })
     window.setTimeout(() => setFlash(null), 5500)
   }
-  async function runPipeline() {
-    if (!confirm(`Run pipeline for ${domain}?`)) return
-    setBusy("run")
-    const r = await domainActions.runPipeline(domain)
+  // Run pipeline dialog state — replaces the old confirm() so the operator
+  // can pick a per-run LLM provider/model override (and skip-purchase) without
+  // a forced default. Dialog is identical in shape to the brief dialog, just
+  // without the textarea.
+  const [runDialog, setRunDialog] = React.useState<{
+    open: boolean; skipPurchase: boolean; provider: string; model: string; busy: boolean
+  }>({ open: false, skipPurchase: false, provider: "", model: "", busy: false })
+  function openRunDialog() {
+    setRunDialog({ open: true, skipPurchase: false, provider: "", model: "", busy: false })
+  }
+  async function submitRunDialog() {
+    setRunDialog((s) => ({ ...s, busy: true }))
+    const r = await domainActions.runPipeline(domain, {
+      skipPurchase: runDialog.skipPurchase || undefined,
+      customProvider: runDialog.provider || undefined,
+      customModel: runDialog.model.trim() || undefined,
+    })
     show(r.ok ? "ok" : "err", r.message ?? r.error ?? "")
-    setBusy(null)
+    setRunDialog({ open: false, skipPurchase: false, provider: "", model: "", busy: false })
   }
   async function retryStep() {
     setBusy("retry")
     const r = await domainActions.runFromStep(domain, currentStep)
     show(r.ok ? "ok" : "err", r.message ?? r.error ?? "")
     setBusy(null)
+  }
+  // Brief dialog state — driven by the Regenerate button and the Force
+  // button on step 9. The textarea lets the operator override the LLM's
+  // auto-inferred niche; the provider/model dropdowns let them route this
+  // single call to a different LLM than the global setting. All four fields
+  // are independently optional — empty = use the configured defaults.
+  const [briefDialog, setBriefDialog] = React.useState<{
+    open: boolean
+    prompt: string
+    provider: string
+    model: string
+    busy: boolean
+  }>({ open: false, prompt: "", provider: "", model: "", busy: false })
+  function openBriefDialog() {
+    setBriefDialog({ open: true, prompt: "", provider: "", model: "", busy: false })
+  }
+  async function submitBriefDialog() {
+    setBriefDialog((s) => ({ ...s, busy: true }))
+    const r = await domainActions.runFromStep(domain, 9, {
+      customPrompt: briefDialog.prompt.trim() || null,
+      customProvider: briefDialog.provider.trim() || null,
+      customModel: briefDialog.model.trim() || null,
+    })
+    show(r.ok ? "ok" : "err", r.message ?? r.error ?? "Regenerate requested")
+    setBriefDialog({ open: false, prompt: "", provider: "", model: "", busy: false })
   }
   // Per-step "Run from here" — same primitive as the watcher page's per-row
   // button. Re-enqueues pipeline.full with start_from=N; smart-resume short-
@@ -119,6 +182,30 @@ export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, i
     setPerStepBusy(stepNum)
     const r = await domainActions.runFromStep(domain, stepNum)
     show(r.ok ? "ok" : "err", r.message ?? r.error ?? `Run from step ${stepNum} requested`)
+    setPerStepBusy(null)
+  }
+  // Force re-run on COMPLETED/SKIPPED/PENDING steps. Backend already
+  // supports unlocking via run-from/[step] (resetStepsFrom + startFrom unlock
+  // in isStepLocked), so this is a UI escape hatch with stronger confirmation
+  // for destructive steps (1=domain buy, 4=NS, 6=server provision).
+  //
+  // Special case: step 9 (LLM gen) goes through the brief dialog instead of
+  // a plain confirm() so the operator can paste a custom niche/style brief.
+  async function onForceRerun(stepNum: number, stepName: string) {
+    if (stepNum === 9) {
+      openBriefDialog()
+      return
+    }
+    const destructive = forceRerunWarning(stepNum)
+    const baseMsg =
+      `Force re-run from step ${stepNum} (${stepName})?\n\n` +
+      `This will replay step ${stepNum} and every step after, IGNORING the ` +
+      `completion lock that normally prevents redoing finished work.`
+    const fullMsg = destructive ? `${baseMsg}\n\n⚠ ${destructive}` : baseMsg
+    if (!confirm(fullMsg)) return
+    setPerStepBusy(stepNum)
+    const r = await domainActions.runFromStep(domain, stepNum)
+    show(r.ok ? "ok" : "err", r.message ?? r.error ?? `Forced re-run from step ${stepNum}`)
     setPerStepBusy(null)
   }
   async function cancelPipeline() {
@@ -220,8 +307,8 @@ export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, i
             <ButtonGroup>
               <Button
                 size="sm" className="gap-1.5 btn-success"
-                onClick={runPipeline} disabled={busy !== null}
-                title="Run the full pipeline (smart-resume — auto-detects completed steps)"
+                onClick={openRunDialog} disabled={busy !== null}
+                title="Run the full pipeline (smart-resume — auto-detects completed steps). Optional LLM provider override available."
               >
                 <Play className="h-3.5 w-3.5" /> Run pipeline
               </Button>
@@ -231,6 +318,13 @@ export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, i
                 title={`Re-run pipeline starting at step ${currentStep}`}
               >
                 <RotateCw className="h-3.5 w-3.5" /> Retry step {currentStep}
+              </Button>
+              <Button
+                size="sm" variant="outline" className="gap-1.5 btn-soft-success"
+                onClick={openBriefDialog} disabled={busy !== null}
+                title="Re-run only steps 9 + 10 (LLM gen + index.php upload). DNS / server / SSL stay intact. Optional brief lets you steer the niche."
+              >
+                <Sparkles className="h-3.5 w-3.5" /> Regenerate site
               </Button>
               <Button
                 size="sm" variant="outline" className="gap-1.5 btn-soft-warning"
@@ -439,6 +533,26 @@ export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, i
                             Run from here
                           </Button>
                         )}
+                        {(st === "completed" || st === "skipped" || st === "pending") && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className={cn(
+                              "h-6 gap-1 px-1.5 text-xs text-muted-foreground hover:text-status-terminal",
+                              forceRerunWarning(num) && "hover:text-status-terminal",
+                            )}
+                            onClick={() => onForceRerun(num, stepName)}
+                            disabled={perStepBusy === num}
+                            title={
+                              forceRerunWarning(num)
+                                ? `Force re-run step ${num} — destructive, see warning`
+                                : `Force re-run step ${num} (overrides completion lock)`
+                            }
+                          >
+                            <RotateCw className={cn("h-3 w-3", perStepBusy === num && "animate-spin")} />
+                            Force
+                          </Button>
+                        )}
                       </div>
                     </div>
                     {s?.message && (
@@ -499,6 +613,195 @@ export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, i
           ))}
         </div>
       </section>
+
+      {/* Run pipeline dialog — replaces the old confirm() so the operator can
+          override the default LLM provider/model and skip-purchase flag for
+          this run only. Same three-zone scrolling layout as the brief dialog. */}
+      <Dialog
+        open={runDialog.open}
+        onOpenChange={(o) => setRunDialog((s) => ({ ...s, open: o }))}
+      >
+        <DialogContent className="flex max-h-[90vh] flex-col gap-0 p-0 sm:max-w-[520px]">
+          <DialogHeader className="shrink-0 px-6 pt-6 pb-2">
+            <DialogTitle className="inline-flex items-center gap-2">
+              <Play className="h-4 w-4 text-status-completed" />
+              Run pipeline for <span className="font-mono">{domain}</span>
+            </DialogTitle>
+            <DialogDescription>
+              Smart-resume: the worker auto-detects completed steps and only redoes what's
+              missing. Optional fields below let you skip the registrar purchase or route
+              step 9 (LLM site generation) to a different provider for this run only.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="min-h-0 flex-1 overflow-y-auto px-6 py-3 flex flex-col gap-3">
+            <label className="inline-flex items-center gap-2 text-small">
+              <Checkbox
+                checked={runDialog.skipPurchase}
+                onCheckedChange={(v) => setRunDialog((s) => ({ ...s, skipPurchase: Boolean(v) }))}
+              />
+              Skip purchase (BYO domain — assume already owned)
+            </label>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="text-micro font-medium">
+                  Provider <span className="text-muted-foreground">(this run only)</span>
+                </label>
+                <Select
+                  value={runDialog.provider || "__default__"}
+                  onValueChange={(v) =>
+                    setRunDialog((s) => ({ ...s, provider: v === "__default__" ? "" : v }))
+                  }
+                >
+                  <SelectTrigger className="h-8 text-small mt-1"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__default__">(use default from Settings)</SelectItem>
+                    <SelectItem value="anthropic">Anthropic (Claude)</SelectItem>
+                    <SelectItem value="openai">OpenAI (GPT)</SelectItem>
+                    <SelectItem value="gemini">Google Gemini</SelectItem>
+                    <SelectItem value="openrouter">OpenRouter</SelectItem>
+                    <SelectItem value="moonshot">Moonshot Kimi</SelectItem>
+                    <SelectItem value="cloudflare">Cloudflare Workers AI (single)</SelectItem>
+                    <SelectItem value="cloudflare_pool">Cloudflare Workers AI POOL</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div>
+                <label className="text-micro font-medium">
+                  Model <span className="text-muted-foreground">(optional)</span>
+                </label>
+                <div className="mt-1">
+                  <ModelPicker
+                    provider={runDialog.provider || "anthropic"}
+                    value={runDialog.model}
+                    onChange={(v) => setRunDialog((s) => ({ ...s, model: v }))}
+                    size="sm"
+                  />
+                </div>
+              </div>
+            </div>
+            <p className="text-micro text-muted-foreground">
+              The override only applies to step 9 of THIS run — global Settings are
+              unchanged. Each provider still pulls its API key from Settings.
+            </p>
+          </div>
+          <DialogFooter className="shrink-0 border-t border-border bg-background/95 px-6 py-3">
+            <Button
+              variant="ghost" size="sm"
+              onClick={() => setRunDialog({ open: false, skipPurchase: false, provider: "", model: "", busy: false })}
+              disabled={runDialog.busy}
+            >
+              Cancel
+            </Button>
+            <Button
+              size="sm" className="gap-1.5 btn-success"
+              onClick={submitRunDialog} disabled={runDialog.busy}
+            >
+              {runDialog.busy
+                ? <RotateCw className="h-3.5 w-3.5 animate-spin" />
+                : <Play className="h-3.5 w-3.5" />}
+              Start
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Brief dialog — opened by Regenerate site or Force button on step 9.
+          Three-zone flex layout (header / scrolling middle / footer) so a
+          long pasted brief never pushes the submit button off-screen. Same
+          pattern as OperatorDialog; inlined here because the dynamic submit
+          label needs the dialog's own state. */}
+      <Dialog
+        open={briefDialog.open}
+        onOpenChange={(o) => setBriefDialog((s) => ({ ...s, open: o }))}
+      >
+        <DialogContent className="flex max-h-[90vh] flex-col gap-0 p-0 sm:max-w-[560px]">
+          <DialogHeader className="shrink-0 px-6 pt-6 pb-2">
+            <DialogTitle className="inline-flex items-center gap-2">
+              <Sparkles className="h-4 w-4 text-status-completed" />
+              Regenerate site for <span className="font-mono">{domain}</span>
+            </DialogTitle>
+            <DialogDescription>
+              Optional brief — tell the LLM what kind of site to build. Leave
+              empty to use the default niche-from-domain-name inference. Re-runs
+              steps 9 (LLM) and 10 (upload index.php). DNS / server / SSL stay
+              intact. The current site stays live until the new one finishes.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="min-h-0 flex-1 overflow-y-auto px-6 py-3 flex flex-col gap-3">
+            <Textarea
+              value={briefDialog.prompt}
+              onChange={(e) => setBriefDialog((s) => ({ ...s, prompt: e.target.value }))}
+              placeholder="e.g. Professional dental clinic landing page in a teal/white palette. Hero with appointment-CTA, services list (cleanings / fillings / cosmetic), team blurb, location map, contact form."
+              rows={6}
+              className="font-mono text-small"
+              autoFocus
+            />
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="text-micro font-medium">
+                  Provider <span className="text-muted-foreground">(this run only)</span>
+                </label>
+                <Select
+                  value={briefDialog.provider || "__default__"}
+                  onValueChange={(v) =>
+                    setBriefDialog((s) => ({ ...s, provider: v === "__default__" ? "" : v }))
+                  }
+                >
+                  <SelectTrigger className="h-8 text-small mt-1"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__default__">(use global setting)</SelectItem>
+                    <SelectItem value="anthropic">Anthropic (Claude)</SelectItem>
+                    <SelectItem value="openai">OpenAI (GPT)</SelectItem>
+                    <SelectItem value="gemini">Google Gemini</SelectItem>
+                    <SelectItem value="openrouter">OpenRouter</SelectItem>
+                    <SelectItem value="moonshot">Moonshot Kimi</SelectItem>
+                    <SelectItem value="cloudflare">Cloudflare Workers AI (single)</SelectItem>
+                    <SelectItem value="cloudflare_pool">Cloudflare Workers AI POOL</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div>
+                <label className="text-micro font-medium">
+                  Model <span className="text-muted-foreground">(optional override)</span>
+                </label>
+                <div className="mt-1">
+                  <ModelPicker
+                    provider={briefDialog.provider || "anthropic"}
+                    value={briefDialog.model}
+                    onChange={(v) => setBriefDialog((s) => ({ ...s, model: v }))}
+                    size="sm"
+                  />
+                </div>
+              </div>
+            </div>
+            <p className="text-micro text-muted-foreground">
+              Provider / model only override THIS regeneration — the global Settings
+              value is unchanged. Each provider still pulls its API key from the
+              settings page. Safety constraints (no medical / financial / gambling /
+              adult content) still apply — the brief shapes niche + style, not the
+              policy bar.
+            </p>
+          </div>
+          <DialogFooter className="shrink-0 border-t border-border bg-background/95 px-6 py-3">
+            <Button
+              variant="ghost" size="sm"
+              onClick={() => setBriefDialog({ open: false, prompt: "", provider: "", model: "", busy: false })}
+              disabled={briefDialog.busy}
+            >
+              Cancel
+            </Button>
+            <Button
+              size="sm" className="gap-1.5 btn-soft-success"
+              onClick={submitBriefDialog} disabled={briefDialog.busy}
+            >
+              {briefDialog.busy
+                ? <RotateCw className="h-3.5 w-3.5 animate-spin" />
+                : <Sparkles className="h-3.5 w-3.5" />}
+              {briefDialog.prompt.trim() ? "Regenerate with brief" : "Regenerate (auto-niche)"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

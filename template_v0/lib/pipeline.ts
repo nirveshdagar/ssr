@@ -43,7 +43,7 @@ import { addDomain, getDomain, updateDomain, type DomainRow } from "./repos/doma
 import { listServers, updateServer, type ServerRow } from "./repos/servers"
 import { logPipeline } from "./repos/logs"
 import {
-  initSteps, updateStep, heartbeat, setStepArtifact,
+  initSteps, updateStep, heartbeat, setStepArtifact, getStepArtifact,
   startPipelineRun, endPipelineRun,
 } from "./repos/steps"
 import { enqueueJob, registerHandler } from "./jobs"
@@ -58,7 +58,7 @@ import {
   createApplication, findAppId, installCustomSsl, uploadIndexPhp,
   installAgentOnDroplet, isSaServerAlive,
 } from "./serveravatar"
-import { generateSinglePage, ContentBlockedError } from "./website-generator"
+import { generateSinglePage, ContentBlockedError, type GeneratedFile } from "./website-generator"
 import {
   createDroplet, DOAllTokensFailed, DropletRateLimited,
 } from "./digitalocean"
@@ -173,6 +173,16 @@ export interface PipelineFullPayload {
   server_id?: number | null
   start_from?: number | null
   force_new_server?: boolean
+  /** Operator-supplied site brief — when present, step 9 passes it to the
+   *  LLM as "Operator brief" so the model uses that niche/style instead of
+   *  inferring from the domain name. Only consulted when start_from <= 9. */
+  custom_prompt?: string | null
+  /** Per-call provider override (e.g. "anthropic", "cloudflare_pool") — for
+   *  this run only. Falls back to the global llm_provider setting. */
+  custom_provider?: string | null
+  /** Per-call model override (e.g. "claude-haiku-4-5-20251001"). Falls back
+   *  to the llm_model setting and then per-provider defaults. */
+  custom_model?: string | null
 }
 
 export interface PipelineBulkPayload {
@@ -180,6 +190,8 @@ export interface PipelineBulkPayload {
   skip_purchase?: boolean
   server_id?: number | null
   force_new_server?: boolean
+  custom_provider?: string | null
+  custom_model?: string | null
 }
 
 export function runFullPipeline(
@@ -189,6 +201,9 @@ export function runFullPipeline(
     serverId?: number | null
     startFrom?: number | null
     forceNewServer?: boolean
+    customPrompt?: string | null
+    customProvider?: string | null
+    customModel?: string | null
   } = {},
 ): number | null {
   if (!tryAcquireSlot(domain)) {
@@ -202,6 +217,9 @@ export function runFullPipeline(
     server_id: opts.serverId ?? null,
     start_from: opts.startFrom ?? null,
     force_new_server: opts.forceNewServer ?? false,
+    custom_prompt: opts.customPrompt ?? null,
+    custom_provider: opts.customProvider ?? null,
+    custom_model: opts.customModel ?? null,
   })
 }
 
@@ -232,6 +250,8 @@ export function runBulkPipeline(
     skipPurchase?: boolean
     serverId?: number | null
     forceNewServer?: boolean
+    customProvider?: string | null
+    customModel?: string | null
   } = {},
 ): BulkRunResult {
   const eligible: string[] = []
@@ -252,6 +272,8 @@ export function runBulkPipeline(
       server_id: opts.serverId ?? null,
       start_from: null,
       force_new_server: opts.forceNewServer ?? false,
+      custom_provider: opts.customProvider ?? null,
+      custom_model: opts.customModel ?? null,
     }),
   )
   return {
@@ -281,6 +303,8 @@ export function runSequentialBulkPipeline(
     skipPurchase?: boolean
     serverId?: number | null
     forceNewServer?: boolean
+    customProvider?: string | null
+    customModel?: string | null
   } = {},
 ): BulkRunResult {
   const eligible: string[] = []
@@ -302,6 +326,8 @@ export function runSequentialBulkPipeline(
     skip_purchase: opts.skipPurchase ?? false,
     server_id: opts.serverId ?? null,
     force_new_server: opts.forceNewServer ?? false,
+    custom_provider: opts.customProvider ?? null,
+    custom_model: opts.customModel ?? null,
   })
   return {
     job_ids: [jobId],
@@ -320,6 +346,9 @@ async function pipelineFullHandler(payload: Record<string, unknown>): Promise<vo
   await pipelineWorker(
     p.domain, p.skip_purchase ?? false, p.server_id ?? null,
     p.start_from ?? null, p.force_new_server ?? false,
+    p.custom_prompt ?? null,
+    p.custom_provider ?? null,
+    p.custom_model ?? null,
   )
 }
 
@@ -330,6 +359,9 @@ async function pipelineBulkHandler(payload: Record<string, unknown>): Promise<vo
       await pipelineWorker(
         d, p.skip_purchase ?? false, p.server_id ?? null,
         null, p.force_new_server ?? false,
+        null,
+        p.custom_provider ?? null,
+        p.custom_model ?? null,
       )
     } catch (e) {
       logPipeline(d, "pipeline", "failed",
@@ -350,6 +382,9 @@ export function registerPipelineHandlers(): void {
 async function pipelineWorker(
   domain: string, skipPurchase: boolean, serverId: number | null,
   startFrom: number | null, forceNewServer: boolean,
+  customPrompt: string | null = null,
+  customProvider: string | null = null,
+  customModel: string | null = null,
 ): Promise<void> {
   const runId = startPipelineRun(domain, {
     skip_purchase: skipPurchase,
@@ -358,7 +393,10 @@ async function pipelineWorker(
   })
   const ticker = startHeartbeat(domain, 1000)
   try {
-    await pipelineWorkerImpl(domain, skipPurchase, serverId, startFrom, forceNewServer)
+    await pipelineWorkerImpl(
+      domain, skipPurchase, serverId, startFrom, forceNewServer,
+      customPrompt, customProvider, customModel,
+    )
   } finally {
     ticker.stop()
     // Determine final outcome from the post-run domain status. Order matters:
@@ -387,7 +425,8 @@ async function pipelineWorker(
 
 async function pipelineWorkerImpl(
   domain: string, skipPurchase: boolean, serverId: number | null, startFrom: number | null,
-  forceNewServer: boolean,
+  forceNewServer: boolean, customPrompt: string | null = null,
+  customProvider: string | null = null, customModel: string | null = null,
 ): Promise<void> {
   try {
     // Refuse to redo work on a domain that's already at a success status
@@ -504,15 +543,36 @@ async function pipelineWorkerImpl(
 
     checkCancel(domain)
     let php: string | null = null
+    let files: GeneratedFile[] | undefined
     if (startFrom == null || startFrom <= 9) {
       if (shouldRun(9)) {
-        php = await step9GenerateContent(domain)
-        if (php == null) return
+        const r = await step9GenerateContent(domain, customPrompt, customProvider, customModel)
+        if (r == null) return
+        php = r.php
+        files = r.files
       } else {
-        // Step 9 locked from prior completion — read cached site_html
-        // off the domain row (step 9 persists it there on success).
-        const d = getDomain(domain)
-        php = d?.site_html ?? null
+        // Step 9 locked from prior completion — would normally read cached
+        // site_html off the domain row. BUT: only the entry-point file is
+        // cached there. If the prior run was multi-file, the siblings
+        // (style.css, app.js, assets/*) aren't recoverable from the cache,
+        // and re-running step 10 alone would re-upload only the index —
+        // leaving stale siblings on the SA box (or none at all on a fresh
+        // server during migration). When the prior step-9 artifact reports
+        // a multi-file output, force regen instead of trusting the cache.
+        const last9 = getStepArtifact<{ files?: { path: string }[] | null }>(domain, 9)
+        const wasMultiFile = Array.isArray(last9?.files) && (last9!.files!.length > 1)
+        if (wasMultiFile) {
+          logPipeline(domain, "pipeline", "warning",
+            `Prior step 9 produced ${last9!.files!.length} files but only the index ` +
+            `is cached — re-running step 9 to restore the full tree`)
+          const r = await step9GenerateContent(domain, customPrompt, customProvider, customModel)
+          if (r == null) return
+          php = r.php
+          files = r.files
+        } else {
+          const d = getDomain(domain)
+          php = d?.site_html ?? null
+        }
       }
     }
     // If we got here without php (start_from > 9, or step 9 was locked
@@ -540,7 +600,7 @@ async function pipelineWorkerImpl(
     checkCancel(domain)
     if (startFrom == null || startFrom <= 10) {
       if (shouldRun(10)) {
-        if (!await step10UploadIndexPhp(domain, server, php!)) return
+        if (!await step10UploadIndexPhp(domain, server, php!, files)) return
       }
     }
 
@@ -984,9 +1044,34 @@ async function step8IssueAndInstallSsl(domain: string, server: ServerRow): Promi
   }
 
   if (installOk) {
-    updateStep(domain, 8, "completed", `SSL installed (${installMsg})`)
+    // Defensive verification — TLS-probe the origin IP and confirm the cert
+    // serving is actually our CloudFlare Origin CA, not SA's auto-issued
+    // Let's Encrypt. Catches the failure mode where the API/UI tier reports
+    // success but a stale LE cert remained on the SA box (the "treats SA's
+    // own SSL as completed" symptom). Probe failure is non-fatal — we don't
+    // break working pipelines on a transient network blip.
+    const { verifyOriginCertIsCustom } = await import("./serveravatar")
+    const verify = await verifyOriginCertIsCustom(server.ip!, domain)
+    if (verify.ok === false) {
+      // Cert IS serving but with the wrong issuer (LE on origin → step
+      // didn't actually replace it). Surface as warning so Run-from-here
+      // shows the retry button.
+      updateStep(domain, 8, "warning",
+        `SSL install reported success BUT cert verification failed: ${verify.message}. ` +
+        `Installer message: ${installMsg}. Click "Run from here" on step 8 to retry.`)
+      updateDomain(domain, { status: "retryable_error" })
+      return false
+    }
+    const verifyNote = verify.ok === true
+      ? ` · cert ${verify.message}`
+      : ` · cert verify skipped (${verify.message})`
+    updateStep(domain, 8, "completed", `SSL installed (${installMsg})${verifyNote}`)
     updateDomain(domain, { status: "ssl_installed" })
-    setStepArtifact(domain, 8, { cert_id: bundle.id, expires_on: bundle.expires_on })
+    setStepArtifact(domain, 8, {
+      cert_id: bundle.id, expires_on: bundle.expires_on,
+      verified_issuer: verify.issuerCN ?? null,
+      verified: verify.ok === true,
+    })
     // Purge CF cache. Origin SSL just changed — any cached "SA welcome"
     // response from CF's earlier fetch through the broken HTTPS vhost
     // would otherwise persist for hours.
@@ -999,24 +1084,60 @@ async function step8IssueAndInstallSsl(domain: string, server: ServerRow): Promi
   return false
 }
 
-async function step9GenerateContent(domain: string): Promise<string | null> {
+async function step9GenerateContent(
+  domain: string, customPrompt: string | null = null,
+  customProvider: string | null = null, customModel: string | null = null,
+): Promise<{ php: string; files?: GeneratedFile[] } | null> {
   const d = getDomain(domain)
-  if (d?.site_html && d.site_html.length > 100) {
+  // When the operator supplied a custom brief OR explicitly chose a different
+  // provider/model (force-rerun via the brief dialog), ALWAYS run the LLM —
+  // the cached site_html was generated under different params, so the
+  // operator clearly wants a redo.
+  const hasOverrides = Boolean(customPrompt || customProvider || customModel)
+  if (!hasOverrides && d?.site_html && d.site_html.length > 100) {
     updateStep(domain, 9, "skipped", "Content already generated")
-    return d.site_html
+    // Note: no `files` here — multi-file siblings aren't cached on the
+    // domain row. Step 10 will re-upload only the index. Same effect as
+    // pre-multi-file pipelines: rerunning step 10 alone touches index only.
+    return { php: d.site_html }
   }
-  updateStep(domain, 9, "running", "Generating single-page site (Haiku 4.5)...")
+  const briefNote = [
+    customPrompt ? "custom brief" : null,
+    customProvider ? `provider=${customProvider}` : null,
+    customModel ? `model=${customModel}` : null,
+  ].filter(Boolean).join(", ")
+  const note = briefNote ? ` (${briefNote})` : ""
+  updateStep(domain, 9, "running", `Generating single-page site${note}...`)
   try {
-    const result = await generateSinglePage(domain)
+    const result = await generateSinglePage(domain, {
+      customPrompt, customProvider, customModel,
+    })
     const php = result.php
     const niche = result.inferredNiche
     updateDomain(domain, { site_html: php })
-    updateStep(domain, 9, "completed", `Generated (niche='${niche}'  bytes=${php.length})`)
+    // When the LLM refused and the static "Coming Soon" placeholder was
+    // substituted, mark the step "warning" so the dashboard's existing
+    // Run-from-here button surfaces on the timeline (it's hidden on
+    // "completed" steps to avoid noise on healthy pipelines). Pipeline
+    // still continues — the site is LIVE with the placeholder.
+    if (result.usedFallback) {
+      updateStep(domain, 9, "warning",
+        `Placeholder used — LLM refused for this domain (niche='${niche}'). ` +
+        `Click "Run from here" on step 9 to retry, change provider/model, or accept placeholder.`)
+    } else if (result.files && result.files.length > 1) {
+      updateStep(domain, 9, "completed",
+        `Generated (niche='${niche}'  files=${result.files.length}: ` +
+        `${result.files.map((f) => f.path).join(", ").slice(0, 240)})`)
+    } else {
+      updateStep(domain, 9, "completed", `Generated (niche='${niche}'  bytes=${php.length})`)
+    }
     setStepArtifact(domain, 9, {
       niche, byte_size: php.length,
       sha256: createHash("sha256").update(php, "utf8").digest("hex"),
+      placeholder: Boolean(result.usedFallback),
+      files: result.files?.map((f) => ({ path: f.path, bytes: f.content.length })) ?? null,
     })
-    return php
+    return { php, files: result.files }
   } catch (e) {
     if (e instanceof ContentBlockedError) {
       updateStep(domain, 9, "failed",
@@ -1032,14 +1153,25 @@ async function step9GenerateContent(domain: string): Promise<string | null> {
 }
 
 async function step10UploadIndexPhp(
-  domain: string, server: ServerRow, php: string,
+  domain: string, server: ServerRow, php: string, files?: GeneratedFile[],
 ): Promise<boolean> {
-  updateStep(domain, 10, "running", `Writing index.php to ${server.name}...`)
+  const isMultiFile = Boolean(files && files.length > 1)
+  updateStep(domain, 10, "running",
+    isMultiFile
+      ? `Writing ${files!.length} files to ${server.name}...`
+      : `Writing index.php to ${server.name}...`)
   try {
-    await uploadIndexPhp(server.sa_server_id!, domain, php, server.ip ?? undefined)
+    if (isMultiFile) {
+      const { uploadAppFiles } = await import("./serveravatar")
+      await uploadAppFiles(server.sa_server_id!, domain, files!, server.ip ?? undefined)
+    } else {
+      await uploadIndexPhp(server.sa_server_id!, domain, php, server.ip ?? undefined)
+    }
 
-    // Archive the generated content locally so dead-server migration can
+    // Archive the entry-point file locally so dead-server migration can
     // re-upload it without paying the LLM or waiting on regeneration.
+    // For multi-file sites, only the index is archived — siblings will be
+    // regenerated on migration. (Future improvement: archive the whole tree.)
     try {
       const { archiveSite } = await import("./migration")
       await archiveSite(domain, php)
@@ -1054,6 +1186,7 @@ async function step10UploadIndexPhp(
       `once https://${domain}/ responds (usually a few min).`)
     setStepArtifact(domain, 10, {
       server_ip: server.ip, server_id: server.id, byte_size: php.length,
+      multi_file: isMultiFile, file_count: files?.length ?? 1,
     })
     // Purge CF cache so visitors immediately see the new content. Without
     // this, CF can keep serving the SA welcome page (cached during step 7)

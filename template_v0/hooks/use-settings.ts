@@ -29,6 +29,15 @@ export interface SettingsValues {
   llm_api_key_openai: string
   llm_api_key_gemini: string
   llm_api_key_openrouter: string
+  llm_api_key_moonshot: string
+  llm_timeout_ms: string
+  llm_max_output_tokens: string
+  cloudflare_account_id: string
+  cloudflare_workers_ai_token: string
+  // CLI-auth toggles — when on, ignore the per-provider API key above and
+  // shell out to the local `gemini` / `codex` binary that's already
+  // OAuth-logged-in on this machine. Only OpenAI and Gemini support this.
+  llm_cli_enabled_openai: boolean
   smtp_server: string
   smtp_port: string
   smtp_email: string

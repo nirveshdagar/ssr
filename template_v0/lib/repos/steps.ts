@@ -259,6 +259,35 @@ export function setStepArtifact(
   }
 }
 
+/**
+ * Read the most recent step artifact for a (domain, step). Looks at the
+ * latest non-running pipeline_run for the domain and pulls that step's
+ * artifact_json. Returns null if no artifact has ever been recorded.
+ *
+ * Used by the worker to detect "prior step 9 was multi-file → siblings
+ * weren't cached → forcing regen on resume" without making the worker
+ * issue ad-hoc SQL.
+ */
+export function getStepArtifact<T = Record<string, unknown>>(
+  domain: string, stepNum: number,
+): T | null {
+  const row = one<{ artifact_json: string | null }>(
+    `SELECT psr.artifact_json
+       FROM pipeline_step_runs psr
+       JOIN pipeline_runs pr ON pr.id = psr.run_id
+      WHERE pr.domain = ? AND psr.step_num = ?
+      ORDER BY pr.id DESC
+      LIMIT 1`,
+    domain, stepNum,
+  )
+  if (!row?.artifact_json) return null
+  try {
+    return JSON.parse(row.artifact_json) as T
+  } catch {
+    return null
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Read helpers (used by /api/runs and the watcher pages)
 // ---------------------------------------------------------------------------
