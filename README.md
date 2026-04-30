@@ -53,29 +53,44 @@ If you want a multi-tenant SaaS, this isn't that. If you want a private cockpit 
 
 ## Quick start
 
-> Detailed Ubuntu deployment instructions: [`UBUNTU_INSTALL.md`](./UBUNTU_INSTALL.md)
-> Production deploy & operations: [`template_v0/DEPLOY.md`](./template_v0/DEPLOY.md)
+### 🚀 One command on a fresh Ubuntu server (recommended)
+
+SSH into a fresh Ubuntu 22.04 or 24.04 LTS server (1 GB RAM minimum, 2 GB recommended), then run:
 
 ```bash
-# 1. Clone
-git clone https://github.com/nirveshdagar/ssr.git
-cd ssr/template_v0
-
-# 2. Install (Node 22+ required)
-npm ci
-npx patchright install chromium    # optional — only for SA UI fallback
-
-# 3. Configure
-cp .env.example .env.local
-# Edit .env.local — set SSR_SESSION_PASSWORD to a 32+ byte random string:
-#   node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"
-
-# 4. Build & run
-npm run build
-npm run start                      # http://localhost:3000
+curl -fsSL https://raw.githubusercontent.com/nirveshdagar/ssr/main/install.sh \
+  | sudo DASHBOARD_HOSTNAME=ssr.example.com CERTBOT_EMAIL=you@example.com bash
 ```
 
-First time you load the dashboard, set the operator password in **Settings → Security**, then add your Cloudflare keys, DO tokens, ServerAvatar credentials, Spaceship API key, and at least one LLM provider key.
+That's it. The script (in ~5 minutes):
+
+1. Apt-installs base tooling, Node 22, Chromium runtime libs
+2. Creates the `ssr` operator user + `/opt/ssr` install dir
+3. Clones the repo, runs `npm ci`, builds the app
+4. Generates a fresh session secret in `.env.local`
+5. Wires up the systemd service (graceful SIGTERM drain, auto-restart)
+6. Configures `ufw` (only SSH + 80/443 exposed)
+7. Sets up nginx as reverse proxy
+8. Issues a Let's Encrypt cert + redirects HTTP → HTTPS
+
+When it finishes you have a live, TLS-protected dashboard at `https://ssr.example.com/`. Open it, set the operator password in **Settings → Security**, then add your Cloudflare keys, DO tokens, ServerAvatar credentials, Spaceship API key, and at least one LLM provider key.
+
+> **Without TLS / without a domain yet?** Omit the env vars — `curl ... | sudo bash` runs the script in "no-domain" mode and binds the dashboard to `127.0.0.1:3000` for SSH-tunneling. Re-run with `DASHBOARD_HOSTNAME=...` later to add nginx + Let's Encrypt.
+>
+> Re-running `install.sh` is safe — every step is idempotent. Use it for routine `git pull` + rebuild + restart, too.
+
+For step-by-step manual install, troubleshooting, ops + backups, see [`UBUNTU_INSTALL.md`](./UBUNTU_INSTALL.md). For day-2 production tuning, see [`template_v0/DEPLOY.md`](./template_v0/DEPLOY.md).
+
+### Local development (Mac/Windows/Linux)
+
+```bash
+git clone https://github.com/nirveshdagar/ssr.git
+cd ssr/template_v0
+npm ci
+cp .env.example .env.local
+echo "SSR_SESSION_PASSWORD=$(node -e "console.log(require('crypto').randomBytes(48).toString('base64'))")" >> .env.local
+npm run dev          # http://localhost:3000 with Turbopack HMR
+```
 
 ## Architecture overview
 
