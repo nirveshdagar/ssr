@@ -679,6 +679,133 @@ export async function checkSaAgents(): Promise<SaHealthResult> {
 }
 
 // ---------------------------------------------------------------------------
+// Live + content auto-repair — fires the same reason→step pipeline
+// runFromStep(N) the operator gets when they click a DOWN / DEFAULT PAGE
+// badge on /domains, but does it on the 5-min auto-heal cadence so the
+// fleet self-heals without a human in the loop.
+// ---------------------------------------------------------------------------
+
+// Reason → step mapping. KEEP IN SYNC WITH the REPAIR_STEP map in
+// app/domains/page.tsx — they encode the same recovery policy. Reasons
+// not listed (timeout, connect_refused, fetch_error) need operator
+// judgment (migration vs. server-level fix) so we don't auto-fire them.
+const AUTOHEAL_REPAIR_STEP: Record<string, number> = {
+  dns_fail: 5,    // re-set NS + wait for zone active
+  ssl_error: 8,   // re-issue + install SSL
+  http_4xx: 10,   // upload index.php
+  http_5xx: 7,    // re-create SA app / fix Apache
+}
+
+// Per-domain streak of consecutive auto-heal ticks where the row was
+// observed as failing. We require 2 consecutive ticks (≥10 min of being
+// down) before firing a repair, so a single transient probe failure
+// doesn't kick off a 30-second pipeline run.
+const liveDownStreak = new Map<string, number>()
+const REPAIR_STREAK_THRESHOLD = 2
+
+export interface DownAutoFixResult {
+  candidates: number
+  fired: { domain: string; reason: string; step: number; jobId: number }[]
+  skippedNoMap: { domain: string; reason: string }[]
+  skippedInflight: { domain: string }[]
+  skippedNotEnoughStreak: { domain: string; streak: number }[]
+  skippedDisabled: boolean
+}
+
+export async function autoFixDownDomains(): Promise<DownAutoFixResult> {
+  const result: DownAutoFixResult = {
+    candidates: 0, fired: [], skippedNoMap: [], skippedInflight: [],
+    skippedNotEnoughStreak: [], skippedDisabled: false,
+  }
+  const enabled = (getSetting("auto_migrate_enabled") || "0") === "1"
+  if (!enabled) {
+    // Same kill switch the SSL auto-fix uses. Operator can disable
+    // self-heal entirely without losing the detection signal (badges
+    // still flip on /domains; we just don't auto-fire pipelines).
+    result.skippedDisabled = true
+    return result
+  }
+
+  // Two failure modes to repair:
+  //   live_ok=0                       → DOWN  (probe failed)
+  //   live_ok=1 AND content_ok=0      → DEFAULT PAGE (files weren't deployed)
+  // Both end up firing runFromStep(N).
+  const rows = all<{
+    domain: string
+    live_ok: number | null
+    live_reason: string | null
+    content_ok: number | null
+  }>(
+    `SELECT domain, live_ok, live_reason, content_ok
+       FROM domains
+      WHERE status IN ('hosted','live')
+        AND (live_ok = 0 OR (live_ok = 1 AND content_ok = 0))`,
+  )
+  result.candidates = rows.length
+
+  // GC streak entries for domains that are no longer failing — the live-
+  // checker writes live_ok=1 on success, so any domain not in this row
+  // set must have recovered (or been deleted).
+  const failing = new Set(rows.map((r) => r.domain))
+  for (const k of liveDownStreak.keys()) {
+    if (!failing.has(k)) liveDownStreak.delete(k)
+  }
+  if (rows.length === 0) return result
+
+  const { enqueueJob } = await import("./jobs")
+  for (const r of rows) {
+    // DEFAULT PAGE always maps to step 10. DOWN maps via reason; ambiguous
+    // reasons (timeout/connect_refused/fetch_error) are skipped.
+    const isDefaultPage = r.live_ok === 1 && r.content_ok === 0
+    const reason = isDefaultPage ? "default_page" : (r.live_reason ?? "unknown")
+    const step = isDefaultPage ? 10 : AUTOHEAL_REPAIR_STEP[reason]
+    if (!step) {
+      result.skippedNoMap.push({ domain: r.domain, reason })
+      continue
+    }
+    // Streak gating — require N consecutive observations before firing.
+    const streak = (liveDownStreak.get(r.domain) ?? 0) + 1
+    liveDownStreak.set(r.domain, streak)
+    if (streak < REPAIR_STREAK_THRESHOLD) {
+      result.skippedNotEnoughStreak.push({ domain: r.domain, streak })
+      continue
+    }
+    // Dedupe against any in-flight pipeline.full job for this domain so
+    // we don't stack retries when one is already running.
+    const inflight = all<{ id: number }>(
+      `SELECT id FROM jobs
+        WHERE kind = 'pipeline.full'
+          AND status IN ('queued', 'running')
+          AND payload_json LIKE ?`,
+      `%"domain":"${r.domain}"%`,
+    )
+    if (inflight.length > 0) {
+      result.skippedInflight.push({ domain: r.domain })
+      continue
+    }
+    const jobId = enqueueJob("pipeline.full", {
+      domain: r.domain,
+      skip_purchase: true,
+      server_id: null,
+      start_from: step,
+      force_new_server: false,
+    }, 1)
+    result.fired.push({ domain: r.domain, reason, step, jobId })
+    logPipeline(r.domain, "auto_heal", "running",
+      `Auto-fix: ${reason} (streak=${streak}) → enqueued pipeline.full from step ${step} (job ${jobId})`)
+    // Reset streak so a slow-running repair doesn't double-fire on the
+    // next tick. The dedupe-against-inflight guard already protects us,
+    // but resetting keeps the streak metric meaningful.
+    liveDownStreak.set(r.domain, 0)
+    try {
+      appendAudit("auto_heal_repair", r.domain,
+        `reason=${reason} step=${step} job=${jobId}`, null)
+    } catch { /* ignore */ }
+  }
+  return result
+}
+
+// ---------------------------------------------------------------------------
 // One tick of the background loop
 // ---------------------------------------------------------------------------
 
@@ -691,6 +818,7 @@ export interface AutoHealTickResult {
   saHealth: SaHealthResult | { error: string }
   stuckCreating: StuckCreatingResult | { error: string }
   sslSweep: SslSweepResult | { error: string }
+  downAutoFix: DownAutoFixResult | { error: string }
   ranAt: string
 }
 
@@ -756,6 +884,13 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
     sslSweep = { error: (e as Error).message }
   }
 
+  let downAutoFix: DownAutoFixResult | { error: string }
+  try {
+    downAutoFix = await autoFixDownDomains()
+  } catch (e) {
+    downAutoFix = { error: (e as Error).message }
+  }
+
   // Only audit-log when something actually happened — avoids audit spam.
   const claimedN = "claimed" in reconcile ? reconcile.claimed.length : 0
   const resumedN = "resumed" in resume ? resume.resumed.length : 0
@@ -765,17 +900,19 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
   const degradedN = "degraded" in saHealth ? saHealth.degraded.length : 0
   const stuckN = "reEnqueued" in stuckCreating ? stuckCreating.reEnqueued.length : 0
   const sslMismatchedN = "mismatched" in sslSweep ? sslSweep.mismatched.length : 0
-  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN + stuckN + sslMismatchedN > 0) {
+  const downRepairsN = "fired" in downAutoFix ? downAutoFix.fired.length : 0
+  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN + stuckN + sslMismatchedN + downRepairsN > 0) {
     appendAudit(
       "auto_heal_tick", "",
       `claimed=${claimedN} resumed=${resumedN} ns_resumed=${nsResumedN} ` +
       `retried=${retriedN} ssl_reissued=${sslReissuedN} sa_degraded=${degradedN} ` +
-      `stuck_recovered=${stuckN} ssl_mismatched=${sslMismatchedN}`,
+      `stuck_recovered=${stuckN} ssl_mismatched=${sslMismatchedN} ` +
+      `down_repairs=${downRepairsN}`,
       null,
     )
   }
 
-  return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, sslSweep, ranAt }
+  return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, sslSweep, downAutoFix, ranAt }
 }
 
 // ---------------------------------------------------------------------------
@@ -843,4 +980,10 @@ export const _internal = {
   autoResumeStuckPipelines,
   autoCheckPendingNs,
   autoHealTickOnce,
+  autoFixDownDomains,
+}
+
+/** Reset auto-heal in-memory streak state — useful for tests. */
+export function _resetAutoHealStreaks(): void {
+  liveDownStreak.clear()
 }
