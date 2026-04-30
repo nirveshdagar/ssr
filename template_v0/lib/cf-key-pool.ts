@@ -16,6 +16,7 @@
 
 import { getDb, all, one, run } from "./db"
 import { getSetting } from "./repos/settings"
+import { decrypt, encrypt } from "./secrets-vault"
 export { releaseCfKeySlot } from "./repos/domains"
 
 export class CFKeyPoolExhausted extends Error {
@@ -66,7 +67,7 @@ export function getNextAvailableCfKey(): CfKeyWithCreds {
       ORDER BY id ASC
       LIMIT 1`,
   )
-  if (row) return row
+  if (row) return { ...row, api_key: decrypt(row.api_key) }
   const total = one<{ n: number }>(
     "SELECT COUNT(*) AS n FROM cf_keys WHERE is_active = 1",
   )?.n ?? 0
@@ -101,7 +102,7 @@ export function assignCfKeyToDomain(domain: string, keyId?: number): CfKeyWithCr
       `SELECT ${KEY_WITH_CREDS_COLS} FROM cf_keys WHERE id = ?`,
       existing.cf_key_id,
     )
-    if (keyRow) return keyRow
+    if (keyRow) return { ...keyRow, api_key: decrypt(keyRow.api_key) }
   }
 
   // 2. Pick a candidate
@@ -119,7 +120,7 @@ export function assignCfKeyToDomain(domain: string, keyId?: number): CfKeyWithCr
         `CF key id=${keyId} not available (missing, inactive, or full).`,
       )
     }
-    candidate = row
+    candidate = { ...row, api_key: decrypt(row.api_key) }
   }
 
   // 3. Atomic increment + assignment.
@@ -167,10 +168,11 @@ export function assignCfKeyToDomain(domain: string, keyId?: number): CfKeyWithCr
   }
 
   // 4. Return fresh row (so the caller sees the post-increment domains_used)
-  return one<CfKeyWithCreds>(
+  const fresh = one<CfKeyWithCreds>(
     `SELECT ${KEY_WITH_CREDS_COLS} FROM cf_keys WHERE id = ?`,
     candidate.id,
   )!
+  return { ...fresh, api_key: decrypt(fresh.api_key) }
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +214,7 @@ export function addCfKey(opts: {
     `INSERT INTO cf_keys(email, api_key, alias, cf_account_id, max_domains)
      VALUES(?, ?, ?, ?, ?)`,
     opts.email,
-    opts.apiKey,
+    encrypt(opts.apiKey),
     opts.alias ?? null,
     opts.cfAccountId ?? null,
     maxDomains,
@@ -246,11 +248,12 @@ export async function refreshCfAccountId(cfKeyId: number): Promise<string> {
     cfKeyId,
   )
   if (!row) throw new Error(`cf_keys id=${cfKeyId} not found`)
+  const apiKey = decrypt(row.api_key)
 
   const res = await fetch("https://api.cloudflare.com/client/v4/accounts", {
     headers: {
       "X-Auth-Email": row.email,
-      "X-Auth-Key": row.api_key,
+      "X-Auth-Key": apiKey,
       "Content-Type": "application/json",
     },
     signal: AbortSignal.timeout(15_000),

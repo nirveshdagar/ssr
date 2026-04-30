@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { runBulkPipeline } from "@/lib/pipeline"
 import { listDomains } from "@/lib/repos/domains"
+import { appendAudit } from "@/lib/repos/audit"
 
 export const runtime = "nodejs"
 
@@ -59,6 +60,14 @@ export async function POST(req: NextRequest): Promise<Response> {
   const result = runBulkPipeline(domainsList, {
     skipPurchase, serverId, forceNewServer, customProvider, customModel,
   })
+  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null
+  appendAudit(
+    "pipeline_run_bulk", "",
+    `count=${domainsList.length} enqueued=${result.enqueued} skipped=${result.skipped} ` +
+    `server_id=${serverId ?? ""} force_new_server=${forceNewServer} ` +
+    `provider=${customProvider ?? ""} model=${customModel ?? ""}`,
+    ip,
+  )
   if (result.enqueued === 0) {
     return NextResponse.json({
       ok: false,

@@ -20,10 +20,44 @@ const PUBLIC_PATHS = new Set<string>([
 
 const PUBLIC_PREFIXES = ["/_next/", "/icon", "/apple-icon", "/placeholder"]
 
+// Methods that mutate state — additionally require Origin to match Host
+// (defense-in-depth on top of sameSite=strict). A misconfigured browser
+// or an exploit that defeats sameSite still hits this gate.
+const STATE_CHANGING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"])
+
+function originMatchesHost(req: NextRequest): boolean {
+  const origin = req.headers.get("origin")
+  // Same-origin form posts and many fetches send Origin. If absent, fall
+  // back to Referer — same-origin checked there. If both absent (e.g. cli
+  // tools), the cookie's sameSite=strict is the primary gate; allow.
+  const host = req.headers.get("host")
+  if (!host) return true
+  if (origin) {
+    try {
+      return new URL(origin).host === host
+    } catch { return false }
+  }
+  const referer = req.headers.get("referer")
+  if (referer) {
+    try {
+      return new URL(referer).host === host
+    } catch { return false }
+  }
+  return true
+}
+
 export async function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl
   if (PUBLIC_PATHS.has(pathname)) return NextResponse.next()
   if (PUBLIC_PREFIXES.some((p) => pathname.startsWith(p))) return NextResponse.next()
+
+  // CSRF gate — applies to state-changing methods on all non-public paths.
+  // Runs BEFORE auth so a cross-site attacker can't even hit a 401-vs-403
+  // distinguishing oracle. /api/auth/login is in PUBLIC_PATHS and bypassed
+  // — the form-post from /login itself is same-origin.
+  if (STATE_CHANGING_METHODS.has(req.method) && !originMatchesHost(req)) {
+    return NextResponse.json({ error: "cross-site request rejected" }, { status: 403 })
+  }
 
   const res = NextResponse.next()
   const session = await getIronSession<SsrSession>(req, res, sessionOptions)

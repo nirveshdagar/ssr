@@ -1,4 +1,5 @@
 import { all, one, run } from "../db"
+import { decrypt, encrypt } from "../secrets-vault"
 
 export interface CfKeyRow {
   id: number
@@ -18,24 +19,76 @@ export interface CfKeyWithPreview extends CfKeyRow {
 }
 
 /**
- * Match the cloudflare_page route in Flask: list keys with the masked
- * preview (first 6 + ... + last 4) computed in SQL so the full api_key
- * never leaves the database. Plus the count of domains using each key.
+ * Build a "abc123...wxyz" preview of a credential. The api_key column is
+ * encrypted at rest (Fernet); SQL-level substr would show the ciphertext
+ * prefix, which is useless to the operator. Compute previews in JS after
+ * decrypt() so the operator sees real plaintext head/tail bytes.
  */
+function previewCredential(plain: string): string {
+  if (!plain) return ""
+  if (plain.length <= 12) return plain.slice(0, 3) + "..." + plain.slice(-2)
+  return plain.slice(0, 6) + "..." + plain.slice(-3)
+}
+
+interface RawPreviewRow {
+  id: number
+  email: string
+  alias: string | null
+  cf_account_id: string | null
+  domains_used: number
+  max_domains: number
+  is_active: number
+  created_at: string
+  last_used_at: string | null
+  api_key: string
+  domains_count: number
+}
+
 export function listCfKeysWithPreview(): CfKeyWithPreview[] {
-  return all<CfKeyWithPreview>(`
+  const rows = all<RawPreviewRow>(`
     SELECT k.id, k.email, k.alias, k.cf_account_id,
            k.domains_used, k.max_domains, k.is_active,
-           k.created_at, k.last_used_at,
-           substr(k.api_key, 1, 6) || '...' || substr(k.api_key, length(k.api_key) - 3) AS key_preview,
+           k.created_at, k.last_used_at, k.api_key,
            (SELECT COUNT(*) FROM domains d WHERE d.cf_key_id = k.id) AS domains_count
       FROM cf_keys k
      ORDER BY k.id ASC
   `)
+  return rows.map((r) => ({
+    id: r.id,
+    email: r.email,
+    alias: r.alias,
+    cf_account_id: r.cf_account_id,
+    domains_used: r.domains_used,
+    max_domains: r.max_domains,
+    is_active: r.is_active,
+    created_at: r.created_at,
+    last_used_at: r.last_used_at,
+    domains_count: r.domains_count,
+    key_preview: previewCredential(decrypt(r.api_key)),
+  }))
 }
 
 export function getCfKey(id: number): CfKeyRow | undefined {
   return one<CfKeyRow>("SELECT * FROM cf_keys WHERE id = ?", id)
+}
+
+/**
+ * One-shot boot migration: re-encrypt any plaintext api_key rows. The
+ * decrypt() helper is a no-op for unmarked legacy values, so plaintext rows
+ * keep working on read paths until this sweep replaces them. Idempotent —
+ * already-encrypted rows are skipped.
+ */
+export function encryptExistingCfKeys(): { converted: number; skipped: number } {
+  const rows = all<{ id: number; api_key: string }>("SELECT id, api_key FROM cf_keys")
+  let converted = 0
+  let skipped = 0
+  for (const r of rows) {
+    if (!r.api_key) { skipped++; continue }
+    if (r.api_key.startsWith("enc:v1:")) { skipped++; continue }
+    run("UPDATE cf_keys SET api_key = ? WHERE id = ?", encrypt(r.api_key), r.id)
+    converted++
+  }
+  return { converted, skipped }
 }
 
 export function listDomainsForKey(cfKeyId: number): {

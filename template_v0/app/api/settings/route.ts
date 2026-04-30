@@ -56,28 +56,48 @@ const CHECKBOX_FIELDS = [
 ] as const
 
 /**
- * GET /api/settings — return all whitelisted setting values, decrypted via
- * the secrets vault for sensitive keys. The dashboard password row is
- * surfaced as a boolean (`has_password`) — never as plaintext or hash.
+ * GET /api/settings — return all whitelisted setting values. Sensitive
+ * keys are surfaced ONLY as `<key>_set: true|false` booleans + a last-4
+ * mask preview, never as plaintext. The Settings UI uses these to render
+ * "configured" badges; an operator who needs to view a real value must
+ * rotate it (POST a new value) instead of reading the existing one.
+ *
+ * Why: a single stolen session cookie (XSS, cookie disclosure, malicious
+ * extension) used to walk away with every infra credential in one GET.
+ * Encryption-at-rest is moot if the API serves plaintext to any cookie.
  */
+function maskTail(v: string): string {
+  if (!v) return ""
+  if (v.length <= 4) return "•".repeat(v.length)
+  return "•".repeat(Math.max(4, v.length - 4)) + v.slice(-4)
+}
+
 export async function GET(_req: NextRequest): Promise<Response> {
   const out: Record<string, string | boolean> = {}
   for (const k of STRING_FIELDS) {
-    out[k] = getSetting(k) ?? ""
+    const raw = getSetting(k) ?? ""
+    if (isSensitive(k)) {
+      // Boolean "is it set" + masked preview. Operator UI shows badges, never
+      // the real value. The plaintext only leaves the DB on the write path.
+      out[`${k}_set`] = raw.length > 0
+      out[`${k}_preview`] = raw.length > 0 ? maskTail(raw) : ""
+    } else {
+      out[k] = raw
+    }
   }
   for (const k of CHECKBOX_FIELDS) {
     out[k] = (getSetting(k) ?? "0") === "1"
   }
-  // Dashboard password — bool only
+  // Dashboard password — bool only (was already special-cased)
   const hashRow = all<{ value: string }>(
     "SELECT value FROM settings WHERE key = ?",
     "dashboard_password_hash",
   )[0]
   out["has_password"] = Boolean(hashRow?.value)
 
-  // Read-only telemetry fields — surface DO failover state so the operator
-  // knows which token last worked. Not editable (set by the runtime when
-  // a probe succeeds), so it's not in STRING_FIELDS.
+  // Read-only telemetry — surface DO failover state so the operator knows
+  // which token last worked. Not a secret value (it's just "primary" or
+  // "backup"), but is not editable.
   out["do_last_working_token"] = getSetting("do_last_working_token") ?? ""
   return NextResponse.json({ settings: out })
 }
@@ -95,12 +115,21 @@ export async function GET(_req: NextRequest): Promise<Response> {
 export async function POST(req: NextRequest): Promise<Response> {
   const body = (await req.json().catch(() => ({}))) as Record<string, unknown>
   const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null
+  const changedKeys: string[] = []
   let count = 0
 
   for (const k of STRING_FIELDS) {
     if (k in body) {
       const v = String(body[k] ?? "").trim()
-      setSetting(k, v)
+      // Sensitive fields are masked on GET; the UI submits empty for "leave
+      // alone" because it never sees the real value to begin with. Without
+      // this guard, every Save All Settings click would blank the secret.
+      // Operators clear a sensitive value by sending the literal "-" (mirrors
+      // the dashboard_password convention below).
+      if (isSensitive(k) && v === "") continue
+      const finalV = isSensitive(k) && v === "-" ? "" : v
+      setSetting(k, finalV)
+      changedKeys.push(k)
       count++
     }
   }
@@ -110,6 +139,7 @@ export async function POST(req: NextRequest): Promise<Response> {
       const v = body[k]
       const truthy = v === true || v === 1 || v === "1" || v === "true"
       setSetting(k, truthy ? "1" : "0")
+      changedKeys.push(k)
       count++
     }
   }
@@ -120,16 +150,24 @@ export async function POST(req: NextRequest): Promise<Response> {
     if (newPw === "-") {
       setSetting("dashboard_password_hash", "")
       setSetting("dashboard_password", "")
+      changedKeys.push("dashboard_password")
       count++
     } else if (newPw) {
       setSetting("dashboard_password_hash", hashPasswordPbkdf2(newPw))
       setSetting("dashboard_password", "") // clear legacy plaintext
+      changedKeys.push("dashboard_password")
       count++
     }
     // empty → leave alone
   }
 
-  appendAudit("settings_save", "", `${count} fields submitted`, ip)
+  // Audit lists the field NAMES (not values) so a forensics trail after a
+  // credential rotation incident shows what was rotated when. Truncate to
+  // keep the audit row readable when many fields are saved at once.
+  const fieldsLabel = changedKeys.length > 20
+    ? `[${changedKeys.slice(0, 20).join(",")},+${changedKeys.length - 20}]`
+    : `[${changedKeys.join(",")}]`
+  appendAudit("settings_save", "", `count=${count} fields=${fieldsLabel}`, ip)
   return NextResponse.json({ ok: true, count })
 }
 

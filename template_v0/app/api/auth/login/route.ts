@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { getSession, readPasswordHash, recordLoginAttempt, verifyWerkzeugHash } from "@/lib/auth"
 import { loginThrottleCheckAndReserve, loginThrottleRecord, loginThrottleRetryAfter } from "@/lib/login-throttle"
+import { appendAudit } from "@/lib/repos/audit"
 
 export const runtime = "nodejs"
 
@@ -28,11 +29,15 @@ export async function POST(req: NextRequest) {
   }
 
   const stored = readPasswordHash()
+  // Same generic 401 whether the password row is missing or wrong — don't
+  // give an unauthenticated scanner a fingerprint of "fresh deploy, race
+  // the operator to set a password". Audit-log the unconfigured case so
+  // an admin notices probing.
   if (!stored) {
-    return NextResponse.json(
-      { error: "No dashboard password configured. Set one via Flask Settings page first." },
-      { status: 500 },
-    )
+    try {
+      appendAudit("login_failure", "", "no_password_configured", ip)
+    } catch { /* never block auth on audit failure */ }
+    return NextResponse.json({ error: "Invalid password" }, { status: 401 })
   }
 
   const ok = verifyWerkzeugHash(password, stored)
@@ -40,6 +45,9 @@ export async function POST(req: NextRequest) {
   // The failed-attempt slot was already reserved by `checkAndReserve`
   // above, so we only need to TOUCH the bucket on success (to clear it).
   if (ok) loginThrottleRecord(ip, true)
+  try {
+    appendAudit(ok ? "login_success" : "login_failure", "", "", ip)
+  } catch { /* never block auth on audit failure */ }
   if (!ok) {
     return NextResponse.json({ error: "Invalid password" }, { status: 401 })
   }

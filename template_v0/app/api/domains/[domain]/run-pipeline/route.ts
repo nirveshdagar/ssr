@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { runFullPipeline } from "@/lib/pipeline"
 import { getDomain } from "@/lib/repos/domains"
+import { appendAudit } from "@/lib/repos/audit"
 
 export const runtime = "nodejs"
 
@@ -61,6 +62,14 @@ export async function POST(
     skipPurchase, serverId, startFrom, forceNewServer,
     customProvider, customModel,
   })
+  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null
+  appendAudit(
+    "pipeline_run", domain,
+    `job=${jobId ?? "skipped"} skip_purchase=${skipPurchase} ` +
+    `server_id=${serverId ?? ""} start_from=${startFrom ?? ""} ` +
+    `force_new_server=${forceNewServer} provider=${customProvider ?? ""} model=${customModel ?? ""}`,
+    ip,
+  )
   if (jobId == null) {
     return NextResponse.json({
       ok: false,

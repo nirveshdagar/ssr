@@ -145,6 +145,18 @@ export function scheduleBootHooks(): void {
       })
     } catch { /* boot is best-effort */ }
   }, 3000).unref?.()
+  // Same one-shot migration for the CF DNS Global Keys pool (cf_keys table).
+  setTimeout(() => {
+    try {
+      void import("./repos/cf-keys").then(({ encryptExistingCfKeys }) => {
+        const { converted } = encryptExistingCfKeys()
+        if (converted > 0) {
+          logPipeline("(startup)", "secrets_vault", "completed",
+            `Encrypted ${converted} legacy plaintext CF Global Key(s) at rest.`)
+        }
+      })
+    } catch { /* boot is best-effort */ }
+  }, 3500).unref?.()
   // Daily DB + Fernet-key backup. Self-skips in tests and when SSR_BACKUPS=0.
   void import("./backup").then(({ startDailyBackup }) => startDailyBackup()).catch(() => {
     /* boot is best-effort */

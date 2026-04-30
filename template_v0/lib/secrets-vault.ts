@@ -101,6 +101,19 @@ function loadKeys(): FernetKeys {
   if (existsSync(keyPath)) {
     encoded = readFileSync(keyPath, "utf8").trim()
   } else {
+    // Production guard: if there are already encrypted rows in `settings`
+    // and the key file is missing, refuse to auto-generate. A fresh key
+    // would silently invalidate every existing ciphertext (decrypt() returns
+    // "" on HMAC mismatch), turning a recoverable "key file lost" situation
+    // into "every secret is gone, nothing tells you that". Operator must
+    // restore the key from backup or delete the encrypted rows explicitly.
+    if (process.env.NODE_ENV === "production" && encryptedRowsExist()) {
+      throw new Error(
+        `Fernet key file missing at ${keyPath} but encrypted rows exist in settings. ` +
+        `Refusing to auto-generate a new key (would invalidate every encrypted secret). ` +
+        `Restore from backup or delete the enc:v1: rows first.`,
+      )
+    }
     mkdirSync(path.dirname(keyPath), { recursive: true })
     const fresh = generateKey()
     encoded = fresh.encoded
@@ -118,6 +131,24 @@ function loadKeys(): FernetKeys {
     encoded,
   }
   return cachedKeys
+}
+
+function encryptedRowsExist(): boolean {
+  try {
+    const rows = all<{ value: string }>(
+      "SELECT value FROM settings WHERE value LIKE 'enc:v1:%' LIMIT 1",
+    )
+    if (rows.length > 0) return true
+    // Also check the secondary tables we encrypt at rest.
+    const aiRows = all<{ api_token: string }>(
+      "SELECT api_token FROM cf_workers_ai_keys WHERE api_token LIKE 'enc:v1:%' LIMIT 1",
+    )
+    if (aiRows.length > 0) return true
+    const cfRows = all<{ api_key: string }>(
+      "SELECT api_key FROM cf_keys WHERE api_key LIKE 'enc:v1:%' LIMIT 1",
+    )
+    return cfRows.length > 0
+  } catch { return false }
 }
 
 function setKeysFromEncoded(encoded: string): FernetKeys {
