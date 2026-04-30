@@ -715,6 +715,133 @@ export async function restartPhpFpm(serverIp: string): Promise<{ ok: boolean; ou
 }
 
 // ---------------------------------------------------------------------------
+// File browser — list + delete files in /public_html for a single app.
+// Counterpart to uploadAppFile. SSH-only (SA's file-manager API doesn't
+// expose a clean list endpoint, and the surface area is tiny).
+// ---------------------------------------------------------------------------
+
+export interface AppFileEntry {
+  name: string
+  /** "f" = regular file, "d" = directory, "l" = symlink */
+  kind: "f" | "d" | "l" | string
+  bytes: number
+  modified: string
+}
+
+export interface ListAppFilesResult {
+  path: string
+  files: AppFileEntry[]
+}
+
+/**
+ * List the top-level entries inside /public_html. We stay non-recursive on
+ * purpose — this matches uploadAppFile's "top-level only" rule. Operators
+ * who need a deeper view can SSH directly.
+ */
+export async function listAppFiles(
+  domain: string, serverIp: string,
+): Promise<ListAppFilesResult> {
+  let ssh: SshSession | null = null
+  try {
+    ssh = await withTimeout(openSsh(serverIp), 15_000, `SSH connect ${serverIp}`)
+    const pub = await resolvePublicHtml(ssh, domain)
+    if (!pub) throw new Error(`No public_html dir for ${domain} on ${serverIp}`)
+    // %y (file type), %s (bytes), %TY-%Tm-%TdT%TH:%TM:%TSZ (mtime), %f (basename)
+    // Pipe-separated so pipe-in-filename can't inject extra columns (filenames
+    // here are validated on the way in via validateFilename).
+    const r = await ssh.exec(
+      `find '${pub}' -maxdepth 1 -mindepth 1 ` +
+      `-printf '%y|%s|%TY-%Tm-%Td %TH:%TM:%TS|%f\\n' 2>/dev/null`,
+      { timeoutMs: 10_000 },
+    )
+    const files: AppFileEntry[] = []
+    for (const line of (r.stdout || "").split("\n")) {
+      const t = line.trim()
+      if (!t) continue
+      const [kind, sizeStr, modified, ...rest] = t.split("|")
+      const name = rest.join("|")
+      if (!name) continue
+      const bytes = Number.parseInt(sizeStr, 10)
+      files.push({
+        name, kind: kind || "?",
+        bytes: Number.isFinite(bytes) ? bytes : 0,
+        modified: modified || "",
+      })
+    }
+    files.sort((a, b) => a.name.localeCompare(b.name))
+    return { path: pub, files }
+  } finally {
+    ssh?.close()
+  }
+}
+
+/**
+ * Read one file's contents from /public_html. Capped at 1 MB so a stray
+ * binary doesn't blow the response. Operators wanting the live `index.php`
+ * should keep using /api/sa/index-file (it manages the .bak side effect);
+ * this is for any other file they uploaded.
+ */
+export async function readAppFile(
+  domain: string, serverIp: string, filename: string,
+): Promise<{ content: string; bytes: number; path: string }> {
+  const err = validateFilename(filename)
+  if (err) throw new Error(err)
+  let ssh: SshSession | null = null
+  try {
+    ssh = await withTimeout(openSsh(serverIp), 15_000, `SSH connect ${serverIp}`)
+    const pub = await resolvePublicHtml(ssh, domain)
+    if (!pub) throw new Error(`No public_html dir for ${domain} on ${serverIp}`)
+    const filePath = `${pub}/${filename}`
+    if (!await ssh.sftpStat(filePath)) {
+      throw new Error(`'${filename}' does not exist`)
+    }
+    // Size guard before reading — sftpReadFile loads into memory.
+    const sizeR = await ssh.exec(`stat -c '%s' '${filePath}' 2>/dev/null`, { timeoutMs: 5000 })
+    const size = Number.parseInt((sizeR.stdout || "0").trim(), 10) || 0
+    if (size > 1_000_000) {
+      throw new Error(`'${filename}' is ${size} bytes — too large to view (max 1 MB)`)
+    }
+    const content = await withTimeout(ssh.sftpReadFile(filePath, "utf8"), 10_000, `sftpRead ${filename}`)
+    return { content, bytes: content.length, path: filePath }
+  } finally {
+    ssh?.close()
+  }
+}
+
+const PROTECTED_FILES = new Set(["index.php", "index.php.bak", ".htaccess"])
+
+/**
+ * Delete one file from /public_html. Same validateFilename rules as upload,
+ * plus an extra block on the live `index.php` so an operator can't 404 the
+ * site with a stray click — `index.php.bak` and `.htaccess` are already
+ * blocked by validateFilename.
+ */
+export async function deleteAppFile(
+  domain: string, serverIp: string, filename: string,
+): Promise<{ filename: string; path: string }> {
+  const err = validateFilename(filename)
+  if (err) throw new Error(err)
+  if (PROTECTED_FILES.has(filename.toLowerCase())) {
+    throw new Error(`'${filename}' is protected — restore via the editor instead`)
+  }
+  let ssh: SshSession | null = null
+  try {
+    ssh = await withTimeout(openSsh(serverIp), 15_000, `SSH connect ${serverIp}`)
+    const pub = await resolvePublicHtml(ssh, domain)
+    if (!pub) throw new Error(`No public_html dir for ${domain} on ${serverIp}`)
+    const filePath = `${pub}/${filename}`
+    if (!await ssh.sftpStat(filePath)) {
+      throw new Error(`'${filename}' does not exist`)
+    }
+    await ssh.sftpRemoveFile(filePath)
+    logPipeline(domain, "sa_control", "completed", `Deleted ${filename} via SSH`)
+    return { filename, path: filePath }
+  } finally {
+    ssh?.close()
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Fleet view — server list with apps joined + heartbeat from our DB
 // ---------------------------------------------------------------------------
 

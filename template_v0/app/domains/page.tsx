@@ -60,6 +60,7 @@ import {
   Select, SelectTrigger, SelectValue, SelectContent, SelectGroup, SelectLabel, SelectItem,
 } from "@/components/ui/select"
 import { OperatorDialog } from "@/components/ssr/operator-dialog"
+import { FileBrowserDialog } from "@/components/ssr/file-browser-dialog"
 import { ModelPicker } from "@/components/ssr/model-picker"
 import { Field, FieldLabel, FieldDescription } from "@/components/ui/field"
 import { Textarea } from "@/components/ui/textarea"
@@ -263,6 +264,15 @@ function DomainsPageInner() {
     setCfModalDomain(domain)
     setCfFields({ email: "", key: "", zone: "" })
     setCfResult(null)
+  }
+
+  // Per-domain file browser — list/upload/delete files in /public_html.
+  // Server IP is looked up via the domain row's serverId at click time.
+  const [filesDomain, setFilesDomain] = React.useState<string>("")
+  const [filesServerIp, setFilesServerIp] = React.useState<string>("")
+  function openFiles(domain: string, serverIp: string) {
+    setFilesDomain(domain)
+    setFilesServerIp(serverIp)
   }
   async function submitCfUpdate() {
     if (!cfModalDomain) return
@@ -968,6 +978,17 @@ function DomainsPageInner() {
                           <DropdownMenuItem onClick={() => openCfModal(d.name)}>
                             <Upload className="mr-2 h-3.5 w-3.5" /> CF credentials
                           </DropdownMenuItem>
+                          {(() => {
+                            const sIp = (d.serverId ? serversById[d.serverId]?.ip : null) || (d.ip !== "—" ? d.ip : null)
+                            return (
+                              <DropdownMenuItem
+                                disabled={!sIp}
+                                onClick={() => sIp && openFiles(d.name, sIp)}
+                              >
+                                <FileUp className="mr-2 h-3.5 w-3.5" /> Files
+                              </DropdownMenuItem>
+                            )
+                          })()}
                           <DropdownMenuSeparator />
                           <DropdownMenuItem onClick={() => softDeleteOne(d.name)}>
                             <Archive className="mr-2 h-3.5 w-3.5" /> Soft delete
@@ -1595,6 +1616,13 @@ function DomainsPageInner() {
           </label>
         </Field>
       </OperatorDialog>
+
+      <FileBrowserDialog
+        open={!!filesDomain && !!filesServerIp}
+        onOpenChange={(o) => { if (!o) { setFilesDomain(""); setFilesServerIp("") } }}
+        domain={filesDomain}
+        serverIp={filesServerIp}
+      />
     </AppShell>
   )
 }
