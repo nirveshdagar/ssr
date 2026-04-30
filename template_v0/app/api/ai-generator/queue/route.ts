@@ -20,6 +20,11 @@ interface QueueResult {
 
 const DOMAIN_SHAPE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/i
 const MAX_BULK = 1000
+// Same allowlist applied at the spawn/runLlmCli boundary — kept here too so
+// bad input gets rejected with a 400 instead of bubbling up as a pipeline
+// failure on a per-domain run.
+const SAFE_MODEL = /^[A-Za-z0-9._/@:-]{1,128}$/
+const SAFE_PROVIDER = /^[a-z][a-z0-9_-]{0,31}$/
 
 /**
  * One-shot operator endpoint for the /ai-generator page. Accepts a list of
@@ -102,6 +107,12 @@ export async function POST(req: NextRequest): Promise<Response> {
   const customProvider = trim(body.custom_provider)
   const customModel = trim(body.custom_model)
   const customPrompt = trim(body.custom_prompt)
+  if (customProvider && !SAFE_PROVIDER.test(customProvider)) {
+    return NextResponse.json({ ok: false, error: "invalid custom_provider" }, { status: 400 })
+  }
+  if (customModel && !SAFE_MODEL.test(customModel)) {
+    return NextResponse.json({ ok: false, error: "invalid custom_model" }, { status: 400 })
+  }
 
   // Single domain → full pipeline, parallel-eligible.
   // Multi domain → sequential bulk (one-at-a-time per the spec).

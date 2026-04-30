@@ -56,6 +56,23 @@ interface CliInvocation {
 }
 
 /**
+ * Allowed shape for model identifiers. Mirrors the conservative subset of
+ * provider model names we've actually seen ship: lowercase letters, digits,
+ * dot, dash, underscore, slash, at, colon. Anything else (spaces, shell
+ * metacharacters, control chars) is rejected at the caller — operator-supplied
+ * `customModel` flows from /api/ai-generator/queue and /api/domains/.../run-*
+ * routes through to spawn(), and we never want shell metacharacters in there
+ * even if the platform's spawn implementation parses them safely.
+ */
+export const SAFE_MODEL_REGEX = /^[A-Za-z0-9._/@:-]{1,128}$/
+
+export function assertSafeModel(model: string): void {
+  if (!SAFE_MODEL_REGEX.test(model)) {
+    throw new Error(`Invalid model name (allowed: A-Z a-z 0-9 . _ / @ : - and ≤128 chars): ${JSON.stringify(model.slice(0, 60))}`)
+  }
+}
+
+/**
  * Build the argv (without the prompt). The prompt is ALWAYS piped via stdin
  * to bypass Windows cmd.exe arg-splitting — when `shell: true` is set on
  * Windows (required to resolve .cmd shims for global npm packages), an
@@ -69,6 +86,9 @@ interface CliInvocation {
  *   to the model = our prompt + " ").
  */
 function buildInvocation(_provider: CliProvider, model: string): CliInvocation {
+  // Defense in depth — caller (runLlmCli) also validates, but if a future
+  // direct caller forgets, this still catches it.
+  assertSafeModel(model)
   return {
     bin: "codex",
     args: ["exec", "--skip-git-repo-check", "--model", model, "-"],
@@ -93,17 +113,24 @@ export async function runLlmCli(
   // before emitting tokens. Caller can pass shorter for smoke-tests.
   timeoutMs = 5 * 60_000,
 ): Promise<CliResult> {
+  // Validate model BEFORE building argv. operator-supplied customModel flows
+  // from POST /api/ai-generator/queue (and similar) all the way to here.
+  assertSafeModel(model)
   const fullPrompt = systemMsg ? `${systemMsg}\n\n---\n\n${userMsg}` : userMsg
   const { bin, args } = buildInvocation(provider, model)
+
+  // Resolve the absolute binary path (e.g. C:\...\codex.cmd on Windows) so
+  // we never need `shell: true` — the previous shell-mode spawn was the
+  // only thing that made Windows handle .cmd shims, but it also meant any
+  // future bug in the argv chain could become RCE through cmd.exe parsing.
+  // With an explicit .cmd path, Node's spawn handles the shim natively.
+  const resolvedBin = findBinary(provider) ?? bin
 
   return new Promise((resolve, reject) => {
     let child
     try {
-      child = spawn(bin, args, {
-        // shell: true lets Windows resolve .cmd/.ps1 shims for globally
-        // installed npm CLIs (gemini, codex both ship that way). We DON'T
-        // pass the prompt as argv here — see buildInvocation.
-        shell: process.platform === "win32",
+      child = spawn(resolvedBin, args, {
+        shell: false,
         windowsHide: true,
         stdio: ["pipe", "pipe", "pipe"],
       })

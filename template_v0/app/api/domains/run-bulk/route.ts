@@ -6,6 +6,8 @@ import { appendAudit } from "@/lib/repos/audit"
 export const runtime = "nodejs"
 
 const MAX_BULK = 1000
+const SAFE_MODEL = /^[A-Za-z0-9._/@:-]{1,128}$/
+const SAFE_PROVIDER = /^[a-z][a-z0-9_-]{0,31}$/
 
 /**
  * Bulk pipeline by domain ID list. Accepts BOTH FormData (legacy /domains
@@ -49,6 +51,12 @@ export async function POST(req: NextRequest): Promise<Response> {
       { ok: false, error: `too many domains (${domainIds.length} > ${MAX_BULK})` },
       { status: 413 },
     )
+  }
+  if (customProvider && !SAFE_PROVIDER.test(customProvider)) {
+    return NextResponse.json({ ok: false, error: "invalid custom_provider" }, { status: 400 })
+  }
+  if (customModel && !SAFE_MODEL.test(customModel)) {
+    return NextResponse.json({ ok: false, error: "invalid custom_model" }, { status: 400 })
   }
   const idSet = new Set(domainIds)
   const domainsList = listDomains()

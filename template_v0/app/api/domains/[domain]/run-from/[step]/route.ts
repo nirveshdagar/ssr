@@ -4,6 +4,9 @@ import { getDomain } from "@/lib/repos/domains"
 import { resetStepsFrom } from "@/lib/repos/steps"
 import { appendAudit } from "@/lib/repos/audit"
 
+const SAFE_MODEL = /^[A-Za-z0-9._/@:-]{1,128}$/
+const SAFE_PROVIDER = /^[a-z][a-z0-9_-]{0,31}$/
+
 export const runtime = "nodejs"
 
 /**
@@ -57,6 +60,12 @@ export async function POST(
   // 'completed' state) so we don't redo step 1's domain-buy or step 6's
   // 5-15 min server provisioning when the operator just wants to retry
   // step 9's LLM call.
+  if (customProvider && !SAFE_PROVIDER.test(customProvider)) {
+    return NextResponse.json({ ok: false, error: "invalid custom_provider" }, { status: 400 })
+  }
+  if (customModel && !SAFE_MODEL.test(customModel)) {
+    return NextResponse.json({ ok: false, error: "invalid custom_model" }, { status: 400 })
+  }
   resetStepsFrom(domain, stepNum)
   const jobId = runFullPipeline(domain, {
     skipPurchase, startFrom: stepNum,

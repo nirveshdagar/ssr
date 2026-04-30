@@ -3,6 +3,9 @@ import { runFullPipeline } from "@/lib/pipeline"
 import { getDomain } from "@/lib/repos/domains"
 import { appendAudit } from "@/lib/repos/audit"
 
+const SAFE_MODEL = /^[A-Za-z0-9._/@:-]{1,128}$/
+const SAFE_PROVIDER = /^[a-z][a-z0-9_-]{0,31}$/
+
 export const runtime = "nodejs"
 
 /**
@@ -57,6 +60,12 @@ export async function POST(
     startFrom = sf ? Number.parseInt(sf, 10) : null
     customProvider = trimOrNull(form?.get("custom_provider"))
     customModel = trimOrNull(form?.get("custom_model"))
+  }
+  if (customProvider && !SAFE_PROVIDER.test(customProvider)) {
+    return NextResponse.json({ ok: false, error: "invalid custom_provider" }, { status: 400 })
+  }
+  if (customModel && !SAFE_MODEL.test(customModel)) {
+    return NextResponse.json({ ok: false, error: "invalid custom_model" }, { status: 400 })
   }
   const jobId = runFullPipeline(domain, {
     skipPurchase, serverId, startFrom, forceNewServer,

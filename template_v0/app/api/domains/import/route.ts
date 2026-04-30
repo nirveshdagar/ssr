@@ -6,6 +6,12 @@ export const runtime = "nodejs"
 
 const MUTABLE_COLS = ["cf_email", "cf_global_key", "cf_zone_id", "cf_nameservers"] as const
 
+// Same shape used at /api/ai-generator/queue. Domain values flow from CSV
+// rows into addDomain() and downstream into shell-interpolated SSH calls
+// (e.g. find-public_html search). Reject malformed entries at the import
+// boundary so a quote / dollar / semicolon never reaches a shell context.
+const DOMAIN_SHAPE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/i
+
 /** Tiny RFC-4180 CSV reader — handles quoted fields, escaped quotes, CRLF/LF. */
 function parseCsv(text: string): string[][] {
   const rows: string[][] = []
@@ -53,6 +59,7 @@ export async function POST(req: NextRequest): Promise<Response> {
   }
 
   let count = 0
+  const rejected: { line: number; value: string }[] = []
   const colIdx: Partial<Record<typeof MUTABLE_COLS[number], number>> = {}
   for (const c of MUTABLE_COLS) {
     const i = header.indexOf(c)
@@ -61,8 +68,12 @@ export async function POST(req: NextRequest): Promise<Response> {
 
   for (let r = 1; r < rows.length; r++) {
     const cells = rows[r]
-    const domain = (cells[domainIdx] ?? "").trim()
+    const domain = (cells[domainIdx] ?? "").trim().toLowerCase()
     if (!domain) continue
+    if (!DOMAIN_SHAPE.test(domain)) {
+      rejected.push({ line: r + 1, value: domain.slice(0, 80) })
+      continue
+    }
     addDomain(domain)
     const updates: Record<string, string> = {}
     for (const c of MUTABLE_COLS) {
@@ -77,6 +88,15 @@ export async function POST(req: NextRequest): Promise<Response> {
     count++
   }
 
-  appendAudit("domain_import_csv", `${count} rows`, file.name ?? "uploaded.csv", ip)
-  return NextResponse.json({ ok: true, count, message: `Imported ${count} domain(s) from CSV` })
+  appendAudit("domain_import_csv", `${count} rows`,
+    `${file.name ?? "uploaded.csv"} accepted=${count} rejected=${rejected.length}`, ip)
+  return NextResponse.json({
+    ok: true,
+    count,
+    rejected: rejected.slice(0, 10),
+    rejected_total: rejected.length,
+    message:
+      `Imported ${count} domain(s) from CSV` +
+      (rejected.length ? `; ${rejected.length} rejected by shape check` : ""),
+  })
 }
