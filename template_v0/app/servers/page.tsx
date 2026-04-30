@@ -640,11 +640,28 @@ export default function ServersPage() {
                               <ChevronDown className="h-3.5 w-3.5" />
                             </Button>
                           </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end" className="w-56">
+                          <DropdownMenuContent align="end" className="w-64">
                             <DropdownMenuItem onClick={() => window.location.assign(`/domains?server=${s.id}`)}>
                               View domains hosted here
                             </DropdownMenuItem>
                             <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              onClick={() => openMigrate({
+                                id: Number(s.id),
+                                name: s.name ?? `server-${s.id}`,
+                                ip: s.ip ?? "?",
+                                sites: s.domains,
+                              })}
+                              disabled={s.domains === 0}
+                              title={
+                                s.domains === 0
+                                  ? "No domains to migrate off this server"
+                                  : `Manually migrate all ${s.domains} domain(s) off this server. Use this if auto-migration failed or got stuck (e.g. SA install timed out mid-flow).`
+                              }
+                            >
+                              <ArrowLeftRight className="h-3.5 w-3.5 mr-2" />
+                              Migrate domains off this server
+                            </DropdownMenuItem>
                             <DropdownMenuItem
                               onClick={() => reinstallSa({
                                 id: Number(s.id),
