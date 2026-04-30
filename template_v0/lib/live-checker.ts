@@ -45,11 +45,28 @@ let runningPromise: Promise<void> | null = null
  * Per-domain probe result. `ok` is the boolean the streak counter cares
  * about; `reason`+`status` are surfaced on the dashboard so the operator
  * can see WHY a domain is down without tailing the live-checker log.
+ *
+ * `contentOk` is a separate signal: when the HTTPS probe is 2xx but the
+ * body looks like the SA welcome page / Apache default ("files didn't
+ * deploy" — step 10 silently failed), we surface that even though the
+ * domain technically responds. NULL when probe failed (no body to check)
+ * or content check was inconclusive.
  */
 export interface LiveProbeResult {
   ok: boolean
   reason: "ok" | "timeout" | "dns_fail" | "connect_refused" | "ssl_error" | "http_4xx" | "http_5xx" | "fetch_error"
   status: number | null
+  contentOk: boolean | null
+}
+
+const DEFAULT_PAGE_RE =
+  /(welcome to serveravatar|<title>\s*serveravatar\s*<\/title>|<title>\s*Welcome to nginx!|<title>\s*Apache2\s+(Ubuntu|Debian)\s+Default Page|<h1>\s*It works!\s*<\/h1>)/i
+
+function classifyBody(body: string): boolean | null {
+  // Empty body / very short response → can't tell, leave NULL.
+  if (body.length < 64) return null
+  if (DEFAULT_PAGE_RE.test(body)) return false
+  return true
 }
 
 export async function probeLive(domain: string): Promise<LiveProbeResult> {
@@ -61,12 +78,35 @@ export async function probeLive(domain: string): Promise<LiveProbeResult> {
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     })
     if (res.status >= 200 && res.status < 400) {
-      return { ok: true, reason: "ok", status: res.status }
+      // Read first 16 KB of the body for default-page detection. Cap to
+      // bound memory: a 60-domain fleet × 60s tick × full HTML download
+      // would be wasteful. Default markers are always in the first KB.
+      let body = ""
+      try {
+        if (res.body) {
+          const reader = res.body.getReader()
+          const decoder = new TextDecoder("utf-8", { fatal: false })
+          let bytes = 0
+          const CAP = 16_384
+          while (bytes < CAP) {
+            const { value, done } = await reader.read()
+            if (done) break
+            body += decoder.decode(value, { stream: true })
+            bytes += value.byteLength
+          }
+          try { await reader.cancel() } catch { /* ignore */ }
+        } else {
+          body = await res.text().catch(() => "")
+        }
+      } catch { /* body read failed — leave content unknown */ }
+      const contentOk = classifyBody(body)
+      return { ok: true, reason: "ok", status: res.status, contentOk }
     }
     return {
       ok: false,
       reason: res.status >= 500 ? "http_5xx" : "http_4xx",
       status: res.status,
+      contentOk: null,
     }
   } catch (e) {
     const err = e as { name?: string; message?: string; code?: string; cause?: { code?: string } }
@@ -75,21 +115,21 @@ export async function probeLive(domain: string): Promise<LiveProbeResult> {
     // AbortSignal.timeout fires a TimeoutError / AbortError — both mean we
     // never got a response in PROBE_TIMEOUT_MS.
     if (err.name === "TimeoutError" || err.name === "AbortError" || msg.includes("timeout")) {
-      return { ok: false, reason: "timeout", status: null }
+      return { ok: false, reason: "timeout", status: null, contentOk: null }
     }
     if (code === "ENOTFOUND" || msg.includes("getaddrinfo")) {
-      return { ok: false, reason: "dns_fail", status: null }
+      return { ok: false, reason: "dns_fail", status: null, contentOk: null }
     }
     if (code === "ECONNREFUSED" || code === "ECONNRESET" || msg.includes("refused")) {
-      return { ok: false, reason: "connect_refused", status: null }
+      return { ok: false, reason: "connect_refused", status: null, contentOk: null }
     }
     if (
       msg.includes("certificate") || msg.includes("self-signed") || msg.includes("ssl") ||
       msg.includes("tls") || code === "CERT_HAS_EXPIRED" || code === "DEPTH_ZERO_SELF_SIGNED_CERT"
     ) {
-      return { ok: false, reason: "ssl_error", status: null }
+      return { ok: false, reason: "ssl_error", status: null, contentOk: null }
     }
-    return { ok: false, reason: "fetch_error", status: null }
+    return { ok: false, reason: "fetch_error", status: null, contentOk: null }
   }
 }
 
@@ -160,11 +200,20 @@ async function tick(): Promise<void> {
     // through the in-memory streak counters below — the DB columns are a
     // snapshot of the LATEST probe, not a streak.
     try {
+      const contentVal = probe.contentOk === true ? 1 : probe.contentOk === false ? 0 : null
+      // Only update content_checked_at when we actually got a body to
+      // classify (probe was 2xx). Otherwise the column timestamp would
+      // suggest a check happened when it didn't.
+      const contentCheckedAt = probe.contentOk !== null ? nowIso : null
       run(
         `UPDATE domains
-            SET live_ok = ?, live_reason = ?, live_http_status = ?, live_checked_at = ?
+            SET live_ok = ?, live_reason = ?, live_http_status = ?, live_checked_at = ?,
+                content_ok = COALESCE(?, content_ok),
+                content_checked_at = COALESCE(?, content_checked_at)
           WHERE domain = ?`,
-        up ? 1 : 0, probe.reason, probe.status, nowIso, r.domain,
+        up ? 1 : 0, probe.reason, probe.status, nowIso,
+        contentVal, contentCheckedAt,
+        r.domain,
       )
     } catch { /* ignore — schema may not be migrated yet on first boot */ }
     if (up) {

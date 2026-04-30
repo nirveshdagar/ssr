@@ -33,6 +33,10 @@ export interface DomainRow {
   live_reason: string | null
   live_http_status: number | null
   live_checked_at: string | null
+  /** 1 = response body is real content, 0 = SA welcome / Apache default,
+   *  NULL = unknown */
+  content_ok: number | null
+  content_checked_at: string | null
   created_at: string
   updated_at: string
 }
@@ -44,6 +48,7 @@ const DOMAIN_COLS = new Set<keyof DomainRow>([
   "content_archive_path", "cancel_requested",
   "ssl_origin_ok", "ssl_last_verified_at",
   "live_ok", "live_reason", "live_http_status", "live_checked_at",
+  "content_ok", "content_checked_at",
 ])
 
 export function listDomains(): DomainRow[] {

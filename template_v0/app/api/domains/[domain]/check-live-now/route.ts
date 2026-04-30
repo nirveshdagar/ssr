@@ -27,11 +27,17 @@ export async function POST(
 
   const probe = await probeLive(domain)
   const nowIso = new Date().toISOString().replace(/\.\d{3}Z$/, "Z")
+  const contentVal = probe.contentOk === true ? 1 : probe.contentOk === false ? 0 : null
+  const contentCheckedAt = probe.contentOk !== null ? nowIso : null
   run(
     `UPDATE domains
-        SET live_ok = ?, live_reason = ?, live_http_status = ?, live_checked_at = ?
+        SET live_ok = ?, live_reason = ?, live_http_status = ?, live_checked_at = ?,
+            content_ok = COALESCE(?, content_ok),
+            content_checked_at = COALESCE(?, content_checked_at)
       WHERE domain = ?`,
-    probe.ok ? 1 : 0, probe.reason, probe.status, nowIso, domain,
+    probe.ok ? 1 : 0, probe.reason, probe.status, nowIso,
+    contentVal, contentCheckedAt,
+    domain,
   )
 
   return NextResponse.json({
@@ -39,6 +45,7 @@ export async function POST(
     result: probe.ok,
     reason: probe.reason,
     http_status: probe.status,
+    content_ok: probe.contentOk,
     checked_at: nowIso,
   })
 }

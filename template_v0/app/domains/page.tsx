@@ -313,6 +313,29 @@ function DomainsPageInner() {
     http_4xx: 10,   // upload index.php
     http_5xx: 7,    // re-create SA app / Apache config
   }
+  // One-click redeploy for the "default page detected" case — fires
+  // runFromStep(10) which writes index.php (and any cached generated
+  // siblings) to /public_html. Uses the same in-flight Set as live-checking
+  // so the badge shows a spinner instead of a stale state while step 10
+  // runs (typically <30s).
+  async function redeployFiles(name: string) {
+    if (liveChecking.has(name)) return
+    setLiveChecking((s) => new Set([...s, name]))
+    const r = await domainActions.runFromStep(name, 10, { skipPurchase: true })
+    show(r.ok ? "ok" : "err", r.ok
+      ? (r.message ?? `Redeploy enqueued from step 10 for ${name}`)
+      : (r.error ?? r.message ?? "redeploy failed"))
+    void refresh()
+    // Drop the busy state after 60s — step 10 is fast; if it's still in
+    // flight by then, the next live-checker tick (~60s) will refresh
+    // content_ok independently.
+    window.setTimeout(() => {
+      setLiveChecking((s) => {
+        if (!s.has(name)) return s
+        const n = new Set(s); n.delete(name); return n
+      })
+    }, 60_000)
+  }
   const [liveChecking, setLiveChecking] = React.useState<Set<string>>(new Set())
   async function recheckLive(name: string) {
     if (liveChecking.has(name)) return
@@ -1032,9 +1055,18 @@ function DomainsPageInner() {
                           </span>
                         )
                       }
+                      // Severity ladder: DOWN beats DEFAULT PAGE beats Live.
+                      // DOWN  — probe failed (any reason)
+                      // DEFAULT PAGE — probe 2xx but body is SA welcome /
+                      //   Apache default; site "responds" but files weren't
+                      //   actually deployed
+                      // Live — probe 2xx, body is real content
                       const showDown = liveRelevant && d.liveOk === false
+                      const showDefault = liveRelevant && d.liveOk === true && d.contentOk === false
                       const tip = showDown
-                        ? `DOWN — ${d.liveReason ?? "?"}${d.liveHttpStatus != null ? ` (HTTP ${d.liveHttpStatus})` : ""}${d.liveCheckedAt ? ` · last checked ${d.liveCheckedAt}` : ""}. Click to re-probe.`
+                        ? `DOWN — ${d.liveReason ?? "?"}${d.liveHttpStatus != null ? ` (HTTP ${d.liveHttpStatus})` : ""}${d.liveCheckedAt ? ` · last checked ${d.liveCheckedAt}` : ""}. Click to re-probe + auto-repair.`
+                        : showDefault
+                        ? `Default page detected — files weren't deployed (SA welcome / Apache default still serving)${d.contentCheckedAt ? `. Last checked ${d.contentCheckedAt}` : ""}. Click to redeploy index (step 10).`
                         : liveRelevant && d.liveOk === true
                         ? `Live — HTTP ${d.liveHttpStatus ?? 200}${d.liveCheckedAt ? ` (checked ${d.liveCheckedAt})` : ""}. Click to re-probe.`
                         : liveRelevant
@@ -1044,6 +1076,11 @@ function DomainsPageInner() {
                         <StatusBadge
                           status="terminal_error"
                           label={`DOWN · ${d.liveReason ?? "?"}`}
+                        />
+                      ) : showDefault ? (
+                        <StatusBadge
+                          status="retryable_error"
+                          label="DEFAULT PAGE"
                         />
                       ) : (
                         <StatusBadge status={d.status} />
@@ -1056,8 +1093,8 @@ function DomainsPageInner() {
                           type="button"
                           className="rounded-md focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                           title={tip}
-                          onClick={() => recheckLive(d.name)}
-                          aria-label={`Re-probe ${d.name}`}
+                          onClick={() => showDefault ? redeployFiles(d.name) : recheckLive(d.name)}
+                          aria-label={showDefault ? `Redeploy index for ${d.name}` : `Re-probe ${d.name}`}
                         >
                           {badge}
                         </button>

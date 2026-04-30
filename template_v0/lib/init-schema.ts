@@ -253,6 +253,17 @@ function applyMigrations(db: DatabaseSync): void {
   tryAlter(db, "ALTER TABLE domains ADD COLUMN live_reason TEXT")
   tryAlter(db, "ALTER TABLE domains ADD COLUMN live_http_status INTEGER")
   tryAlter(db, "ALTER TABLE domains ADD COLUMN live_checked_at TEXT")
+  // Content sanity: when the live probe gets a 200, we also peek at the
+  // response body to detect "files weren't actually deployed" — i.e. the
+  // SA default welcome page or Apache 'It works!' is serving instead of
+  // the generated index.php. This catches the case where step 10 silently
+  // failed and the row would otherwise show as Live.
+  // Values:
+  //   content_ok: 1 = body looks like real generated content,
+  //               0 = SA welcome / Apache default detected,
+  //               NULL = probe failed or content check was skipped
+  tryAlter(db, "ALTER TABLE domains ADD COLUMN content_ok INTEGER")
+  tryAlter(db, "ALTER TABLE domains ADD COLUMN content_checked_at TEXT")
 }
 
 /**

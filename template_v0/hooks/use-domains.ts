@@ -55,6 +55,12 @@ export interface DomainRow {
   liveReason: string | null
   liveHttpStatus: number | null
   liveCheckedAt: string | null
+  /** Content sanity from the live probe.
+   *   true  = body is real content
+   *   false = SA welcome / Apache default detected (files didn't deploy)
+   *   null  = unknown (probe failed or body too short to classify) */
+  contentOk: boolean | null
+  contentCheckedAt: string | null
 }
 
 interface ApiDomain {
@@ -78,6 +84,8 @@ interface ApiDomain {
   live_reason: string | null
   live_http_status: number | null
   live_checked_at: string | null
+  content_ok: number | null
+  content_checked_at: string | null
 }
 
 const NORMALIZE_STATUS: Record<string, PipelineStatus> = {
@@ -137,6 +145,8 @@ export function useDomains() {
     liveReason: d.live_reason,
     liveHttpStatus: d.live_http_status,
     liveCheckedAt: d.live_checked_at,
+    contentOk: d.content_ok === 1 ? true : d.content_ok === 0 ? false : null,
+    contentCheckedAt: d.content_checked_at,
   }))
   return { rows, error, isLoading, refresh: mutate }
 }
