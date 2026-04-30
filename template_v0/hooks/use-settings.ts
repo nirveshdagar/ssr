@@ -63,6 +63,7 @@ export interface SettingsValues {
   cf_domains_per_key: string
   // booleans
   auto_migrate_enabled: boolean
+  auto_cleanup_dead_servers: boolean
   do_use_backup_first: boolean
   notifications_enabled: boolean
   email_enabled: boolean

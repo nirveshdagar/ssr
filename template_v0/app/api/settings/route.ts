@@ -40,6 +40,7 @@ const STRING_FIELDS = [
 
 const CHECKBOX_FIELDS = [
   "auto_migrate_enabled",
+  "auto_cleanup_dead_servers",
   "do_use_backup_first",
   "notifications_enabled",
   "email_enabled",

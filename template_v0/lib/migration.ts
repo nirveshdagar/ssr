@@ -547,6 +547,9 @@ export async function migrateServer(
   const { startHeartbeat } = await import("./repos/steps")
   const allDomains = oldRows.map((r) => r.domain)
   const ticker = startHeartbeat(allDomains, 1000)
+  // Single anchor name used by every log line emitted from this function.
+  // Pipeline events show up on the first migrated row's domain page.
+  const anchorName = oldRows[0]?.domain ?? "(auto-migrate)"
   try {
 
   // Pick / provision target. Three tiers, in order:
@@ -572,10 +575,7 @@ export async function migrateServer(
 
   if (!target) {
     // No target supplied AND no existing server has capacity → auto-provision.
-    // Mirrors Flask modules/migration.py migrate_server() lines 419-431. The
-    // anchor domain is the first migrated row so log_pipeline events show up
-    // on a real domain page; the new droplet hosts every migrated domain.
-    const anchorName = oldRows[0]?.domain ?? "(auto-migrate)"
+    // Mirrors Flask modules/migration.py migrate_server() lines 419-431.
     logPipeline(anchorName, "migrate", "running",
       `No eligible target server — provisioning a fresh DO droplet (this takes 5–15 min)…`)
     try {
@@ -700,13 +700,144 @@ export async function migrateServer(
       failed.push({ domain: row.domain, reason: `unhandled: ${(e as Error).message}` })
     }
   }
+
+  // ---- Post-migration cleanup of the OLD dead server -------------------
+  // Only run when 100% of domains migrated cleanly. If anything failed,
+  // keep the old server intact so the operator can investigate / retry.
+  // Gated by `auto_cleanup_dead_servers` (default ON now that the operator
+  // explicitly asked for this — set to "0" to disable).
+  let cleanupSummary = ""
+  if (failed.length === 0 && ok.length > 0) {
+    const cleanupEnabled = (getSetting("auto_cleanup_dead_servers") ?? "1") !== "0"
+    if (cleanupEnabled) {
+      cleanupSummary = await cleanupDeadServer(oldServerId, anchorName)
+    } else {
+      cleanupSummary = " (auto-cleanup disabled — set auto_cleanup_dead_servers=1 to enable)"
+    }
+  }
+
   return {
     ok, failed,
     new_server_id: target.id,
-    msg: `Migrated ${ok.length}/${oldRows.length} domains from #${oldServerId} → #${target.id}`,
+    msg: `Migrated ${ok.length}/${oldRows.length} domains from #${oldServerId} → #${target.id}${cleanupSummary}`,
   }
   } finally {
     ticker.stop()
   }
+}
+
+/**
+ * Tear down the OLD dead server now that all its domains have moved off:
+ *   1. SA: DELETE /organizations/{ORG_ID}/servers/{sa_server_id}
+ *   2. DO: DELETE /v2/droplets/{do_droplet_id}    (stops billing)
+ *   3. DB: DELETE FROM servers WHERE id = ?       (removes from dashboard)
+ *
+ * Each step is independent — failure of one doesn't block the others.
+ * Returns a one-line summary for inclusion in the migration result msg.
+ */
+async function cleanupDeadServer(oldServerId: number, anchorName: string): Promise<string> {
+  const { getServer } = await import("./repos/servers")
+  const old = getServer(oldServerId)
+  if (!old) return " (cleanup: dead server row already gone)"
+
+  const parts: string[] = []
+  let saResult = "skip"
+  let doResult = "skip"
+  let dbResult = "skip"
+
+  // 1. SA delete
+  if (old.sa_server_id) {
+    try {
+      const { deleteSaServer } = await import("./serveravatar")
+      const r = await deleteSaServer(old.sa_server_id)
+      if (r.ok) {
+        saResult = "ok"
+        logPipeline(anchorName, "cleanup", "completed",
+          `Deleted SA entry ${old.sa_server_id} from ServerAvatar`)
+      } else {
+        saResult = `fail:${r.reason?.slice(0, 80) ?? "?"}`
+        logPipeline(anchorName, "cleanup", "warning",
+          `SA delete failed for ${old.sa_server_id}: ${r.reason}`)
+      }
+    } catch (e) {
+      saResult = `error:${(e as Error).message.slice(0, 80)}`
+      logPipeline(anchorName, "cleanup", "warning",
+        `SA delete threw for ${old.sa_server_id}: ${(e as Error).message}`)
+    }
+  } else {
+    saResult = "no_sa_id"
+  }
+  parts.push(`SA=${saResult}`)
+
+  // 2. DO destroy droplet (stops billing). Verify droplet exists + matches
+  // our recorded id before destroying, just in case the row points at a
+  // stale id (don't accidentally destroy an unrelated droplet).
+  if (old.do_droplet_id) {
+    try {
+      const { deleteDroplet, getDroplet } = await import("./digitalocean")
+      let exists = true
+      try {
+        await getDroplet(old.do_droplet_id)
+      } catch (e) {
+        if ((e as Error).message.includes("HTTP 404")) {
+          exists = false
+          doResult = "already_gone"
+        } else throw e
+      }
+      if (exists) {
+        await deleteDroplet(old.do_droplet_id)
+        doResult = "ok"
+        logPipeline(anchorName, "cleanup", "completed",
+          `Destroyed DO droplet ${old.do_droplet_id} (billing stops)`)
+      }
+    } catch (e) {
+      doResult = `fail:${(e as Error).message.slice(0, 80)}`
+      logPipeline(anchorName, "cleanup", "warning",
+        `DO destroy failed for ${old.do_droplet_id}: ${(e as Error).message}`)
+    }
+  } else {
+    doResult = "no_droplet_id"
+  }
+  parts.push(`DO=${doResult}`)
+
+  // 3. DB row delete — only after SA + DO have at least been attempted.
+  // Even if SA/DO failed, drop the row: the operator's view of the dead
+  // server is no longer useful (domains are off, droplet may be lingering
+  // on DO but appears in the orphan-droplet sweep with a warning).
+  try {
+    const { deleteServerRow } = await import("./repos/servers")
+    deleteServerRow(oldServerId)
+    dbResult = "ok"
+    logPipeline(anchorName, "cleanup", "completed",
+      `Deleted servers row #${oldServerId} from dashboard`)
+  } catch (e) {
+    dbResult = `fail:${(e as Error).message.slice(0, 80)}`
+    logPipeline(anchorName, "cleanup", "warning",
+      `DB row delete failed for server #${oldServerId}: ${(e as Error).message}`)
+  }
+  parts.push(`DB=${dbResult}`)
+
+  // One-line audit + notify
+  try {
+    const { appendAudit } = await import("./repos/audit")
+    appendAudit(
+      "server_post_migrate_cleanup", `server-${oldServerId}`,
+      `name=${old.name ?? ""} ip=${old.ip ?? ""} ${parts.join(" ")}`,
+      null,
+    )
+  } catch { /* ignore */ }
+  if (saResult !== "ok" || (doResult !== "ok" && doResult !== "already_gone") || dbResult !== "ok") {
+    try {
+      const { notify } = await import("./notify")
+      await notify(
+        `Cleanup PARTIAL on dead server #${oldServerId}`,
+        `Migration succeeded for all domains, but post-migration cleanup of the dead server ` +
+        `had issues:\n  ${parts.join("\n  ")}\n\n` +
+        `Manual review may be needed (orphan droplet on DO, zombie SA entry).`,
+        { severity: "warning", dedupeKey: `cleanup_partial:${oldServerId}` },
+      )
+    } catch { /* ignore */ }
+  }
+  return ` · cleanup ${parts.join("/")}`
 }
 
