@@ -301,6 +301,18 @@ function DomainsPageInner() {
   // dot disagrees with what the operator sees (e.g. browser shows 200 but
   // dot is red, or vice versa). The live-checker tick runs every ~60s; this
   // bypasses that cadence.
+  //
+  // After the re-probe, if the domain is STILL down with a reason that maps
+  // cleanly to a pipeline step, auto-enqueue runFromStep(N). One click does
+  // both: verify the down-state hasn't gone stale, then kick off the repair.
+  // Reasons without a clean repair (server-down / ambiguous timeout / unknown)
+  // surface as a flash so the operator picks the action manually.
+  const REPAIR_STEP: Record<string, number> = {
+    dns_fail: 5,    // re-set NS + wait for zone active
+    ssl_error: 8,   // re-issue + install SSL
+    http_4xx: 10,   // upload index.php
+    http_5xx: 7,    // re-create SA app / Apache config
+  }
   const [liveChecking, setLiveChecking] = React.useState<Set<string>>(new Set())
   async function recheckLive(name: string) {
     if (liveChecking.has(name)) return
@@ -314,11 +326,34 @@ function DomainsPageInner() {
       show("err", r.error ?? "Live re-probe failed")
     } else {
       const d = r.data ?? {}
-      const verdict = d.result ? "ok" : "err"
-      const text = d.result
-        ? `Live — HTTP ${d.http_status ?? "?"}`
-        : `DOWN — ${d.reason ?? "?"}${d.http_status != null ? ` (HTTP ${d.http_status})` : ""}`
-      show(verdict, text)
+      if (d.result) {
+        show("ok", `Live — HTTP ${d.http_status ?? "?"}`)
+      } else {
+        const reason = d.reason ?? "?"
+        const reasonText = `${reason}${d.http_status != null ? ` (HTTP ${d.http_status})` : ""}`
+        const repairStep = REPAIR_STEP[reason]
+        if (repairStep) {
+          // Auto-fire the matching repair so the operator doesn't have to
+          // dig through Run-from-step. The pipeline endpoint dedupes
+          // already-running pipelines so spam-clicks are safe.
+          const rf = await domainActions.runFromStep(name, repairStep, { skipPurchase: true })
+          if (rf.ok) {
+            show("ok", `DOWN (${reasonText}) → enqueued repair from step ${repairStep} (${PIPELINE_STEPS[repairStep]})`)
+          } else {
+            show("err", `DOWN (${reasonText}) — repair from step ${repairStep} could not enqueue: ${rf.error ?? rf.message ?? "unknown"}`)
+          }
+        } else {
+          // Server-level / ambiguous reasons don't have a clean repair —
+          // server-down needs a migration, not a re-run; timeout could be
+          // many things. Tell the operator + suggest manual action.
+          const hint = reason === "connect_refused"
+            ? " — server unreachable; try Migrate to a new server"
+            : reason === "timeout"
+            ? " — try Run-from-step manually, or Migrate if persistent"
+            : ""
+          show("err", `DOWN (${reasonText})${hint}`)
+        }
+      }
     }
     void refresh()
     setLiveChecking((s) => {
