@@ -170,6 +170,3 @@ export async function POST(req: NextRequest): Promise<Response> {
   appendAudit("settings_save", "", `count=${count} fields=${fieldsLabel}`, ip)
   return NextResponse.json({ ok: true, count })
 }
-
-// Re-export for tests / debug — confirm a key is encrypted by the vault path
-export const _isSensitiveExport = isSensitive

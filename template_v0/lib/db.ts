@@ -18,6 +18,7 @@ import { DatabaseSync, type StatementSync } from "node:sqlite"
 import path from "node:path"
 import { mkdirSync } from "node:fs"
 import { initSchema } from "./init-schema"
+import { ensureStarted } from "./boot-singleton"
 
 declare global {
   // eslint-disable-next-line no-var
@@ -30,6 +31,10 @@ function resolveDbPath(): string {
 }
 
 export function getDb(): DatabaseSync {
+  // Lazy boot of the job pool + sweepers on first DB access. See
+  // lib/boot-singleton.ts for why this lives here instead of
+  // instrumentation.ts.
+  ensureStarted()
   if (globalThis.__ssrDb) return globalThis.__ssrDb
   const dbPath = resolveDbPath()
   // First-run convenience: data/ may not exist yet on a fresh checkout.
