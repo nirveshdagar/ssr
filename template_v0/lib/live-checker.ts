@@ -164,6 +164,31 @@ async function tick(): Promise<void> {
  * operators frequently power-cycle droplets, and we don't want to migrate
  * a domain mid-reboot.
  */
+/**
+ * SA-side liveness probe. If SA says the agent is "disconnected" / "offline"
+ * (or returns 404 — the SA-side row is gone entirely), treat as confirmation
+ * that the server is dead. Conservative: only fires on explicitly-bad SA
+ * statuses, not on transient network failures (returns null in that case so
+ * the slow-path threshold still gates the dead-mark).
+ */
+async function probeSaAgentDead(saServerId: string): Promise<string | null> {
+  try {
+    const { getServerInfo } = await import("./serveravatar")
+    const info = await getServerInfo(saServerId)
+    const status = String(info.agent_status ?? info.status ?? "").toLowerCase()
+    if (status === "disconnected" || status === "offline" || status === "0") {
+      return `SA agent_status='${status}' (SA confirms server unreachable)`
+    }
+    return null
+  } catch (e) {
+    const msg = (e as Error).message
+    if (msg.includes("HTTP 404")) {
+      return "SA returns 404 (server entry deleted from ServerAvatar)"
+    }
+    return null  // transient — let slow-path handle
+  }
+}
+
 async function probeDropletFastDead(dropletId: string): Promise<string | null> {
   try {
     const { getDroplet } = await import("./digitalocean")
@@ -184,8 +209,8 @@ async function checkDeadServers(
   const threshold = Number.isFinite(thresholdRaw) && thresholdRaw > 0 ? thresholdRaw : 10
   const autoMigrate = (getSetting("auto_migrate_enabled") || "0") === "1"
 
-  const servers = all<{ id: number; name: string; ip: string; status: string; do_droplet_id: string | null }>(
-    `SELECT id, name, ip, status, do_droplet_id FROM servers WHERE status = 'ready'`,
+  const servers = all<{ id: number; name: string; ip: string; status: string; do_droplet_id: string | null; sa_server_id: string | null }>(
+    `SELECT id, name, ip, status, do_droplet_id, sa_server_id FROM servers WHERE status = 'ready'`,
   )
 
   for (const s of servers) {
@@ -193,7 +218,7 @@ async function checkDeadServers(
     if (!entries || entries.length === 0) continue
     const allDown = entries.every((e) => e.downStreak >= threshold)
 
-    // Fast-path: if all domains on this server have failed at least 2 ticks
+    // Fast-path #1: if all domains on this server have failed at least 2 ticks
     // AND DO confirms the droplet is gone (404) or archived, declare dead
     // NOW instead of waiting for the full threshold. Saves up to ~9 minutes
     // on the default 10-tick × 60-s setup when an operator deletes the
@@ -201,6 +226,13 @@ async function checkDeadServers(
     let fastReason: string | null = null
     if (!allDown && s.do_droplet_id && entries.every((e) => e.downStreak >= 2)) {
       fastReason = await probeDropletFastDead(s.do_droplet_id)
+    }
+    // Fast-path #2: SA-API agent status. If 2+ ticks of HTTPS failures AND
+    // SA reports the agent is offline / disconnected, treat as dead. Catches
+    // the case where the droplet still exists on DO (SA shows the truth that
+    // the server's services are down even if DO says the VM is up).
+    if (!allDown && !fastReason && s.sa_server_id && entries.every((e) => e.downStreak >= 2)) {
+      fastReason = await probeSaAgentDead(s.sa_server_id)
     }
     if (!allDown && !fastReason) continue
 

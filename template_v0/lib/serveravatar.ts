@@ -405,6 +405,33 @@ export async function isSaServerAlive(saServerId: string): Promise<boolean> {
 }
 
 /**
+ * Delete a server from ServerAvatar's account. Used to clean up half-
+ * registered servers when an SA agent install fails so a retry can start
+ * fresh, and from teardown / migration flows that already delete the DO
+ * droplet but want SA's own bookkeeping cleaned up too.
+ *
+ * Returns `{ ok: true }` on a clean delete or 404 (already gone — same
+ * end state). Returns `{ ok: false, reason }` on every other failure
+ * including network / auth / 5xx so the caller can decide whether to
+ * surface it or move on.
+ */
+export async function deleteSaServer(saServerId: string): Promise<{ ok: boolean; reason?: string }> {
+  if (!saServerId) return { ok: false, reason: "no saServerId provided" }
+  try {
+    const { res } = await saRequest(
+      `/organizations/{ORG_ID}/servers/${saServerId}`,
+      { method: "DELETE", timeoutMs: 30_000 },
+    )
+    if (res.ok || res.status === 204) return { ok: true }
+    if (res.status === 404) return { ok: true } // already gone — same end state
+    const body = (await res.text()).slice(0, 200)
+    return { ok: false, reason: `HTTP ${res.status}: ${body}` }
+  } catch (e) {
+    return { ok: false, reason: (e as Error).message }
+  }
+}
+
+/**
  * Create a server via SA's cloud-provider integration (DigitalOcean linked
  * account). NOTE: ServerAvatar requires you to link the DO token in the SA
  * dashboard once. Its provider id goes in settings.sa_cloud_provider_id.
@@ -673,10 +700,25 @@ async function generateInstallCommand(opts: {
  * runs the installer asynchronously (nohup), then polls SA's side until the
  * server appears as connected. Returns the new sa_server_id.
  */
+/**
+ * Run the SA install on a fresh DO droplet. Two attempts: if the first
+ * fails (timeout waiting for SA agent to register, half-registered SA
+ * row) the half-registered SA server is deleted and the install script
+ * is re-run on the same droplet. Saves the cost of throwing away a
+ * working droplet for a transient install failure (apt blip, slow
+ * cloud-init, network hiccup during agent download).
+ *
+ * Returns the SA server id on success. Throws after both attempts fail.
+ */
 export async function installAgentOnDroplet(opts: {
   dropletIp: string
   serverName: string
   timeoutInstallMs?: number
+  /** How many full SSH+install+poll attempts to run before giving up.
+   *  Default 2 — first attempt + one retry with SA-side cleanup. Each
+   *  attempt costs `timeoutInstallMs` worst-case so don't crank this up
+   *  blindly. */
+  maxAttempts?: number
   /** Called with a human-readable status line each time we have new info
    *  (post-SSH-launch, every poll iteration). The orchestrator wires this
    *  to updateStep so the watcher shows live progress instead of a frozen
@@ -685,13 +727,76 @@ export async function installAgentOnDroplet(opts: {
 }): Promise<string> {
   const { dropletIp, serverName } = opts
   const timeoutInstallMs = opts.timeoutInstallMs ?? 900_000
+  const maxAttempts = opts.maxAttempts ?? 2
   const onProgress = opts.onProgress ?? (() => { /* no-op */ })
 
   const rootPassword = getSetting("server_root_password") || ""
   if (!rootPassword) throw new Error("server_root_password not set")
 
+  let lastError: Error | null = null
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const saServerId = await installAgentOnDropletAttempt({
+        dropletIp, serverName, rootPassword, timeoutInstallMs, onProgress, attempt,
+      })
+      return saServerId
+    } catch (e) {
+      lastError = e as Error
+      // Inspect the failure: if SA actually saw the agent (partial
+      // registration with a saServerId attached to the error), clean up
+      // the SA-side stub so the retry's poll doesn't latch onto the
+      // half-dead row. The `partialSaServerId` is exposed on a custom
+      // property by the inner function below.
+      const partialId = (e as { partialSaServerId?: string }).partialSaServerId
+      const reachedDeadline = !!(e as { reachedDeadline?: boolean }).reachedDeadline
+      if (attempt < maxAttempts) {
+        if (partialId) {
+          logPipeline(serverName, "sa_install", "warning",
+            `Attempt ${attempt} timed out with SA stub sa_id=${partialId} half-registered; ` +
+            `deleting the SA stub before retry`)
+          const cleanup = await deleteSaServer(partialId)
+          if (cleanup.ok) {
+            logPipeline(serverName, "sa_install", "running",
+              `SA stub ${partialId} deleted; retrying install (attempt ${attempt + 1}/${maxAttempts})`)
+          } else {
+            logPipeline(serverName, "sa_install", "warning",
+              `SA stub ${partialId} delete reported error: ${cleanup.reason}; retrying anyway`)
+          }
+        } else if (reachedDeadline) {
+          logPipeline(serverName, "sa_install", "warning",
+            `Attempt ${attempt} timed out with no SA-side state; retrying install (attempt ${attempt + 1}/${maxAttempts})`)
+        } else {
+          // Non-timeout failure (e.g. SSH never connected). Probably worth
+          // ONE retry in case cloud-init was still bringing the droplet up.
+          logPipeline(serverName, "sa_install", "warning",
+            `Attempt ${attempt} failed: ${(e as Error).message.slice(0, 160)}; ` +
+            `retrying (attempt ${attempt + 1}/${maxAttempts})`)
+        }
+        continue
+      }
+      throw lastError
+    }
+  }
+  throw lastError ?? new Error("installAgentOnDroplet: exhausted retries with no error captured")
+}
+
+interface InstallAttemptError extends Error {
+  partialSaServerId?: string
+  reachedDeadline?: boolean
+}
+
+async function installAgentOnDropletAttempt(opts: {
+  dropletIp: string
+  serverName: string
+  rootPassword: string
+  timeoutInstallMs: number
+  onProgress: (message: string) => void
+  attempt: number
+}): Promise<string> {
+  const { dropletIp, serverName, rootPassword, timeoutInstallMs, onProgress, attempt } = opts
+
   logPipeline(serverName, "sa_install", "running",
-    `Requesting SA install command for ${serverName}`)
+    `Requesting SA install command for ${serverName} (attempt ${attempt})`)
   const cmd = await generateInstallCommand({ serverName })
 
   logPipeline(serverName, "sa_install", "running", `Waiting for SSH on ${dropletIp}...`)
@@ -699,12 +804,6 @@ export async function installAgentOnDroplet(opts: {
   try {
     logPipeline(serverName, "sa_install", "running",
       `Running install script on ${dropletIp} (takes 5-15 min)`)
-    // Full detach so the SSH channel closes immediately:
-    //   - subshell `( … & )` so the child loses its parent shell
-    //   - redirect stdin from /dev/null (otherwise ssh2 keeps the channel
-    //     open waiting for EOF on the inherited fd)
-    //   - redirect stdout/stderr to install.log
-    //   - setsid when available so the child gets its own session/pgid
     const escaped = `'${cmd.replace(/'/g, "'\\''")}'`
     const asyncCmd =
       "mkdir -p /root/sa_install && " +
@@ -716,9 +815,6 @@ export async function installAgentOnDroplet(opts: {
     try {
       await ssh.exec(asyncCmd, { timeoutMs: 60_000 })
     } catch (e) {
-      // If the launcher exec didn't return cleanly we still want to poll
-      // SA — the install may have started on the droplet regardless. The
-      // poll loop below is the authoritative success signal anyway.
       logPipeline(serverName, "sa_install", "warning",
         `SSH launcher did not return cleanly (${(e as Error).message.slice(0, 200)}); ` +
         `polling SA for agent appearance anyway`)
@@ -732,7 +828,7 @@ export async function installAgentOnDroplet(opts: {
     let lastSaStatus = "(none)"
     onProgress(
       `Installing SA agent on ${dropletIp} — 0m elapsed / ${totalMin}m max · ` +
-      `polling SA every 30s`,
+      `polling SA every 30s (attempt ${attempt})`,
     )
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 30_000))
@@ -754,19 +850,18 @@ export async function installAgentOnDroplet(opts: {
         lastSaStatus = status || "(unknown)"
         if (status === "connected" || status === "active" || status === "1") {
           logPipeline(serverName, "sa_install", "completed",
-            `SA agent active; sa_server_id=${saServerId}`)
+            `SA agent active; sa_server_id=${saServerId} (attempt ${attempt})`)
           return saServerId
         }
       }
       if (saServerId) {
-        // Confirm via dedicated GET
         try {
           const info = await getServerInfo(saServerId)
           const status = String(info.agent_status ?? info.status ?? "")
           lastSaStatus = status || lastSaStatus
           if (status === "connected" || status === "active" || status === "1") {
             logPipeline(serverName, "sa_install", "completed",
-              `SA agent active; sa_server_id=${saServerId}`)
+              `SA agent active; sa_server_id=${saServerId} (attempt ${attempt})`)
             return saServerId
           }
         } catch { /* keep polling */ }
@@ -775,20 +870,26 @@ export async function installAgentOnDroplet(opts: {
       onProgress(
         `Installing SA agent on ${dropletIp} — ${elapsedMin}m / ${totalMin}m · ` +
         `SA status: ${lastSaStatus}` +
-        (saServerId ? ` (sa_id=${saServerId})` : " (not yet visible to SA)"),
+        (saServerId ? ` (sa_id=${saServerId})` : " (not yet visible to SA)") +
+        ` (attempt ${attempt})`,
       )
     }
 
-    // Timeout — read install.log tail for diagnosis
+    // Timeout — read install.log tail for diagnosis. Attach the partial
+    // SA id (if any) to the thrown error so the outer retry loop can
+    // delete the half-registered SA server before re-running install.
     let tail = "(could not read install.log)"
     try {
       const r = await ssh.exec("tail -n 50 /root/sa_install/install.log", { timeoutMs: 15_000 })
       tail = r.stdout
     } catch { /* ignore */ }
-    throw new Error(
-      `SA agent did not become active within ${timeoutInstallMs}ms. ` +
+    const err: InstallAttemptError = new Error(
+      `SA agent did not become active within ${timeoutInstallMs}ms (attempt ${attempt}). ` +
       `Install log tail:\n${tail.slice(-1500)}`,
     )
+    err.reachedDeadline = true
+    if (saServerId) err.partialSaServerId = saServerId
+    throw err
   } finally {
     ssh.close()
   }
