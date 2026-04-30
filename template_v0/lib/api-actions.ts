@@ -228,6 +228,13 @@ export const serverActions = {
     postForm(`/api/servers/${id}/migrate-now`, {
       target_server_id: targetServerId != null ? String(targetServerId) : undefined,
     }),
+  /**
+   * Reinstall the SA agent on this server's existing DO droplet. Use when
+   * the original install failed mid-script — the droplet is fine, just
+   * needs the install re-run cleanly. Returns 202 + job id; poll the logs
+   * for "reinstall_sa" entries. Worst-case 30 min (2 attempts × 15 min).
+   */
+  reinstallSa: (id: number) => postForm(`/api/servers/${id}/reinstall-sa`),
   destroyAll: (confirmPhrase: string) =>
     postForm("/api/servers/destroy-all", { confirm_phrase: confirmPhrase }),
   syncFromDo: () => postForm("/api/servers/sync-from-do"),

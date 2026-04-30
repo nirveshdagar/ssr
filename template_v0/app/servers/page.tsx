@@ -112,6 +112,29 @@ export default function ServersPage() {
     show(r.ok ? "ok" : "err", r.message ?? r.error ?? "")
     await refresh(); setBusy(null)
   }
+  async function reinstallSa(s: { id: number; name: string; ip: string }) {
+    const ok = window.confirm(
+      `Reinstall SA agent on ${s.name} (${s.ip})?\n\n` +
+      `This re-runs the SA install script on the existing DO droplet. ` +
+      `It does NOT destroy the droplet or affect other servers. The reinstall takes ` +
+      `5-15 minutes per attempt and runs up to 2 attempts.\n\n` +
+      `Use this when SA install failed during provisioning but the droplet itself is fine.`,
+    )
+    if (!ok) return
+    setBusy(`reinstall-${s.id}`)
+    try {
+      const r = await serverActions.reinstallSa(s.id)
+      if (r.ok) {
+        show("ok", r.message ?? `Reinstall SA enqueued for ${s.name} — watch /logs for progress.`)
+        await refresh()
+      } else {
+        show("err", r.error ?? `Reinstall failed`)
+      }
+    } finally {
+      setBusy(null)
+    }
+  }
+
   async function markReady(id: number) {
     setBusy(`r-${id}`)
     const r = await serverActions.markReady(id)
@@ -617,9 +640,26 @@ export default function ServersPage() {
                               <ChevronDown className="h-3.5 w-3.5" />
                             </Button>
                           </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end" className="w-48">
+                          <DropdownMenuContent align="end" className="w-56">
                             <DropdownMenuItem onClick={() => window.location.assign(`/domains?server=${s.id}`)}>
                               View domains hosted here
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              onClick={() => reinstallSa({
+                                id: Number(s.id),
+                                name: s.name ?? `server-${s.id}`,
+                                ip: s.ip ?? "?",
+                              })}
+                              disabled={busy === `reinstall-${s.id}` || !s.ip || !s.doDropletId}
+                              title={
+                                !s.ip || !s.doDropletId
+                                  ? "Requires a known DO droplet + IP"
+                                  : "Re-run SA install on the existing droplet (no new droplet provisioned)"
+                              }
+                            >
+                              <RefreshCw className="h-3.5 w-3.5 mr-2" />
+                              Reinstall SA agent
                             </DropdownMenuItem>
                           </DropdownMenuContent>
                         </DropdownMenu>
