@@ -11,8 +11,9 @@ import {
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
-import { Loader2, RefreshCw, Trash2, Eye, Upload as UploadIcon, FileText, X } from "lucide-react"
+import { Loader2, RefreshCw, Trash2, Eye, Upload as UploadIcon, FileText, X, AlertTriangle, CheckCircle2 } from "lucide-react"
 import { MonoCode } from "@/components/ssr/data-table"
+import { domainActions } from "@/lib/api-actions"
 
 interface AppFileEntry {
   name: string
@@ -42,12 +43,33 @@ interface SimpleResponse {
   message?: string
 }
 
+/**
+ * Live + content snapshot from the parent row so the dialog can show "why
+ * are you here" — e.g. DEFAULT PAGE detected, click Redeploy. Optional;
+ * when not provided, the banner is hidden and the dialog behaves like a
+ * pure file browser.
+ */
+export interface FileBrowserSnapshot {
+  liveOk: boolean | null
+  liveReason: string | null
+  liveHttpStatus: number | null
+  liveCheckedAt: string | null
+  contentOk: boolean | null
+  contentCheckedAt: string | null
+}
+
 export interface FileBrowserDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   /** Empty string while not opened on a row. */
   domain: string
   serverIp: string
+  /** Live + content state from the parent row. Hides the banner if omitted. */
+  snapshot?: FileBrowserSnapshot
+  /** Called after the dialog mutates state the parent should re-fetch
+   *  (re-probe / redeploy). Parent typically wires this to `mutate()` from
+   *  useDomains so the row badge updates without page refresh. */
+  onParentRefresh?: () => void
 }
 
 function formatBytes(n: number): string {
@@ -56,7 +78,7 @@ function formatBytes(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1)} MB`
 }
 
-export function FileBrowserDialog({ open, onOpenChange, domain, serverIp }: FileBrowserDialogProps) {
+export function FileBrowserDialog({ open, onOpenChange, domain, serverIp, snapshot, onParentRefresh }: FileBrowserDialogProps) {
   const [files, setFiles] = React.useState<AppFileEntry[]>([])
   const [pubPath, setPubPath] = React.useState<string>("")
   const [loading, setLoading] = React.useState(false)
@@ -66,7 +88,48 @@ export function FileBrowserDialog({ open, onOpenChange, domain, serverIp }: File
   const [uploadName, setUploadName] = React.useState("")
   const [uploadBody, setUploadBody] = React.useState("")
   const [uploadBusy, setUploadBusy] = React.useState(false)
+  const [bannerBusy, setBannerBusy] = React.useState<"reprobe" | "redeploy" | null>(null)
   const fileInputRef = React.useRef<HTMLInputElement>(null)
+
+  async function reprobe() {
+    if (bannerBusy) return
+    setBannerBusy("reprobe"); setErrMsg(null); setOkMsg(null)
+    try {
+      const r = await domainActions.checkLiveNow(domain) as {
+        ok: boolean
+        data?: { result?: boolean; reason?: string; http_status?: number | null; content_ok?: boolean | null }
+        error?: string
+      }
+      if (!r.ok) throw new Error(r.error ?? "re-probe failed")
+      const d = r.data ?? {}
+      const text = d.result
+        ? d.content_ok === false
+          ? `Live (HTTP ${d.http_status ?? 200}) — but DEFAULT PAGE serving (files not deployed)`
+          : `Live — HTTP ${d.http_status ?? 200}`
+        : `DOWN — ${d.reason ?? "?"}${d.http_status != null ? ` (HTTP ${d.http_status})` : ""}`
+      setOkMsg(text)
+      onParentRefresh?.()
+    } catch (e) {
+      setErrMsg((e as Error).message)
+    } finally {
+      setBannerBusy(null)
+    }
+  }
+
+  async function redeployIndex() {
+    if (bannerBusy) return
+    setBannerBusy("redeploy"); setErrMsg(null); setOkMsg(null)
+    try {
+      const r = await domainActions.runFromStep(domain, 10, { skipPurchase: true })
+      if (!r.ok) throw new Error(r.error ?? r.message ?? "redeploy enqueue failed")
+      setOkMsg(r.message ?? `Redeploy enqueued from step 10 for ${domain}`)
+      onParentRefresh?.()
+    } catch (e) {
+      setErrMsg((e as Error).message)
+    } finally {
+      setBannerBusy(null)
+    }
+  }
 
   const refresh = React.useCallback(async () => {
     if (!domain || !serverIp) return
@@ -188,6 +251,75 @@ export function FileBrowserDialog({ open, onOpenChange, domain, serverIp }: File
 
         <div className="min-h-0 flex-1 overflow-y-auto px-6 py-3">
           <div className="flex flex-col gap-3">
+            {snapshot && (() => {
+              // Severity ladder mirrors the /domains Status badge:
+              // DOWN > DEFAULT PAGE > Live > unknown.
+              const isDown = snapshot.liveOk === false
+              const isDefault = snapshot.liveOk === true && snapshot.contentOk === false
+              const isLive = snapshot.liveOk === true && snapshot.contentOk !== false
+              const variant = isDown
+                ? "border-status-terminal/40 bg-status-terminal/10 text-status-terminal"
+                : isDefault
+                ? "border-status-retryable/40 bg-status-retryable/10 text-status-retryable"
+                : isLive
+                ? "border-status-completed/40 bg-status-completed/10 text-status-completed"
+                : "border-border bg-muted/40 text-muted-foreground"
+              const Icon = isDown || isDefault ? AlertTriangle : isLive ? CheckCircle2 : RefreshCw
+              const headline = isDown
+                ? `DOWN — ${snapshot.liveReason ?? "?"}${snapshot.liveHttpStatus != null ? ` (HTTP ${snapshot.liveHttpStatus})` : ""}`
+                : isDefault
+                ? "Default page detected — files weren't deployed"
+                : isLive
+                ? `Live — HTTP ${snapshot.liveHttpStatus ?? 200}`
+                : "Live state unknown"
+              const sub = isDefault
+                ? "SA welcome / Apache default is serving instead of the generated index. Click Redeploy to push step 10 again."
+                : isDown
+                ? "HTTPS probe failed. Re-probe to see if it's transient, or use the Redeploy button if you suspect a content issue."
+                : snapshot.contentCheckedAt
+                ? `Last checked ${snapshot.contentCheckedAt}`
+                : snapshot.liveCheckedAt
+                ? `Last checked ${snapshot.liveCheckedAt}`
+                : ""
+              return (
+                <div className={`rounded-md border px-3 py-2 ${variant}`}>
+                  <div className="flex items-start gap-2">
+                    <Icon className="mt-0.5 h-4 w-4 shrink-0" />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-small font-medium">{headline}</div>
+                      {sub && <div className="text-micro opacity-80 mt-0.5">{sub}</div>}
+                    </div>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <Button
+                        variant="outline" size="sm" className="h-7 gap-1.5"
+                        onClick={reprobe}
+                        disabled={bannerBusy !== null}
+                        title="Run a fresh HTTPS + content probe right now"
+                      >
+                        {bannerBusy === "reprobe"
+                          ? <Loader2 className="h-3 w-3 animate-spin" />
+                          : <RefreshCw className="h-3 w-3" />}
+                        Re-probe
+                      </Button>
+                      {(isDefault || isDown) && (
+                        <Button
+                          variant="default" size="sm" className="h-7 gap-1.5"
+                          onClick={redeployIndex}
+                          disabled={bannerBusy !== null}
+                          title="Enqueue runFromStep(10) — re-uploads index.php to /public_html"
+                        >
+                          {bannerBusy === "redeploy"
+                            ? <Loader2 className="h-3 w-3 animate-spin" />
+                            : <UploadIcon className="h-3 w-3" />}
+                          Redeploy
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )
+            })()}
+
             <div className="flex items-center justify-between gap-2">
               <span className="text-small text-muted-foreground">
                 {loading ? "Loading…" : `${files.length} file${files.length === 1 ? "" : "s"}`}

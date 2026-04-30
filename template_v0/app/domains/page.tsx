@@ -1850,6 +1850,19 @@ function DomainsPageInner() {
         onOpenChange={(o) => { if (!o) { setFilesDomain(""); setFilesServerIp("") } }}
         domain={filesDomain}
         serverIp={filesServerIp}
+        snapshot={(() => {
+          const row = DOMAINS.find((r) => r.name === filesDomain)
+          if (!row) return undefined
+          return {
+            liveOk: row.liveOk,
+            liveReason: row.liveReason,
+            liveHttpStatus: row.liveHttpStatus,
+            liveCheckedAt: row.liveCheckedAt,
+            contentOk: row.contentOk,
+            contentCheckedAt: row.contentCheckedAt,
+          }
+        })()}
+        onParentRefresh={() => { void refresh() }}
       />
     </AppShell>
   )
