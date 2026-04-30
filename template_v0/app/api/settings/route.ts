@@ -57,30 +57,40 @@ const CHECKBOX_FIELDS = [
 
 /**
  * GET /api/settings — return all whitelisted setting values. Sensitive
- * keys are surfaced ONLY as `<key>_set: true|false` booleans + a last-4
- * mask preview, never as plaintext. The Settings UI uses these to render
- * "configured" badges; an operator who needs to view a real value must
- * rotate it (POST a new value) instead of reading the existing one.
+ * keys come back as a fixed-shape mask (••••••••wxyz — last 4 chars
+ * visible, the rest redacted), so the operator sees "configured" at a
+ * glance without the plaintext leaving the DB. The mask doubles as the
+ * input field's value: typing replaces it; submitting it unchanged means
+ * "preserve existing" (POST handler matches the mask shape and skips).
  *
- * Why: a single stolen session cookie (XSS, cookie disclosure, malicious
+ * Why: a stolen session cookie (XSS, cookie disclosure, malicious
  * extension) used to walk away with every infra credential in one GET.
  * Encryption-at-rest is moot if the API serves plaintext to any cookie.
+ * The mask reveals only the last 4 chars — enough for the operator to
+ * confirm which key is configured, not enough to use the credential.
  */
+const MASK_BULLET = "•"
 function maskTail(v: string): string {
   if (!v) return ""
-  if (v.length <= 4) return "•".repeat(v.length)
-  return "•".repeat(Math.max(4, v.length - 4)) + v.slice(-4)
+  if (v.length <= 4) return MASK_BULLET.repeat(v.length)
+  return MASK_BULLET.repeat(Math.max(4, Math.min(20, v.length - 4))) + v.slice(-4)
 }
+
+/** Server-side detector for the masked sentinel POST handler must preserve. */
+const MASK_SENTINEL_RE = /^•+[A-Za-z0-9._@:/=+-]{0,8}$/
 
 export async function GET(_req: NextRequest): Promise<Response> {
   const out: Record<string, string | boolean> = {}
   for (const k of STRING_FIELDS) {
     const raw = getSetting(k) ?? ""
     if (isSensitive(k)) {
-      // Boolean "is it set" + masked preview. Operator UI shows badges, never
-      // the real value. The plaintext only leaves the DB on the write path.
+      // Mask the value AS the field value (so the UI shows ••••••••wxyz
+      // in the input). Plus the legacy `_set` / `_preview` shapes for any
+      // UI code that consumes them as separate fields.
+      const masked = raw.length > 0 ? maskTail(raw) : ""
+      out[k] = masked
       out[`${k}_set`] = raw.length > 0
-      out[`${k}_preview`] = raw.length > 0 ? maskTail(raw) : ""
+      out[`${k}_preview`] = masked
     } else {
       out[k] = raw
     }
@@ -121,16 +131,26 @@ export async function POST(req: NextRequest): Promise<Response> {
   for (const k of STRING_FIELDS) {
     if (k in body) {
       const v = String(body[k] ?? "").trim()
-      // Sensitive fields are masked on GET; the UI submits empty for "leave
-      // alone" because it never sees the real value to begin with. Without
-      // this guard, every Save All Settings click would blank the secret.
-      // Operators clear a sensitive value by sending the literal "-" (mirrors
-      // the dashboard_password convention below).
-      if (isSensitive(k) && v === "") continue
-      const finalV = isSensitive(k) && v === "-" ? "" : v
-      setSetting(k, finalV)
-      changedKeys.push(k)
-      count++
+      // Sensitive fields: GET returned a mask (••••••••wxyz). If POST
+      // sends:
+      //   - empty string → operator didn't touch the field, preserve
+      //   - the mask itself → operator submitted Save without editing,
+      //     preserve (without this, Save would overwrite the secret with
+      //     literal bullet characters)
+      //   - "-" → explicit clear
+      //   - anything else → real new value, save it
+      if (isSensitive(k)) {
+        if (v === "") continue
+        if (MASK_SENTINEL_RE.test(v)) continue
+        const finalV = v === "-" ? "" : v
+        setSetting(k, finalV)
+        changedKeys.push(k)
+        count++
+      } else {
+        setSetting(k, v)
+        changedKeys.push(k)
+        count++
+      }
     }
   }
 
