@@ -934,10 +934,10 @@ function DomainsPageInner() {
                     ) : (
                       <button
                         type="button"
-                        className="inline-flex items-center justify-center rounded-sm p-0.5 text-muted-foreground/60 hover:bg-muted hover:text-muted-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-muted-foreground"
-                        title="SSL never verified — pipeline hasn't reached step 8 yet, or last probe was inconclusive. Click to probe now."
-                        onClick={() => recheckSsl(d.name)}
-                        aria-label={`Probe SSL for ${d.name}`}
+                        className="inline-flex items-center justify-center rounded-sm p-0.5 text-muted-foreground/60 hover:bg-status-warning/15 hover:text-status-warning focus:outline-none focus-visible:ring-1 focus-visible:ring-muted-foreground"
+                        title="SSL never verified — pipeline hasn't reached step 8 yet. Click to install now (re-runs pipeline from step 8)."
+                        onClick={() => fixSsl(d.name)}
+                        aria-label={`Install SSL for ${d.name}`}
                       >
                         <Lock className="h-4 w-4 opacity-60" />
                       </button>
