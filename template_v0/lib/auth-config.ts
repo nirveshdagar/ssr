@@ -37,11 +37,21 @@ function resolveCookiePassword(): string {
     : "ssr-dev-cookie-secret-change-in-prod-please-32chars-min"
 }
 
+// Allow operating on plain HTTP (e.g. dashboard accessed at http://server-ip/
+// over a trusted private network or via SSH tunnel) by setting
+// SSR_INSECURE_COOKIES=1. Disables the cookie `Secure` flag so browsers will
+// send the session cookie over HTTP. Shipping this in real prod is unsafe —
+// only use when the network path is otherwise trusted (LAN, VPN, SSH tunnel).
+function cookieSecureFlag(): boolean {
+  if (process.env.SSR_INSECURE_COOKIES === "1") return false
+  return process.env.NODE_ENV === "production"
+}
+
 export const sessionOptions: SessionOptions = {
   get password(): string { return resolveCookiePassword() },
   cookieName: "ssr_session",
   cookieOptions: {
-    secure: process.env.NODE_ENV === "production",
+    get secure(): boolean { return cookieSecureFlag() },
     httpOnly: true,
     // strict (not lax): there's no SSO / external login flow, so we never
     // need cross-site navigation to carry the cookie. Strict closes the

@@ -75,7 +75,7 @@ That's it. The script (in ~5 minutes):
 
 When it finishes you have a live, TLS-protected dashboard at `https://ssr.example.com/`. Open it, set the operator password in **Settings → Security**, then add your Cloudflare keys, DO tokens, ServerAvatar credentials, Spaceship API key, and at least one LLM provider key.
 
-> **Without TLS / without a domain yet?** Omit the env vars — `curl ... | sudo bash` runs the script in "no-domain" mode and binds the dashboard to `127.0.0.1:3000` for SSH-tunneling. Re-run with `DASHBOARD_HOSTNAME=...` later to add nginx + Let's Encrypt.
+> **No domain yet?** Omit both env vars — `curl ... | sudo bash` runs in "IP-only" mode: nginx still serves on port 80 with a wildcard `server_name`, the dashboard answers at `http://<server-ip>/`, and `SSR_INSECURE_COOKIES=1` is auto-set so login works over plain HTTP. Use this only on private networks / VPN — there's no transport encryption. Re-run with `DASHBOARD_HOSTNAME=... CERTBOT_EMAIL=...` later to add Let's Encrypt; the script removes `SSR_INSECURE_COOKIES` automatically when you add a domain.
 >
 > Re-running `install.sh` is safe — every step is idempotent. Use it for routine `git pull` + rebuild + restart, too.
 
