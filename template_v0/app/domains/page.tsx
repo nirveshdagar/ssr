@@ -905,19 +905,25 @@ function DomainsPageInner() {
                         className="inline-block"
                         title={
                           sslFixing.has(d.name)
-                            ? "SSL repair in progress — re-running pipeline from step 8 (install cert + verify)"
+                            ? "SSL install/repair in progress — re-running pipeline from step 8 (install via SA API + verify)"
                             : "Re-probing origin cert…"
                         }
                       >
                         <Loader2 className="h-4 w-4 mx-auto animate-spin text-muted-foreground" aria-label="SSL probe in progress" />
                       </span>
                     ) : d.sslOk === true ? (
+                      // Even when the wire-probe says "CF Origin Cert serving",
+                      // SA's tracker can disagree (cert installed via SSH
+                      // fallback bypassed SA's REST API → SA UI shows "Not
+                      // Installed"). Click triggers a from-step-8 reinstall
+                      // through SA's API path so the tracker reconciles.
+                      // Shift-click does just a re-probe without reinstalling.
                       <button
                         type="button"
                         className="inline-flex items-center justify-center rounded-sm p-0.5 text-status-completed hover:bg-status-completed/10 focus:outline-none focus-visible:ring-1 focus-visible:ring-status-completed"
-                        title={`CloudFlare Origin Cert verified${d.sslVerifiedAt ? ` at ${d.sslVerifiedAt}` : ""}. Click to re-probe now.`}
-                        onClick={() => recheckSsl(d.name)}
-                        aria-label={`Re-probe SSL for ${d.name}`}
+                        title={`CloudFlare Origin Cert verified on origin${d.sslVerifiedAt ? ` at ${d.sslVerifiedAt}` : ""}. Click to reinstall via SA API (reconciles SA tracker if it shows "Not Installed"). Shift+click to re-probe only.`}
+                        onClick={(e) => e.shiftKey ? recheckSsl(d.name) : fixSsl(d.name)}
+                        aria-label={`Reinstall SSL for ${d.name}`}
                       >
                         <Lock className="h-4 w-4" />
                       </button>
