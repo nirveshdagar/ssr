@@ -230,6 +230,10 @@ export interface BulkRunResult {
   job_id: number | null
   enqueued: number
   skipped: number
+  /** The actual domains that were queued, preserving input order. Use this
+   *  instead of `enqueued` (count) when you need to report back which
+   *  specific domains made it past the slot lock. */
+  eligible_domains: string[]
 }
 
 /**
@@ -281,6 +285,7 @@ export function runBulkPipeline(
     job_id: job_ids[0] ?? null,
     enqueued: job_ids.length,
     skipped,
+    eligible_domains: eligible,
   }
 }
 
@@ -319,7 +324,7 @@ export function runSequentialBulkPipeline(
     }
   }
   if (eligible.length === 0) {
-    return { job_ids: [], job_id: null, enqueued: 0, skipped }
+    return { job_ids: [], job_id: null, enqueued: 0, skipped, eligible_domains: [] }
   }
   const jobId = enqueueJob("pipeline.bulk", {
     domains: eligible,
@@ -334,6 +339,7 @@ export function runSequentialBulkPipeline(
     job_id: jobId,
     enqueued: eligible.length,
     skipped,
+    eligible_domains: eligible,
   }
 }
 
@@ -354,6 +360,7 @@ async function pipelineFullHandler(payload: Record<string, unknown>): Promise<vo
 
 async function pipelineBulkHandler(payload: Record<string, unknown>): Promise<void> {
   const p = payload as unknown as PipelineBulkPayload
+  const failed: { domain: string; reason: string }[] = []
   for (const d of p.domains) {
     try {
       await pipelineWorker(
@@ -364,9 +371,17 @@ async function pipelineBulkHandler(payload: Record<string, unknown>): Promise<vo
         p.custom_model ?? null,
       )
     } catch (e) {
+      const reason = `${(e as Error).name}: ${(e as Error).message}`
+      failed.push({ domain: d, reason })
       logPipeline(d, "pipeline", "failed",
-        `Bulk-worker exception escaped: ${(e as Error).name}: ${(e as Error).message}`)
+        `Bulk-worker exception escaped: ${reason}`)
     }
+  }
+  if (failed.length) {
+    logPipeline("", "pipeline", "warning",
+      `Bulk run finished with ${failed.length}/${p.domains.length} failures: ` +
+      failed.slice(0, 5).map((f) => `${f.domain} (${f.reason})`).join("; ") +
+      (failed.length > 5 ? ` and ${failed.length - 5} more` : ""))
   }
 }
 

@@ -114,7 +114,7 @@ export async function POST(req: NextRequest): Promise<Response> {
     const bulk: BulkRunResult = runSequentialBulkPipeline(valid, {
       skipPurchase, customProvider, customModel,
     })
-    result.enqueued = valid.slice(0, bulk.enqueued)
+    result.enqueued = bulk.eligible_domains
     result.job_id = bulk.job_id
     result.job_ids = bulk.job_ids
     // NOTE: customPrompt is NOT honored on the bulk path right now —

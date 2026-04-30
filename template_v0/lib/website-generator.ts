@@ -421,7 +421,7 @@ function validateGeneratedFiles(files: unknown): GeneratedFile[] | { error: stri
   if (files.length > 20) return { error: `too many files (${files.length} > max 20)` }
 
   const out: GeneratedFile[] = []
-  let entryPointSeen = false
+  let entryPointCount = 0
   // Allowed: lowercase letters, digits, dot, dash, underscore, slash.
   // Uppercase rejected to keep paths predictable on case-insensitive
   // filesystems (Apache resolves URLs case-sensitively even when the FS
@@ -450,11 +450,12 @@ function validateGeneratedFiles(files: unknown): GeneratedFile[] | { error: stri
     if (!content) return { error: `file '${path}' has empty content` }
     if (content.length > 50_000) return { error: `file '${path}' too large (${content.length} > 50000 bytes)` }
 
-    if (path === "index.php" || path === "index.html") entryPointSeen = true
+    if (path === "index.php" || path === "index.html") entryPointCount++
     out.push({ path, content })
   }
 
-  if (!entryPointSeen) return { error: "files must include exactly one of: index.php, index.html" }
+  if (entryPointCount === 0) return { error: "files must include exactly one of: index.php, index.html" }
+  if (entryPointCount > 1) return { error: "files must include exactly one of: index.php, index.html (both present)" }
   return out
 }
 

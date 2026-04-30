@@ -7,7 +7,8 @@ export async function GET(req: NextRequest) {
   const url = new URL(req.url)
   const action = url.searchParams.get("action")?.trim() || null
   const search = url.searchParams.get("q")?.trim() || null
-  const page = Math.max(1, Number.parseInt(url.searchParams.get("page") || "1", 10) || 1)
+  const rawPage = Number.parseInt(url.searchParams.get("page") || "1", 10) || 1
+  const page = Math.min(Math.max(1, rawPage), 10_000)
   const PAGE_SIZE = 50
   const { rows, total } = searchAuditLog({ action, search, limit: PAGE_SIZE, offset: (page - 1) * PAGE_SIZE })
   const lastPage = Math.max(1, Math.ceil(total / PAGE_SIZE))
