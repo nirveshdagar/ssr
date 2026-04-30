@@ -1,11 +1,11 @@
 /**
- * SQLite connection — shared with the Flask app.
+ * SQLite connection — owned end-to-end by this Next.js app.
  *
  * Uses Node's built-in `node:sqlite` (Node 22+). No native build, no
- * Visual Studio toolchain required on Windows. The Flask side owns
- * init_db() (schema + idempotent migrations + seed); this Next.js port
- * READS AND WRITES the same `data/ssr.db` file so both apps see the
- * same data — no schema duplication during the migration phase.
+ * Visual Studio toolchain required on Windows. The schema lives in
+ * lib/init-schema.ts and runs on first connection — a wiped or fresh
+ * `data/ssr.db` is safe (encrypted columns survive only as long as
+ * `data/.ssr_secret_fernet` is preserved alongside).
  *
  * Path resolution:
  *   - SSR_DB_PATH env var (preferred; absolute path)
@@ -16,6 +16,8 @@
  */
 import { DatabaseSync, type StatementSync } from "node:sqlite"
 import path from "node:path"
+import { mkdirSync } from "node:fs"
+import { initSchema } from "./init-schema"
 
 declare global {
   // eslint-disable-next-line no-var
@@ -30,19 +32,14 @@ function resolveDbPath(): string {
 export function getDb(): DatabaseSync {
   if (globalThis.__ssrDb) return globalThis.__ssrDb
   const dbPath = resolveDbPath()
+  // First-run convenience: data/ may not exist yet on a fresh checkout.
+  // SQLite errors loudly if the directory is missing, so create it here.
+  try { mkdirSync(path.dirname(dbPath), { recursive: true }) } catch { /* ignore */ }
   const db = new DatabaseSync(dbPath)
-  // Match Flask side's pragmas exactly so concurrent access plays nice.
   db.exec("PRAGMA journal_mode = WAL")
   db.exec("PRAGMA foreign_keys = ON")
   db.exec("PRAGMA busy_timeout = 10000")
-  // Indexes for hot dashboard queries. CREATE INDEX IF NOT EXISTS is
-  // idempotent so this is safe to run on every connection-cache-miss.
-  // Without these, OFFSET-paginated audit / pipeline_log queries scan
-  // the full table at 10k+ rows.
-  db.exec("CREATE INDEX IF NOT EXISTS idx_audit_action_id ON audit_log(action, id DESC)")
-  db.exec("CREATE INDEX IF NOT EXISTS idx_audit_created_at ON audit_log(created_at DESC)")
-  db.exec("CREATE INDEX IF NOT EXISTS idx_pipeline_log_domain_id ON pipeline_log(domain, id DESC)")
-  db.exec("CREATE INDEX IF NOT EXISTS idx_pipeline_log_created_at ON pipeline_log(created_at)")
+  initSchema(db)
   globalThis.__ssrDb = db
   return db
 }

@@ -13,27 +13,17 @@
 import { all, getDb, one, run } from "../db"
 import { decrypt, encrypt } from "../secrets-vault"
 
-let schemaReady = false
-
+/**
+ * Schema for cf_workers_ai_keys is now created in lib/init-schema.ts on
+ * first connection. This function is kept as a no-op alias so existing
+ * callers don't have to be updated all at once. Will be removed in a
+ * future cleanup pass.
+ */
 export function ensureCfAiKeysSchema(): void {
-  if (schemaReady) return
-  getDb().exec(`
-    CREATE TABLE IF NOT EXISTS cf_workers_ai_keys (
-      id              INTEGER PRIMARY KEY AUTOINCREMENT,
-      account_id      TEXT NOT NULL,
-      api_token       TEXT NOT NULL,
-      alias           TEXT,
-      is_active       INTEGER NOT NULL DEFAULT 1,
-      calls_today     INTEGER NOT NULL DEFAULT 0,
-      calls_total     INTEGER NOT NULL DEFAULT 0,
-      last_call_at    TEXT,
-      last_call_date  TEXT,
-      last_error      TEXT,
-      created_at      TEXT DEFAULT (datetime('now')),
-      UNIQUE(account_id, api_token)
-    );
-  `)
-  schemaReady = true
+  // Schema is created in lib/init-schema.ts during getDb().
+  // Calling getDb() here would only force-init it if for some reason a
+  // caller bypassed db.ts — defensive, cheap.
+  getDb()
 }
 
 export interface CfAiKeyRow {
