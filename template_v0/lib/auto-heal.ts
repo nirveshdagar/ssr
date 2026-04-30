@@ -397,6 +397,106 @@ export function autoFixBrokenSsl(): BrokenSslResult {
 }
 
 // ---------------------------------------------------------------------------
+// SA-agent health probe — proactively flags degraded servers
+// ---------------------------------------------------------------------------
+
+export interface SaHealthEntry {
+  server_id: number
+  name: string | null
+  ip: string | null
+  sa_server_id: string
+  status: string  // human-readable: "disconnected" | "offline" | "404" | "error: ..."
+}
+export interface SaHealthResult {
+  checked: number
+  degraded: SaHealthEntry[]
+}
+
+/**
+ * Walk every `status='ready'` server with a `sa_server_id` and ask SA whether
+ * the agent is connected. Domains that still serve HTTPS won't trigger the
+ * live-checker's dead-server flow, but if the SA agent is offline the
+ * dashboard can't deploy / migrate / install certs — operator needs to know.
+ *
+ * On finding a degraded server: log to pipeline_log, appendAudit, fire a
+ * deduped notify (dedupeKey scoped per-server so the same agent flapping
+ * doesn't spam every 5 minutes). This function does NOT auto-mark the
+ * server dead or trigger migration — that decision belongs to the operator
+ * (they may want to manually reinstall the agent first). live-checker still
+ * handles the "HTTPS down too" → mark dead path independently.
+ */
+export async function checkSaAgents(): Promise<SaHealthResult> {
+  const rows = all<{ id: number; name: string | null; ip: string | null; sa_server_id: string }>(
+    `SELECT id, name, ip, sa_server_id
+       FROM servers
+      WHERE status = 'ready' AND sa_server_id IS NOT NULL AND sa_server_id != ''`,
+  )
+  const degraded: SaHealthEntry[] = []
+  if (rows.length === 0) return { checked: 0, degraded }
+
+  const { getServerInfo } = await import("./serveravatar")
+  const { notify } = await import("./notify")
+
+  for (const r of rows) {
+    let agentStatus = ""
+    try {
+      const info = await getServerInfo(r.sa_server_id)
+      agentStatus = String(info.agent_status ?? info.status ?? "").toLowerCase()
+    } catch (e) {
+      const msg = (e as Error).message
+      if (msg.includes("HTTP 404")) {
+        agentStatus = "404"
+      } else {
+        // Transient SA-API failure — skip this row this tick. Log so the
+        // operator can see we tried and SA itself was unreachable (vs
+        // staying silent which would mask SA-side outages).
+        logPipeline(`server-${r.id}`, "sa_health", "warning",
+          `SA-info probe failed: ${msg.slice(0, 160)}`)
+        continue
+      }
+    }
+
+    const isDegraded =
+      agentStatus === "disconnected" ||
+      agentStatus === "offline" ||
+      agentStatus === "0" ||
+      agentStatus === "404"
+    if (!isDegraded) continue
+
+    degraded.push({
+      server_id: r.id, name: r.name, ip: r.ip,
+      sa_server_id: r.sa_server_id, status: agentStatus,
+    })
+
+    const reason = agentStatus === "404"
+      ? `SA returned 404 for sa_server_id=${r.sa_server_id} (entry deleted from ServerAvatar)`
+      : `SA agent_status='${agentStatus}'`
+    logPipeline(`server-${r.id}`, "sa_health", "warning",
+      `${reason} — agent appears degraded; HTTPS may still serve but SA-managed actions ` +
+      `(deploy, install cert, migrate) will fail. Reinstall agent or migrate.`)
+    try {
+      appendAudit(
+        "sa_agent_degraded",
+        `server-${r.id}`,
+        `name=${r.name ?? ""} ip=${r.ip ?? ""} sa_server_id=${r.sa_server_id} ` +
+        `agent_status=${agentStatus}`,
+        null,
+      )
+    } catch { /* ignore */ }
+    try {
+      await notify(
+        `SA agent degraded: ${r.name ?? `server-${r.id}`}`,
+        `${reason}\n\nServer #${r.id} (${r.name ?? "?"} / ${r.ip ?? "?"}).\n` +
+        `HTTPS to its domains may still work, but ServerAvatar can't manage it. ` +
+        `Reinstall the agent (Servers → click the row → Reinstall agent) or migrate to a fresh droplet.`,
+        { severity: "error", dedupeKey: `sa_agent_degraded:${r.id}` },
+      )
+    } catch { /* notify is best-effort */ }
+  }
+  return { checked: rows.length, degraded }
+}
+
+// ---------------------------------------------------------------------------
 // One tick of the background loop
 // ---------------------------------------------------------------------------
 
@@ -406,6 +506,7 @@ export interface AutoHealTickResult {
   ns: NsCheckResult | { error: string }
   retry: RetryResult | { error: string }
   brokenSsl: BrokenSslResult | { error: string }
+  saHealth: SaHealthResult | { error: string }
   ranAt: string
 }
 
@@ -450,22 +551,30 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
     brokenSsl = { error: (e as Error).message }
   }
 
+  let saHealth: SaHealthResult | { error: string }
+  try {
+    saHealth = await checkSaAgents()
+  } catch (e) {
+    saHealth = { error: (e as Error).message }
+  }
+
   // Only audit-log when something actually happened — avoids audit spam.
   const claimedN = "claimed" in reconcile ? reconcile.claimed.length : 0
   const resumedN = "resumed" in resume ? resume.resumed.length : 0
   const nsResumedN = "resumed" in ns ? ns.resumed.length : 0
   const retriedN = "retried" in retry ? retry.retried.length : 0
   const sslReissuedN = "reissued" in brokenSsl ? brokenSsl.reissued.length : 0
-  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN > 0) {
+  const degradedN = "degraded" in saHealth ? saHealth.degraded.length : 0
+  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN > 0) {
     appendAudit(
       "auto_heal_tick", "",
       `claimed=${claimedN} resumed=${resumedN} ns_resumed=${nsResumedN} ` +
-      `retried=${retriedN} ssl_reissued=${sslReissuedN}`,
+      `retried=${retriedN} ssl_reissued=${sslReissuedN} sa_degraded=${degradedN}`,
       null,
     )
   }
 
-  return { reconcile, resume, ns, retry, brokenSsl, ranAt }
+  return { reconcile, resume, ns, retry, brokenSsl, saHealth, ranAt }
 }
 
 // ---------------------------------------------------------------------------
