@@ -87,6 +87,12 @@ async function cfRequest<T>(
           method,
           headers: authHeaders(creds, body !== undefined),
           body: body !== undefined ? JSON.stringify(body) : undefined,
+          // 30s ceiling on each attempt — without this, a hung TCP (kept-alive
+          // pool stale entry, CF edge brownout, our outbound NAT dropping the
+          // SYN-ACK) pins the worker forever and the heartbeat keeps writing
+          // 'running' so auto-heal never picks it up as stuck. Other clients
+          // (DO, SA) all have explicit timeouts; CF was the lone outlier.
+          signal: AbortSignal.timeout(30_000),
         })
         if (res.status === 429 || res.status >= 500) {
           // Retry on rate-limit / 5xx with linear backoff
@@ -389,7 +395,12 @@ async function rawCfPost(url: string, body: unknown, headers: Record<string, str
   const email = (headers["X-Auth-Email"] ?? "").toLowerCase()
   const semKey = email ? `cf:${email}` : "cf:_anon"
   return withSemaphore(semKey, CF_CAP_PER_KEY, async () => {
-    const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) })
+    const res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
+    })
     const text = await res.text()
     let json: RawCfResponse["json"] = null
     try { json = text ? JSON.parse(text) : null } catch { /* keep null */ }

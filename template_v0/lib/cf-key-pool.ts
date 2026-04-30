@@ -92,20 +92,10 @@ export function getNextAvailableCfKey(): CfKeyWithCreds {
  * round-robin pick). If that key has no capacity / is inactive, throws.
  */
 export function assignCfKeyToDomain(domain: string, keyId?: number): CfKeyWithCreds {
-  // 1. Fast path: domain already has a key — return without touching counters
-  const existing = one<{ cf_key_id: number | null }>(
-    "SELECT cf_key_id FROM domains WHERE domain = ?",
-    domain,
-  )
-  if (existing?.cf_key_id) {
-    const keyRow = one<CfKeyWithCreds>(
-      `SELECT ${KEY_WITH_CREDS_COLS} FROM cf_keys WHERE id = ?`,
-      existing.cf_key_id,
-    )
-    if (keyRow) return { ...keyRow, api_key: decrypt(keyRow.api_key) }
-  }
-
-  // 2. Pick a candidate
+  // Pick a candidate FIRST (outside the transaction) so we don't hold a write
+  // lock during the SELECT that might pick a row about to be filled. We
+  // re-validate inside the transaction with a guarded UPDATE — the loser
+  // sees rowcount=0 and retries.
   let candidate: CfKeyWithCreds
   if (keyId == null) {
     candidate = getNextAvailableCfKey()
@@ -123,37 +113,54 @@ export function assignCfKeyToDomain(domain: string, keyId?: number): CfKeyWithCr
     candidate = { ...row, api_key: decrypt(row.api_key) }
   }
 
-  // 3. Atomic increment + assignment.
-  // node:sqlite doesn't expose a Transaction helper — use raw BEGIN/COMMIT.
   const db = getDb()
   db.exec("BEGIN IMMEDIATE")
   try {
-    const incRes = db
-      .prepare(
-        `UPDATE cf_keys
-            SET domains_used = domains_used + 1,
-                last_used_at = datetime('now')
-          WHERE id = ?
-            AND domains_used < max_domains
-            AND is_active = 1`,
-      )
-      .run(candidate.id)
-    if (incRes.changes !== 1) {
-      // Race: someone filled the slot between SELECT and UPDATE. Roll back
-      // and retry with a fresh pick (no keyId override — the override is the
-      // operator's "use this one specifically" choice, but if it's full we
-      // have to fall back to the next free one).
+    // Idempotency check INSIDE the transaction. Two parallel calls for the
+    // same domain (operator double-click, retry storm) used to read
+    // cf_key_id=null both, both increment a counter, and the second's UPDATE
+    // overwrite the first — leaking the first key's slot. Reading here under
+    // BEGIN IMMEDIATE serializes the check against any concurrent writer.
+    const existing = db.prepare(
+      "SELECT cf_key_id FROM domains WHERE domain = ?",
+    ).get(domain) as { cf_key_id: number | null } | undefined
+    if (existing?.cf_key_id) {
+      // Another caller assigned this domain while we were picking. Reuse.
       db.exec("ROLLBACK")
-      return assignCfKeyToDomain(domain) // retry with auto-pick
+      const keyRow = one<CfKeyWithCreds>(
+        `SELECT ${KEY_WITH_CREDS_COLS} FROM cf_keys WHERE id = ?`,
+        existing.cf_key_id,
+      )!
+      return { ...keyRow, api_key: decrypt(keyRow.api_key) }
     }
-    db.prepare(
+
+    const incRes = db.prepare(
+      `UPDATE cf_keys
+          SET domains_used = domains_used + 1,
+              last_used_at = datetime('now')
+        WHERE id = ?
+          AND domains_used < max_domains
+          AND is_active = 1`,
+    ).run(candidate.id)
+    if (incRes.changes !== 1) {
+      // Race: someone filled this candidate's slot. Roll back and retry
+      // with a fresh pick (auto-pick, ignore explicit keyId override since
+      // the override is "use this one" but it's now full).
+      db.exec("ROLLBACK")
+      return assignCfKeyToDomain(domain)
+    }
+
+    // Guarded domain update: only assign if cf_key_id is still null. If a
+    // concurrent winner (somehow) already wrote, we ROLLBACK to release the
+    // increment we just did rather than overwrite their pointer.
+    const domUpd = db.prepare(
       `UPDATE domains
           SET cf_key_id = ?,
               cf_email = ?,
               cf_global_key = ?,
               cf_account_id = ?,
               updated_at = datetime('now')
-        WHERE domain = ?`,
+        WHERE domain = ? AND cf_key_id IS NULL`,
     ).run(
       candidate.id,
       candidate.email,
@@ -161,13 +168,19 @@ export function assignCfKeyToDomain(domain: string, keyId?: number): CfKeyWithCr
       candidate.cf_account_id,
       domain,
     )
+    if (domUpd.changes !== 1) {
+      // A concurrent caller assigned this domain between our existence
+      // check and now. Roll back so we don't double-count, then reuse.
+      db.exec("ROLLBACK")
+      return assignCfKeyToDomain(domain)
+    }
     db.exec("COMMIT")
   } catch (e) {
     try { db.exec("ROLLBACK") } catch { /* ignore */ }
     throw e
   }
 
-  // 4. Return fresh row (so the caller sees the post-increment domains_used)
+  // Return fresh row (so the caller sees the post-increment domains_used)
   const fresh = one<CfKeyWithCreds>(
     `SELECT ${KEY_WITH_CREDS_COLS} FROM cf_keys WHERE id = ?`,
     candidate.id,

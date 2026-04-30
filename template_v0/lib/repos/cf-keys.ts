@@ -1,4 +1,4 @@
-import { all, one, run } from "../db"
+import { all, getDb, one, run } from "../db"
 import { decrypt, encrypt } from "../secrets-vault"
 
 export interface CfKeyRow {
@@ -113,10 +113,25 @@ export function toggleCfKeyActive(id: number): boolean {
 }
 
 export function deleteCfKey(id: number): { ok: boolean; reason?: string } {
-  const ref = one<{ n: number }>("SELECT COUNT(*) AS n FROM domains WHERE cf_key_id = ?", id)
-  if (ref && ref.n > 0) return { ok: false, reason: `${ref.n} domain(s) still reference this key` }
-  run("DELETE FROM cf_keys WHERE id = ?", id)
-  return { ok: true }
+  // Wrap reference-check + DELETE in BEGIN IMMEDIATE so a pipeline.full
+  // running between the SELECT and the DELETE can't slip a new domain row
+  // pointing at this key in. Without the transaction the DELETE succeeds
+  // and the new row holds a dangling FK.
+  const db = getDb()
+  db.exec("BEGIN IMMEDIATE")
+  try {
+    const ref = db.prepare("SELECT COUNT(*) AS n FROM domains WHERE cf_key_id = ?").get(id) as { n: number } | undefined
+    if (ref && ref.n > 0) {
+      db.exec("ROLLBACK")
+      return { ok: false, reason: `${ref.n} domain(s) still reference this key` }
+    }
+    db.prepare("DELETE FROM cf_keys WHERE id = ?").run(id)
+    db.exec("COMMIT")
+    return { ok: true }
+  } catch (e) {
+    try { db.exec("ROLLBACK") } catch { /* ignore */ }
+    throw e
+  }
 }
 
 export function editCfKey(id: number, alias: string | null, max_domains: number): void {

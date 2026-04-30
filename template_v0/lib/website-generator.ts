@@ -66,6 +66,29 @@ interface LlmConfig {
 // Gemini still works via API-key path (settings → llm_api_key_gemini).
 const CLI_CAPABLE_PROVIDERS: ReadonlySet<string> = new Set(["openai"])
 
+/**
+ * Read the response body as text first, then JSON.parse. On parse failure,
+ * throw a descriptive error including provider, status, and body head.
+ *
+ * Why: providers occasionally return 200 with truncated / non-JSON bodies
+ * (Anthropic on quota throttling, OpenRouter on upstream-failure passthrough,
+ * any of them on edge brownouts). The default `await res.json()` then throws
+ * `SyntaxError: Unexpected token < in JSON at position 0` and the operator
+ * sees an inscrutable error masquerading as a model failure.
+ */
+async function safeLlmJson<T>(provider: string, res: Response): Promise<T> {
+  const text = await res.text()
+  try {
+    return JSON.parse(text) as T
+  } catch (e) {
+    const head = text.slice(0, 200).replace(/\s+/g, " ")
+    throw new Error(
+      `${provider} returned non-JSON body (status=${res.status}, parse=${(e as Error).message}, ` +
+      `body-head=${JSON.stringify(head)})`,
+    )
+  }
+}
+
 function isCliEnabled(provider: string): boolean {
   if (!CLI_CAPABLE_PROVIDERS.has(provider)) return false
   return (getSetting(`llm_cli_enabled_${provider}`) || "0") === "1"
@@ -608,10 +631,10 @@ async function _generateSinglePageImpl(
       signal: AbortSignal.timeout(getLlmTimeoutMs()),
     })
     if (!res.ok) throw new Error(`${provider} HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`)
-    const apiBody = (await res.json()) as {
+    const apiBody = await safeLlmJson<{
       choices?: { message?: { content?: string } }[]
       usage?: { prompt_tokens?: number; completion_tokens?: number; input_tokens?: number; output_tokens?: number }
-    }
+    }>(provider, res)
     text = apiBody.choices?.[0]?.message?.content ?? ""
     const u = apiBody.usage ?? {}
     usage = {
@@ -641,18 +664,35 @@ async function _generateSinglePageImpl(
     const model = (overrideModel || getSetting("llm_model") || "@cf/moonshotai/kimi-k2.6").trim()
     const tried: number[] = []
     let lastErr: Error | null = null
-    for (let attempt = 0; attempt < 6; attempt++) {
+    let attempt = 0
+    // Loop until getNextAiKey itself throws AiPoolExhausted — the function
+    // is the authoritative oracle for "are there any rows left to try".
+    // The previous hardcoded 6-cap defeated the point of stacking many
+    // accounts in v9_state — operator could have 15 accounts but the run
+    // would stop at row 7.
+    let success = false
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
       let row
       try {
         row = getNextAiKey(tried)
       } catch (e) {
-        if (lastErr) throw lastErr
+        // No rows left to try. If we previously got a quota error, surface
+        // it as AiPoolExhausted so callers can distinguish "no keys ever"
+        // from "all keys have been tried and quotaed". Otherwise rethrow
+        // whatever getNextAiKey itself complained about.
+        if (lastErr) {
+          throw new AiPoolExhausted(
+            `cloudflare_pool: all ${tried.length} active row(s) failed; last error: ${lastErr.message}`,
+          )
+        }
         throw e
       }
       tried.push(row.id)
+      attempt++
       logPipeline(domain, "generate_site_v2", "running",
         `cloudflare_pool call: row=#${row.id} (${row.alias ?? row.account_id.slice(0, 6)}) ` +
-        `model=${model} max_tokens=${maxTokens} attempt=${attempt + 1}`)
+        `model=${model} max_tokens=${maxTokens} attempt=${attempt}`)
       try {
         const out = await callCloudflareWorkersAi({
           accountId: row.account_id,
@@ -662,7 +702,7 @@ async function _generateSinglePageImpl(
         recordAiKeyCall(row.id)
         text = out.text
         usage = out.usage
-        lastErr = null
+        success = true
         break
       } catch (e) {
         const err = e as Error
@@ -677,10 +717,10 @@ async function _generateSinglePageImpl(
           `cloudflare_pool row #${row.id} hit quota — falling through to next row`)
       }
     }
-    if (lastErr) {
-      throw new AiPoolExhausted(
-        `cloudflare_pool: all ${tried.length} active row(s) failed; last error: ${lastErr.message}`,
-      )
+    if (!success) {
+      // Unreachable in practice — the loop only exits via break (success)
+      // or via throw — but TS flow analysis is happier with this guard.
+      throw new AiPoolExhausted("cloudflare_pool: exited without a successful call")
     }
   } else if (provider === "gemini") {
     const model = (overrideModel || getSetting("llm_model") || "gemini-2.5-flash").trim()
@@ -705,10 +745,10 @@ async function _generateSinglePageImpl(
       },
     )
     if (!res.ok) throw new Error(`gemini HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`)
-    const apiBody = (await res.json()) as {
+    const apiBody = await safeLlmJson<{
       candidates?: { content?: { parts?: { text?: string }[] } }[]
       usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number }
-    }
+    }>("gemini", res)
     const cands = apiBody.candidates ?? []
     if (cands.length) {
       const parts = cands[0].content?.parts ?? []
@@ -737,10 +777,10 @@ async function _generateSinglePageImpl(
       signal: AbortSignal.timeout(getLlmTimeoutMs()),
     })
     if (!res.ok) throw new Error(`Anthropic HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`)
-    const apiBody = (await res.json()) as {
+    const apiBody = await safeLlmJson<{
       content?: { text?: string }[]
       usage?: { input_tokens?: number; output_tokens?: number }
-    }
+    }>("anthropic", res)
     text = apiBody.content?.[0]?.text ?? ""
     const u = apiBody.usage ?? {}
     usage = { input_tokens: u.input_tokens ?? null, output_tokens: u.output_tokens ?? null }

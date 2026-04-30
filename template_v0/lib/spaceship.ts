@@ -44,6 +44,47 @@ async function safeJson(res: Response): Promise<unknown> {
   }
 }
 
+/**
+ * Wraps `fetch` with a default 30s timeout AND a 2-attempt linear-backoff
+ * retry on 429 / 5xx / network errors. Spaceship has no idempotency-key
+ * support and no failover-token concept, so a transient blip on the only
+ * registrar would otherwise stall every step-1 / step-4 forever. Default
+ * retries=2 picks up brief outages without amplifying load.
+ *
+ * Important: the caller still gets a single Response; callers that POST
+ * non-idempotent operations (purchaseDomain) must check for "already in
+ * account" themselves to avoid double-charge — see purchaseDomain.
+ */
+async function spaceshipFetch(
+  url: string,
+  init: RequestInit = {},
+  opts: { retries?: number; timeoutMs?: number } = {},
+): Promise<Response> {
+  const retries = opts.retries ?? 2
+  const timeoutMs = opts.timeoutMs ?? 30_000
+  let lastErr: unknown
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) })
+      if (res.status === 429 || res.status >= 500) {
+        if (attempt < retries) {
+          await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)))
+          continue
+        }
+      }
+      return res
+    } catch (e) {
+      lastErr = e
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)))
+        continue
+      }
+      throw e
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error("spaceshipFetch: exhausted retries")
+}
+
 function extractMessage(body: unknown, fallback: string): string {
   if (body && typeof body === "object" && "message" in body) {
     const m = (body as { message?: unknown }).message
@@ -60,7 +101,7 @@ export async function checkAvailability(
   domains: string | string[],
 ): Promise<AvailabilityResponse> {
   const list = Array.isArray(domains) ? domains : [domains]
-  const res = await fetch(`${API_BASE}/domains/available`, {
+  const res = await spaceshipFetch(`${API_BASE}/domains/available`, {
     method: "POST",
     headers: headers(),
     body: JSON.stringify({ domains: list }),
@@ -78,7 +119,7 @@ async function pollAsyncOperation(
 ): Promise<{ ok: true; data: unknown } | { ok: false; error: string }> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    const res = await fetch(`${API_BASE}/async-operations/${operationId}`, {
+    const res = await spaceshipFetch(`${API_BASE}/async-operations/${operationId}`, {
       headers: headers(),
     })
     if (!res.ok) return { ok: false, error: `Operation poll HTTP ${res.status}` }
@@ -127,17 +168,33 @@ export async function purchaseDomain(
 ): Promise<{ ok: boolean; result: unknown }> {
   logPipeline(domain, "domain_purchase", "running", `Purchasing ${domain} for ${years} year(s)`)
   try {
+    // Pre-purchase idempotency check — if a previous purchase succeeded but
+    // we lost the response (network blip, our timeout fired after Spaceship
+    // already charged), the domain is already in the account and a second
+    // POST would double-charge. Spaceship returns 200 from getDomainInfo for
+    // owned domains and 4xx otherwise, so we use it as the existence probe.
+    try {
+      await getDomainInfo(domain)
+      logPipeline(domain, "domain_purchase", "warning",
+        `${domain} already in Spaceship account; skipping POST to avoid double-charge`)
+      return { ok: true, result: { idempotent: true } }
+    } catch { /* not in account — proceed to purchase */ }
+
     const payload = {
       autoRenew: false,
       years,
       privacyProtection: { level: "high" },
       contacts: buildContacts(),
     }
-    const res = await fetch(`${API_BASE}/domains/${domain}`, {
+    // Don't retry POST /domains automatically — every retry is a new
+    // purchase attempt and the side effect is a real charge. The pre-check
+    // above handles the lost-response case for the previous purchase; let
+    // any failure here surface to the caller.
+    const res = await spaceshipFetch(`${API_BASE}/domains/${domain}`, {
       method: "POST",
       headers: headers(),
       body: JSON.stringify(payload),
-    })
+    }, { retries: 0 })
     if (res.status === 202) {
       const opId = res.headers.get("spaceship-async-operationid") || ""
       if (opId) {
@@ -171,7 +228,7 @@ export async function purchaseDomain(
 export async function setNameservers(domain: string, nameservers: string[]): Promise<boolean> {
   logPipeline(domain, "set_nameservers", "running", `Setting NS: ${nameservers.join(", ")}`)
   try {
-    const res = await fetch(`${API_BASE}/domains/${domain}/nameservers`, {
+    const res = await spaceshipFetch(`${API_BASE}/domains/${domain}/nameservers`, {
       method: "PUT",
       headers: headers(),
       body: JSON.stringify({ provider: "custom", hosts: nameservers }),
@@ -208,7 +265,7 @@ export async function restoreDefaultNameservers(
   logPipeline(domain, "restore_nameservers", "running",
     "Switching domain back to Spaceship's basic NS pool before CF zone delete")
   try {
-    const res = await fetch(`${API_BASE}/domains/${domain}/nameservers`, {
+    const res = await spaceshipFetch(`${API_BASE}/domains/${domain}/nameservers`, {
       method: "PUT",
       headers: headers(),
       body: JSON.stringify({ provider: "basic" }),
@@ -236,14 +293,14 @@ export async function restoreDefaultNameservers(
 }
 
 export async function getDomainInfo(domain: string): Promise<unknown> {
-  const res = await fetch(`${API_BASE}/domains/${domain}`, { headers: headers() })
+  const res = await spaceshipFetch(`${API_BASE}/domains/${domain}`, { headers: headers() })
   if (!res.ok) throw new Error(`Spaceship get_domain HTTP ${res.status}`)
   return res.json()
 }
 
 export async function listDomains(take = 25, skip = 0): Promise<unknown> {
   const url = `${API_BASE}/domains?take=${take}&skip=${skip}`
-  const res = await fetch(url, { headers: headers() })
+  const res = await spaceshipFetch(url, { headers: headers() })
   if (!res.ok) throw new Error(`Spaceship list_domains HTTP ${res.status}`)
   return res.json()
 }
@@ -251,7 +308,7 @@ export async function listDomains(take = 25, skip = 0): Promise<unknown> {
 export async function deleteDomain(domain: string): Promise<{ ok: boolean; message: string }> {
   logPipeline(domain, "spaceship_delete", "running", `Attempting to delete ${domain} from Spaceship...`)
   try {
-    const res = await fetch(`${API_BASE}/domains/${domain}`, {
+    const res = await spaceshipFetch(`${API_BASE}/domains/${domain}`, {
       method: "DELETE",
       headers: headers(),
     })
