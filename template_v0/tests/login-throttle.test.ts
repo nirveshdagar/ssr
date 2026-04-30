@@ -50,4 +50,22 @@ describe("login-throttle", () => {
     expect(loginThrottleCheck("10.1.1.1")).toBe(false)
     expect(loginThrottleCheck("10.1.1.2")).toBe(true) // different IP, fresh
   })
+
+  it("checkAndReserve admits exactly MAX_PER_WINDOW under burst (TOCTOU race fix)", async () => {
+    // The race fix: a naïve check-then-record sequence let N parallel
+    // requests all see length<5 and all proceed. checkAndReserve does
+    // check + push in a single synchronous pass, so the (N+1)th sees the
+    // bucket full. Verify by firing 20 callers at the same IP and asserting
+    // exactly MAX_PER_WINDOW (5) get true.
+    const { loginThrottleCheckAndReserve } = await import("@/lib/login-throttle")
+    const ip = "10.0.0.99"
+    // Fire all calls without awaiting between them — better-sqlite3 isn't
+    // involved here (the throttle bucket lives in module memory), but the
+    // shape mirrors what N concurrent route handlers would do.
+    const results = Array.from({ length: 20 }, () => loginThrottleCheckAndReserve(ip))
+    const allowed = results.filter(Boolean).length
+    expect(allowed).toBe(5)
+    // And the bucket is now properly full — a 21st caller is rejected.
+    expect(loginThrottleCheckAndReserve(ip)).toBe(false)
+  })
 })

@@ -1,12 +1,23 @@
 import { all, run } from "../db"
 
+// Cap on the freeform `message` column. CF/SA error bodies can be many KiB,
+// and pipeline_log writes from request handlers interpolate them directly —
+// without this cap, the table grows fast under failure storms and dashboard
+// queries slow down. 2 KiB is enough for human messages + one stack-shaped
+// error head; truncation marker tells the operator to look at the full
+// stack via the run details / step artifact.
+const LOG_MESSAGE_MAX = 2048
+
 export function logPipeline(domain: string, step: string, status: string, message = ""): void {
+  const safe = message && message.length > LOG_MESSAGE_MAX
+    ? message.slice(0, LOG_MESSAGE_MAX) + ` …[truncated; original ${message.length} chars]`
+    : message
   run(
     "INSERT INTO pipeline_log(domain,step,status,message) VALUES(?,?,?,?)",
     domain,
     step,
     status,
-    message,
+    safe,
   )
 }
 
