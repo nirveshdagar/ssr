@@ -498,8 +498,15 @@ export function startAutoHeal(): void {
   // hit external APIs.
   setTimeout(() => {
     void autoHealTickOnce().catch((e) => {
-      logPipeline("(auto-heal)", "auto_heal", "warning",
-        `tick threw: ${(e as Error).message}`)
+      const msg = (e as Error).message
+      logPipeline("(auto-heal)", "auto_heal", "warning", `tick threw: ${msg}`)
+      try { appendAudit("auto_heal_crashed", "", msg, null) } catch { /* ignore */ }
+      void import("./notify").then(({ notify }) =>
+        notify("Auto-heal tick crashed",
+          `autoHealTickOnce threw — sweeper continues but may be in degraded state.\n\n${msg}`,
+          { severity: "error", dedupeKey: "auto_heal_crashed" },
+        ),
+      ).catch(() => { /* notify is best-effort */ })
     })
     const timer = setInterval(() => {
       void autoHealTickOnce().catch((e) => {

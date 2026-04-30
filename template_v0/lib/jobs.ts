@@ -99,7 +99,10 @@ export function listJobs(opts: { status?: string; kind?: string; limit?: number 
 
 export function recoverOrphans(): number {
   const now = Date.now() / 1000
-  // Failed: any 'running' that already exhausted its attempts.
+  // attempt_count is incremented on FAILURE (in runOne), not on CLAIM,
+  // so a crashed worker leaves the row at its pre-claim count. The check
+  // below correctly fails only jobs that have actually exhausted their
+  // recorded attempts; everything else gets requeued for another try.
   const failed = run(
     `UPDATE jobs
         SET status = 'failed',
@@ -138,18 +141,58 @@ export function recoverOrphans(): number {
   return Number(failed.changes) + Number(skippedDone.changes) + Number(requeued.changes)
 }
 
+/**
+ * Soft variant of `recoverOrphans` for the in-process stuck-job sweeper.
+ * Only requeues rows that have been `running` long enough to be considered
+ * stuck (default 30 min). Used by the scheduled sweeper so a worker that
+ * silently dies — e.g. an upstream `await` that never resolves and isn't
+ * caught by Node's process-level handler — gets its job back to the queue
+ * within bounded time instead of waiting for the next process restart.
+ */
+export function recoverStuckJobs(stuckAfterSeconds = 1800): number {
+  const now = Date.now() / 1000
+  const cutoff = now - stuckAfterSeconds
+  const failed = run(
+    `UPDATE jobs
+        SET status = 'failed',
+            last_error = COALESCE(last_error, '') || ' | stuck: locked > ' || ? || 's, attempts exhausted',
+            locked_by = NULL, locked_at = NULL, updated_at = ?
+      WHERE status = 'running'
+        AND locked_at IS NOT NULL AND locked_at < ?
+        AND attempt_count >= max_attempts`,
+    stuckAfterSeconds,
+    now,
+    cutoff,
+  )
+  const requeued = run(
+    `UPDATE jobs
+        SET status = 'queued',
+            last_error = COALESCE(last_error, '') || ' | stuck: locked > ' || ? || 's, requeued',
+            locked_by = NULL, locked_at = NULL, updated_at = ?
+      WHERE status = 'running'
+        AND locked_at IS NOT NULL AND locked_at < ?`,
+    stuckAfterSeconds,
+    now,
+    cutoff,
+  )
+  return Number(failed.changes) + Number(requeued.changes)
+}
+
 function claimOne(workerId: string): JobRow | null {
   const now = Date.now() / 1000
   const db = getDb()
   // SELECT-then-UPDATE with status guard. SQLite serializes writes; the
   // guard makes the loser's UPDATE a no-op (rowcount=0).
+  // attempt_count is intentionally NOT incremented here — it ticks up only
+  // on actual failure, so a worker that crashes mid-handler doesn't burn
+  // an attempt. Recovery is then accurate (see recoverOrphans).
   const row = db.prepare(
     `SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1`,
   ).get() as { id: number } | undefined
   if (!row) return null
   const updated = db.prepare(
     `UPDATE jobs
-        SET status = 'running', attempt_count = attempt_count + 1,
+        SET status = 'running',
             locked_by = ?, locked_at = ?, updated_at = ?
       WHERE id = ? AND status = 'queued'`,
   ).run(workerId, now, now, row.id)
@@ -170,12 +213,28 @@ function finishJob(id: number, status: string, error: string | null = null): voi
   )
 }
 
-function requeueForRetry(id: number, error: string): void {
+function failJobIncrement(id: number, error: string, newCount: number): void {
   const now = Date.now() / 1000
   run(
     `UPDATE jobs
-        SET status = 'queued', last_error = ?, locked_by = NULL, locked_at = NULL, updated_at = ?
+        SET status = 'failed', attempt_count = ?, last_error = ?,
+            locked_by = NULL, locked_at = NULL, updated_at = ?
       WHERE id = ?`,
+    newCount,
+    error,
+    now,
+    id,
+  )
+}
+
+function requeueForRetry(id: number, error: string, newCount: number): void {
+  const now = Date.now() / 1000
+  run(
+    `UPDATE jobs
+        SET status = 'queued', attempt_count = ?, last_error = ?,
+            locked_by = NULL, locked_at = NULL, updated_at = ?
+      WHERE id = ?`,
+    newCount,
     error,
     now,
     id,
@@ -200,10 +259,14 @@ async function runOne(job: JobRow): Promise<void> {
     finishJob(job.id, "done")
   } catch (e) {
     const err = `${(e as Error).name}: ${(e as Error).message}`
-    if (job.attempt_count < job.max_attempts) {
-      requeueForRetry(job.id, err)
+    // Increment attempt_count on actual failure (not on claim) so a crashed
+    // worker doesn't burn an attempt. After this increment, if the row has
+    // recorded N >= max_attempts failures, it's terminal; otherwise requeue.
+    const newCount = job.attempt_count + 1
+    if (newCount < job.max_attempts) {
+      requeueForRetry(job.id, err, newCount)
     } else {
-      finishJob(job.id, "failed", err)
+      failJobIncrement(job.id, err, newCount)
     }
   }
 }
@@ -239,6 +302,7 @@ export function startPool(numWorkers = defaultWorkers()): void {
     const id = `${WORKER_ID_BASE}-w${i}`
     pool.threads.push(workerLoop(id))
   }
+  startStuckJobSweeper()
 }
 
 export async function stopPool(): Promise<void> {
@@ -246,4 +310,47 @@ export async function stopPool(): Promise<void> {
   await Promise.all(pool.threads)
   pool.threads.length = 0
   pool.started = false
+  if (globalThis.__ssrStuckJobTimer) {
+    clearInterval(globalThis.__ssrStuckJobTimer)
+    globalThis.__ssrStuckJobTimer = undefined
+  }
+}
+
+declare global {
+  // eslint-disable-next-line no-var
+  var __ssrStuckJobTimer: ReturnType<typeof setInterval> | undefined
+}
+
+const STUCK_SWEEP_INTERVAL_MS = 5 * 60 * 1000
+
+/**
+ * In-process sweeper: every 5 min, walks the jobs table for `running` rows
+ * locked > 30 min and either requeues them (if attempts remain) or marks
+ * them failed. Closes the gap where a worker silently wedges (await that
+ * never resolves, sync infinite loop, GC pause) and the row sits running
+ * forever — recoverOrphans only runs at boot.
+ */
+function startStuckJobSweeper(): void {
+  if (globalThis.__ssrStuckJobTimer) return
+  if (process.env.NODE_ENV === "test") return
+  if (process.env.SSR_JOB_SWEEPER === "0") return
+  const stuckAfter = parseStuckAfterSeconds()
+  globalThis.__ssrStuckJobTimer = setInterval(() => {
+    try {
+      const n = recoverStuckJobs(stuckAfter)
+      if (n > 0) {
+        // eslint-disable-next-line no-console
+        console.log(`[jobs] stuck-job sweeper recovered ${n} row(s)`)
+      }
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("[jobs] stuck-job sweeper failed:", e)
+    }
+  }, STUCK_SWEEP_INTERVAL_MS)
+  globalThis.__ssrStuckJobTimer.unref?.()
+}
+
+function parseStuckAfterSeconds(): number {
+  const n = parseInt(process.env.SSR_JOB_STUCK_AFTER_S || "1800", 10)
+  return Number.isFinite(n) && n >= 60 ? n : 1800
 }

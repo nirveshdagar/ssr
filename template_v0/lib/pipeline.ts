@@ -44,7 +44,7 @@ import { listServers, updateServer, type ServerRow } from "./repos/servers"
 import { logPipeline } from "./repos/logs"
 import {
   initSteps, updateStep, heartbeat, setStepArtifact, getStepArtifact,
-  startPipelineRun, endPipelineRun,
+  startPipelineRun, endPipelineRun, getSteps,
 } from "./repos/steps"
 import { enqueueJob, registerHandler } from "./jobs"
 import {
@@ -220,7 +220,7 @@ export function runFullPipeline(
     custom_prompt: opts.customPrompt ?? null,
     custom_provider: opts.customProvider ?? null,
     custom_model: opts.customModel ?? null,
-  })
+  }, 3)
 }
 
 export interface BulkRunResult {
@@ -278,7 +278,7 @@ export function runBulkPipeline(
       force_new_server: opts.forceNewServer ?? false,
       custom_provider: opts.customProvider ?? null,
       custom_model: opts.customModel ?? null,
-    }),
+    }, 3),
   )
   return {
     job_ids,
@@ -333,7 +333,7 @@ export function runSequentialBulkPipeline(
     force_new_server: opts.forceNewServer ?? false,
     custom_provider: opts.customProvider ?? null,
     custom_model: opts.customModel ?? null,
-  })
+  }, 3)
   return {
     job_ids: [jobId],
     job_id: jobId,
@@ -639,7 +639,18 @@ async function pipelineWorkerImpl(
     logPipeline(domain, "pipeline", "failed",
       `Unhandled pipeline error: ${err.name}: ${err.message}\n\n${tb}`)
     updateDomain(domain, { status: "retryable_error" })
-    // notify hooks land when modules/notify is ported
+    // Operator-facing notification — survives crashes in this catch by
+    // being fire-and-forget. Step number is best-effort: pull the most
+    // recent non-completed step from step_tracker so the alert is precise.
+    void (async () => {
+      try {
+        const steps = getSteps(domain)
+        const inFlight = steps.find((s) => s.status === "running" || s.status === "failed")
+        const stepLabel = inFlight ? `${inFlight.step_num} (${inFlight.step_name})` : "?"
+        const { notifyPipelineFailure } = await import("./notify")
+        await notifyPipelineFailure(domain, stepLabel, `${err.name}: ${err.message}`)
+      } catch { /* notify is best-effort */ }
+    })()
   }
 }
 
@@ -739,6 +750,18 @@ function step2AssignCfKey(domain: string): boolean {
       updateDomain(domain, { status: "cf_pool_full" })
       logPipeline(domain, "pipeline", "failed",
         "CF key pool full — add a new CF key in dashboard and re-run")
+      void (async () => {
+        try {
+          const { notify } = await import("./notify")
+          await notify(
+            "CF key pool exhausted",
+            `Pipeline for ${domain} blocked at step 2: ${e.message}\n\n` +
+            `Add a new CF key in the dashboard. Auto-heal will pick up the backlog ` +
+            `once a key has free slots.`,
+            { severity: "error", dedupeKey: "cf_pool_exhausted" },
+          )
+        } catch { /* notify is best-effort */ }
+      })()
       return false
     }
     updateStep(domain, 2, "failed", (e as Error).message)
@@ -888,6 +911,12 @@ async function step6GetOrProvisionServer(
       updateStep(domain, 6, "failed", msg)
       logPipeline(domain, "provision", "failed", msg)
       updateDomain(domain, { status: "retryable_error" })
+      void (async () => {
+        try {
+          const { notifyDoAllFailed } = await import("./notify")
+          await notifyDoAllFailed(`step 6 (${domain})`, e.attempts)
+        } catch { /* notify is best-effort */ }
+      })()
       return null
     }
     if (e instanceof DropletRateLimited) {
