@@ -1,8 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { useRouter, useSearchParams } from "next/navigation"
-import Link from "next/link"
+import { useSearchParams } from "next/navigation"
 import { Server, Lock, ArrowRight, AlertCircle } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Field, FieldGroup, FieldLabel, FieldDescription } from "@/components/ui/field"
@@ -29,7 +28,6 @@ export default function LoginPage() {
 }
 
 function LoginPageInner() {
-  const router = useRouter()
   const params = useSearchParams()
   // Reject any `next` that isn't a same-origin path. Open-redirect prevention:
   // a phisher who linked /login?next=https://evil.com/clone could otherwise
@@ -39,20 +37,52 @@ function LoginPageInner() {
   const rawNext = params.get("next") || "/"
   const next = rawNext.startsWith("/") && !rawNext.startsWith("//") ? rawNext : "/"
   const [pwd, setPwd] = React.useState("")
+  const [pwdConfirm, setPwdConfirm] = React.useState("")
   const [loading, setLoading] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [env, setEnv] = React.useState<"LOCAL" | "PROD">("PROD")
+  // null = haven't probed yet; true = first-boot setup mode; false = normal sign-in
+  const [needsSetup, setNeedsSetup] = React.useState<boolean | null>(null)
   React.useEffect(() => { setEnv(detectEnv()) }, [])
-  // Note: the unconfigured-password probe via "__probe__no_match__" was
-  // removed when /api/auth/login was changed to return generic 401
-  // (instead of a fingerprint-revealing 500) for both no-password and
-  // wrong-password cases. Open-access banner is no longer surfaced from
-  // the login page; check Settings → Security on first boot.
-  const openAccess = false
+  // Probe whether a dashboard password has been configured. Public endpoint —
+  // returns only `{ needs_setup: bool }`, leaks nothing else.
+  React.useEffect(() => {
+    fetch("/api/auth/setup-status", { credentials: "same-origin" })
+      .then(async (r) => {
+        const j = (await r.json().catch(() => ({}))) as { needs_setup?: boolean }
+        setNeedsSetup(j.needs_setup === true)
+      })
+      .catch(() => { setNeedsSetup(false) /* fail-closed: assume sign-in mode */ })
+  }, [])
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault()
     setError(null)
+
+    // First-boot path: create the password and auto-login.
+    if (needsSetup) {
+      if (pwd.length < 12) { setError("Password must be at least 12 characters"); return }
+      if (pwd !== pwdConfirm) { setError("Passwords don't match"); return }
+      setLoading(true)
+      try {
+        const r = await fetch("/api/auth/setup", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: pwd }),
+          credentials: "same-origin",
+        })
+        if (r.ok) { window.location.assign(next); return }
+        const j = (await r.json().catch(() => ({}))) as { error?: string }
+        setError(j.error ?? `Setup failed (HTTP ${r.status})`)
+      } catch (err) {
+        setError((err as Error).message)
+      } finally {
+        setLoading(false)
+      }
+      return
+    }
+
+    // Normal sign-in path.
     setLoading(true)
     try {
       const fd = new FormData()
@@ -92,8 +122,14 @@ function LoginPageInner() {
             <Server className="h-5 w-5" aria-hidden />
           </div>
           <div className="flex flex-col gap-1">
-            <h1 className="text-base font-semibold tracking-tight">SSR Dashboard</h1>
-            <p className="text-small text-muted-foreground">Site Server Rotation — internal access only</p>
+            <h1 className="text-base font-semibold tracking-tight">
+              {needsSetup ? "First-boot setup" : "SSR Dashboard"}
+            </h1>
+            <p className="text-small text-muted-foreground">
+              {needsSetup
+                ? "Choose an operator password — minimum 12 characters."
+                : "Site Server Rotation — internal access only"}
+            </p>
           </div>
         </div>
 
@@ -102,7 +138,7 @@ function LoginPageInner() {
             <FieldGroup>
               <Field>
                 <FieldLabel htmlFor="password" className="text-[13px]">
-                  Operator password
+                  {needsSetup ? "New operator password" : "Operator password"}
                 </FieldLabel>
                 <InputGroup>
                   <InputGroupAddon>
@@ -113,8 +149,8 @@ function LoginPageInner() {
                     name="password"
                     type="password"
                     autoFocus
-                    autoComplete="current-password"
-                    placeholder="Enter password"
+                    autoComplete={needsSetup ? "new-password" : "current-password"}
+                    placeholder={needsSetup ? "Choose a password (min 12 chars)" : "Enter password"}
                     value={pwd}
                     onChange={(e) => setPwd(e.target.value)}
                     required
@@ -125,6 +161,29 @@ function LoginPageInner() {
                 </FieldDescription>
               </Field>
 
+              {needsSetup && (
+                <Field>
+                  <FieldLabel htmlFor="password-confirm" className="text-[13px]">
+                    Confirm password
+                  </FieldLabel>
+                  <InputGroup>
+                    <InputGroupAddon>
+                      <Lock className="h-3.5 w-3.5" aria-hidden />
+                    </InputGroupAddon>
+                    <InputGroupInput
+                      id="password-confirm"
+                      name="password-confirm"
+                      type="password"
+                      autoComplete="new-password"
+                      placeholder="Re-type password"
+                      value={pwdConfirm}
+                      onChange={(e) => setPwdConfirm(e.target.value)}
+                      required
+                    />
+                  </InputGroup>
+                </Field>
+              )}
+
               {error && (
                 <div className="flex items-start gap-2 rounded-md border border-status-terminal/40 bg-status-terminal/10 px-3 py-2 text-small text-status-terminal">
                   <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5" aria-hidden />
@@ -132,20 +191,26 @@ function LoginPageInner() {
                 </div>
               )}
 
-              <Button type="submit" className="w-full gap-1.5" disabled={loading || pwd.length === 0}>
-                {loading ? "Signing in…" : "Sign in"}
+              <Button
+                type="submit"
+                className="w-full gap-1.5"
+                disabled={loading || pwd.length === 0 || (needsSetup === true && pwdConfirm.length === 0)}
+              >
+                {loading
+                  ? (needsSetup ? "Creating…" : "Signing in…")
+                  : (needsSetup ? "Create password & sign in" : "Sign in")}
                 {!loading && <ArrowRight className="h-3.5 w-3.5" />}
               </Button>
             </FieldGroup>
           </form>
         </div>
 
-        {openAccess && (
+        {needsSetup && (
           <div
             role="alert"
             className="mt-4 rounded-md border border-status-waiting/40 bg-status-waiting/10 px-3 py-2 text-micro text-status-waiting"
           >
-            <strong>Open-access mode:</strong> no dashboard password configured. Set one in Settings → Security to gate the dashboard.
+            <strong>First boot:</strong> no password is configured yet. The password you set here will gate every future visit.
           </div>
         )}
         <div className="mt-6 flex items-center justify-between text-micro text-muted-foreground">
@@ -161,9 +226,8 @@ function LoginPageInner() {
             <span aria-hidden>·</span>
             <span className="font-mono">v1.4.2</span>
           </span>
-          <Link href="/" className="hover:text-foreground transition-colors">
-            Skip to dashboard
-          </Link>
+          {/* "Skip to dashboard" link removed — middleware redirects unauth
+              users back to /login anyway, so it was a dead UI affordance. */}
         </div>
       </div>
     </main>

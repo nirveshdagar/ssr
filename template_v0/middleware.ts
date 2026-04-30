@@ -13,6 +13,12 @@ import { sessionOptions, type SsrSession } from "./lib/auth-config"
 const PUBLIC_PATHS = new Set<string>([
   "/login",
   "/api/auth/login",
+  // First-boot password setup. Server-side guard refuses if a password
+  // is already configured (returns 409), so leaving these public is
+  // safe — there's no privilege escalation path from a fresh deploy
+  // back to a configured one.
+  "/api/auth/setup",
+  "/api/auth/setup-status",
   "/api/health",
   "/healthz",
   "/favicon.ico",
