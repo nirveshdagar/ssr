@@ -446,13 +446,23 @@ export async function migrateDomain(
     // but a different cert (LE auto-issued, stale) is still on the wire.
     try {
       const probe = await sa.verifyOriginCertIsCustom(newIp, domain)
+      const nowIso = new Date().toISOString().replace(/\.\d{3}Z$/, "Z")
       if (probe.ok === true) {
+        updateDomain(domain, {
+          ssl_origin_ok: 1,
+          ssl_last_verified_at: nowIso,
+        } as Parameters<typeof updateDomain>[1])
         logPipeline(domain, "ssl_verify", "completed",
           `Origin cert verified: subject="${probe.subjectCN ?? "?"}" issuer="${probe.issuerCN ?? "?"}"`)
       } else if (probe.ok === false) {
+        updateDomain(domain, {
+          ssl_origin_ok: 0,
+          ssl_last_verified_at: nowIso,
+        } as Parameters<typeof updateDomain>[1])
         logPipeline(domain, "ssl_verify", "warning",
           `Origin cert MISMATCH: ${probe.message}. SSL install reported success but a different cert is serving — operator should investigate.`)
       } else {
+        // Inconclusive — leave existing value. Don't flap the icon.
         logPipeline(domain, "ssl_verify", "warning",
           `Origin probe inconclusive (network blip): ${probe.message}`)
       }

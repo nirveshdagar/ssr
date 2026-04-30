@@ -23,6 +23,8 @@ import {
   FileUp,
   Info,
   ArrowLeftRight,
+  Lock,
+  Unlock,
 } from "lucide-react"
 import { AppShell } from "@/components/ssr/app-shell"
 import { StatusBadge } from "@/components/ssr/status-badge"
@@ -782,6 +784,7 @@ function DomainsPageInner() {
                   />
                 </DataTableHeaderCell>
                 <DataTableHeaderCell>Domain</DataTableHeaderCell>
+                <DataTableHeaderCell className="w-12 text-center">SSL</DataTableHeaderCell>
                 <DataTableHeaderCell>Status</DataTableHeaderCell>
                 <DataTableHeaderCell>Step</DataTableHeaderCell>
                 <DataTableHeaderCell>Server</DataTableHeaderCell>
@@ -816,6 +819,46 @@ function DomainsPageInner() {
                         </span>
                       )}
                     </div>
+                  </DataTableCell>
+                  <DataTableCell className="text-center">
+                    {/* SSL origin-cert lock icon. Updated by auto-heal sweep
+                        every 5 min + by migration's ssl_verify step.
+                          green closed lock = CF Origin Cert serving (verified)
+                          red open lock     = wrong cert serving (auto-fix queued
+                                              if auto_migrate_enabled, else
+                                              operator should run from step 8)
+                          gray lock         = never verified yet */}
+                    {d.sslOk === true ? (
+                      <span
+                        className="inline-block"
+                        title={`CloudFlare Origin Cert verified${d.sslVerifiedAt ? ` at ${d.sslVerifiedAt}` : ""}`}
+                      >
+                        <Lock
+                          className="h-4 w-4 mx-auto text-status-completed"
+                          aria-label="SSL OK"
+                        />
+                      </span>
+                    ) : d.sslOk === false ? (
+                      <span
+                        className="inline-block"
+                        title={`Wrong / missing cert on origin${d.sslVerifiedAt ? ` (last checked ${d.sslVerifiedAt})` : ""}. Auto-fix runs every 5 min when auto-migrate is enabled.`}
+                      >
+                        <Unlock
+                          className="h-4 w-4 mx-auto text-status-terminal"
+                          aria-label="SSL MISSING / WRONG CERT"
+                        />
+                      </span>
+                    ) : (
+                      <span
+                        className="inline-block"
+                        title="SSL never verified — pipeline hasn't reached step 8 yet, or last probe was inconclusive"
+                      >
+                        <Lock
+                          className="h-4 w-4 mx-auto text-muted-foreground/40"
+                          aria-label="SSL not verified yet"
+                        />
+                      </span>
+                    )}
                   </DataTableCell>
                   <DataTableCell>
                     <StatusBadge status={d.status} />

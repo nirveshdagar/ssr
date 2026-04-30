@@ -428,13 +428,16 @@ export interface SslSweepResult {
 /**
  * Walk every domain in `hosted` / `live` status with a server attached and
  * TLS-probe its origin IP (SNI=domain). Confirm the issuer is CF Origin CA.
- * Mismatches are logged + audited + notified (deduped per domain).
  *
- * Auto-correction: when the cert is wrong AND auto_migrate_enabled=1,
- * enqueue a `domain.teardown_app_then_reinstall_ssl` job (TODO future) —
- * for now we just log + notify so the operator can decide. The
- * Reinstall SA Agent button on /servers handles the SA-side of this for
- * server-wide issues; per-domain SSL re-install is a manual flow today.
+ * Three side-effects per domain:
+ *   1. Update `domains.ssl_origin_ok` + `ssl_last_verified_at` so the
+ *      Domains page lock-icon column reflects current state without
+ *      needing a fresh probe per render.
+ *   2. On verified-good: silent (don't spam logs on the happy path).
+ *   3. On mismatch: log + audit + dedupe-notify. If auto_migrate_enabled,
+ *      enqueue a `pipeline.full` job from step 8 to re-issue + install
+ *      the cert on the same server. Per-domain dedupe key prevents
+ *      enqueueing repeated retries while one is in flight.
  */
 export async function checkOriginCerts(): Promise<SslSweepResult> {
   const rows = all<{ domain: string; server_id: number; current_proxy_ip: string | null }>(
@@ -447,6 +450,10 @@ export async function checkOriginCerts(): Promise<SslSweepResult> {
   if (rows.length === 0) return result
 
   const { verifyOriginCertIsCustom } = await import("./serveravatar")
+  const { updateDomain } = await import("./repos/domains")
+  const autoFixEnabled = (getSetting("auto_migrate_enabled") || "0") === "1"
+  const nowIso = new Date().toISOString().replace(/\.\d{3}Z$/, "Z")
+
   for (const r of rows) {
     if (!r.current_proxy_ip) continue
     result.checked++
@@ -454,27 +461,33 @@ export async function checkOriginCerts(): Promise<SslSweepResult> {
     try {
       probe = await verifyOriginCertIsCustom(r.current_proxy_ip, r.domain, 8000)
     } catch (e) {
-      // Probe threw — log but don't flag as mismatch (might be transient).
       logPipeline(r.domain, "ssl_verify", "warning",
         `Origin probe threw: ${(e as Error).message.slice(0, 160)}`)
       continue
     }
-    if (probe.ok === true) continue  // verified — silent on the happy path
+    if (probe.ok === true) {
+      updateDomain(r.domain, {
+        ssl_origin_ok: 1,
+        ssl_last_verified_at: nowIso,
+      } as Parameters<typeof updateDomain>[1])
+      continue
+    }
     if (probe.ok === null) {
-      // Network blip / timeout — don't notify, just log so operator sees
-      // it if they're investigating.
       logPipeline(r.domain, "ssl_verify", "warning",
         `Origin probe inconclusive: ${probe.message}`)
       continue
     }
     // probe.ok === false → wrong cert is serving
+    updateDomain(r.domain, {
+      ssl_origin_ok: 0,
+      ssl_last_verified_at: nowIso,
+    } as Parameters<typeof updateDomain>[1])
     result.mismatched.push({
       domain: r.domain, serverIp: r.current_proxy_ip,
       subjectCN: probe.subjectCN, issuer: probe.issuerCN,
     })
     logPipeline(r.domain, "ssl_verify", "warning",
-      `Origin cert MISMATCH on ${r.current_proxy_ip}: ${probe.message}. ` +
-      `Re-run pipeline from step 8 (or migrate domain off this server).`)
+      `Origin cert MISMATCH on ${r.current_proxy_ip}: ${probe.message}.`)
     try {
       appendAudit(
         "ssl_origin_mismatch", r.domain,
@@ -483,6 +496,36 @@ export async function checkOriginCerts(): Promise<SslSweepResult> {
         null,
       )
     } catch { /* ignore */ }
+
+    // Auto-fix: re-run pipeline from step 8 to re-issue + install SSL on
+    // the same server. Skips if a recent in-flight pipeline.full job
+    // for this domain is queued or running (avoid stacking retries).
+    if (autoFixEnabled) {
+      const inflight = all<{ id: number }>(
+        `SELECT id FROM jobs
+          WHERE kind = 'pipeline.full'
+            AND status IN ('queued', 'running')
+            AND payload_json LIKE ?`,
+        `%"domain":"${r.domain}"%`,
+      )
+      if (inflight.length === 0) {
+        const { enqueueJob } = await import("./jobs")
+        const jobId = enqueueJob("pipeline.full", {
+          domain: r.domain,
+          skip_purchase: true,
+          server_id: r.server_id,
+          start_from: 8,        // Re-issue + install SSL only
+          force_new_server: false,
+        }, 1)
+        result.enqueuedReinstalls.push({ domain: r.domain, jobId })
+        logPipeline(r.domain, "ssl_verify", "running",
+          `Auto-fix: enqueued pipeline.full from step 8 (job ${jobId}) to re-install SSL.`)
+      } else {
+        logPipeline(r.domain, "ssl_verify", "warning",
+          `Mismatch detected but pipeline.full is already queued/running for this domain — skipping auto-fix to avoid stacking.`)
+      }
+    }
+
     try {
       const { notify } = await import("./notify")
       await notify(
@@ -490,8 +533,9 @@ export async function checkOriginCerts(): Promise<SslSweepResult> {
         `Origin TLS probe at ${r.current_proxy_ip} returned a non-CF certificate:\n` +
         `  subject: ${probe.subjectCN ?? "?"}\n  issuer:  ${probe.issuerCN ?? "?"}\n\n` +
         `${probe.message}\n\n` +
-        `Likely fix: re-run the pipeline for this domain from step 8 (Issue + Install SSL), ` +
-        `or migrate the domain to a different server.`,
+        (autoFixEnabled
+          ? `Auto-fix: pipeline.full from step 8 has been queued. Watch /logs.`
+          : `Likely fix: enable auto_migrate_enabled, OR manually re-run the pipeline for this domain from step 8.`),
         { severity: "warning", dedupeKey: `ssl_mismatch:${r.domain}` },
       )
     } catch { /* notify is best-effort */ }

@@ -39,6 +39,13 @@ export interface DomainRow {
   ip: string
   createdAt: string
   registrar: "Spaceship" | "Imported"
+  /** SSL origin-cert verification result.
+   *   true  = CF Origin Cert verified on origin (green lock)
+   *   false = wrong cert serving (red lock — needs fix)
+   *   null  = never verified yet (gray lock)
+   *  Updated by migration ssl_verify step + auto-heal sweep every 5 min. */
+  sslOk: boolean | null
+  sslVerifiedAt: string | null
 }
 
 interface ApiDomain {
@@ -56,6 +63,8 @@ interface ApiDomain {
   current_step_status: string | null
   current_step_name: string | null
   current_step_message: string | null
+  ssl_origin_ok: number | null
+  ssl_last_verified_at: string | null
 }
 
 const NORMALIZE_STATUS: Record<string, PipelineStatus> = {
@@ -109,6 +118,8 @@ export function useDomains() {
     ip: d.current_proxy_ip ?? "—",
     createdAt: d.created_at,
     registrar: "Spaceship",
+    sslOk: d.ssl_origin_ok === 1 ? true : d.ssl_origin_ok === 0 ? false : null,
+    sslVerifiedAt: d.ssl_last_verified_at,
   }))
   return { rows, error, isLoading, refresh: mutate }
 }

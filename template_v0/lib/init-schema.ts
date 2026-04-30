@@ -229,6 +229,16 @@ function applyMigrations(db: DatabaseSync): void {
   tryAlter(db, "ALTER TABLE servers ADD COLUMN max_sites INTEGER NOT NULL DEFAULT 60")
   tryAlter(db, "ALTER TABLE servers ADD COLUMN region TEXT")
   tryAlter(db, "ALTER TABLE servers ADD COLUMN size_slug TEXT")
+  // SSL origin-cert verification cache. Updated by:
+  //   - migration.ts:migrateDomain after each successful install
+  //   - auto-heal.ts:checkOriginCerts every 5 min for hosted/live domains
+  //   - pipeline.ts step 8 after issuing the cert
+  // Values:
+  //   ssl_origin_ok: 1 = CF Origin Cert verified on origin, 0 = wrong cert,
+  //                  NULL = never verified (just installed / probe failed)
+  //   ssl_last_verified_at: ISO timestamp of last probe
+  tryAlter(db, "ALTER TABLE domains ADD COLUMN ssl_origin_ok INTEGER")
+  tryAlter(db, "ALTER TABLE domains ADD COLUMN ssl_last_verified_at TEXT")
 }
 
 /**
