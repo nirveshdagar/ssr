@@ -69,6 +69,9 @@ async function bootEverything(): Promise<void> {
   const { bulkMigrateHandler } = await import("./handlers/bulk-migrate")
   safe("domain.bulk_migrate", () => registerHandler("domain.bulk_migrate", bulkMigrateHandler))
 
+  const { reinstallSaHandler } = await import("./handlers/reinstall-sa")
+  safe("server.reinstall_sa", () => registerHandler("server.reinstall_sa", reinstallSaHandler))
+
   startPool()
 
   // Boot resilience: grey-cloud recovery + orphan-droplet sweep + auto-heal +
