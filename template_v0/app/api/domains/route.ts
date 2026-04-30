@@ -104,12 +104,20 @@ export async function GET(req: NextRequest) {
   })
 }
 
+const MAX_DOMAINS_PER_REQUEST = 5000
+
 export async function POST(req: NextRequest) {
   const form = await req.formData().catch(() => null)
   const raw = (form?.get("domains") as string | null) || ""
   const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null
 
   const candidates = raw.replace(/,/g, "\n").split("\n").map((d) => d.trim()).filter(Boolean)
+  if (candidates.length > MAX_DOMAINS_PER_REQUEST) {
+    return NextResponse.json(
+      { ok: false, error: `too many domains (${candidates.length} > ${MAX_DOMAINS_PER_REQUEST})` },
+      { status: 413 },
+    )
+  }
   const valid = candidates.map(validate).filter((d): d is string => d !== null)
   for (const d of valid) addDomain(d)
   const skipped = candidates.length - valid.length

@@ -3,7 +3,7 @@
  * Same column whitelist as Flask's _DOMAIN_COLS so a Next.js write
  * can never touch an unintended column.
  */
-import { all, one, run } from "../db"
+import { all, getDb, one, run } from "../db"
 
 export interface DomainRow {
   id: number
@@ -65,15 +65,25 @@ export function deleteDomain(domain: string): void {
 }
 
 export function releaseCfKeySlot(domain: string): void {
-  // Same logic as modules/cf_key_pool.release_cf_key_slot
-  const row = one<{ cf_key_id: number | null }>(
-    "SELECT cf_key_id FROM domains WHERE domain = ?",
-    domain,
-  )
-  if (!row || !row.cf_key_id) return
-  run(
-    "UPDATE cf_keys SET domains_used = MAX(0, domains_used - 1) WHERE id = ?",
-    row.cf_key_id,
-  )
-  run("UPDATE domains SET cf_key_id = NULL WHERE domain = ?", domain)
+  // BEGIN IMMEDIATE so the decrement + domain-detach commit atomically.
+  // Without the transaction, a crash between writes leaves the slot freed
+  // but the domain still pointing at the key — a teardown retry would
+  // then decrement again, drifting the counter under MAX(0, ...) bound.
+  const db = getDb()
+  db.exec("BEGIN IMMEDIATE")
+  try {
+    const row = db.prepare("SELECT cf_key_id FROM domains WHERE domain = ?").get(domain) as { cf_key_id: number | null } | undefined
+    if (!row || !row.cf_key_id) {
+      db.exec("ROLLBACK")
+      return
+    }
+    db.prepare(
+      "UPDATE cf_keys SET domains_used = MAX(0, domains_used - 1) WHERE id = ?",
+    ).run(row.cf_key_id)
+    db.prepare("UPDATE domains SET cf_key_id = NULL WHERE domain = ?").run(domain)
+    db.exec("COMMIT")
+  } catch (e) {
+    try { db.exec("ROLLBACK") } catch { /* ignore */ }
+    throw e
+  }
 }

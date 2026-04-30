@@ -5,8 +5,9 @@ export const runtime = "nodejs"
 
 export async function GET(req: NextRequest) {
   const url = new URL(req.url)
-  const action = url.searchParams.get("action")?.trim() || null
-  const search = url.searchParams.get("q")?.trim() || null
+  const action = (url.searchParams.get("action")?.trim() || "").slice(0, 64) || null
+  // Cap `q` so a multi-MB search string can't slow the LIKE query.
+  const search = (url.searchParams.get("q")?.trim() || "").slice(0, 200) || null
   const rawPage = Number.parseInt(url.searchParams.get("page") || "1", 10) || 1
   const page = Math.min(Math.max(1, rawPage), 10_000)
   const PAGE_SIZE = 50

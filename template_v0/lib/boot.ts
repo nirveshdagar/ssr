@@ -161,6 +161,11 @@ export function scheduleBootHooks(): void {
   void import("./backup").then(({ startDailyBackup }) => startDailyBackup()).catch(() => {
     /* boot is best-effort */
   })
+  // Daily log-table retention sweep. Bounded growth on pipeline_log,
+  // audit_log, pipeline_runs/_step_runs.
+  void import("./log-retention").then(({ startLogRetention }) => startLogRetention()).catch(() => {
+    /* boot is best-effort */
+  })
   // Auto-heal sweeper — reconcile SA orphans + auto-resume stuck pipelines
   // every SSR_AUTOHEAL_INTERVAL_MS (default 5 min). Self-skips in tests
   // and when SSR_AUTOHEAL=0.

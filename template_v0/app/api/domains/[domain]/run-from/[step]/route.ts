@@ -6,6 +6,7 @@ import { appendAudit } from "@/lib/repos/audit"
 
 const SAFE_MODEL = /^[A-Za-z0-9._/@:-]{1,128}$/
 const SAFE_PROVIDER = /^[a-z][a-z0-9_-]{0,31}$/
+const SAFE_DOMAIN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/i
 
 export const runtime = "nodejs"
 
@@ -21,6 +22,9 @@ export async function POST(
   const stepNum = Number.parseInt(step, 10)
   if (!Number.isFinite(stepNum) || stepNum < 1 || stepNum > 10) {
     return NextResponse.json({ ok: false, error: "step must be between 1 and 10" }, { status: 400 })
+  }
+  if (!SAFE_DOMAIN.test(domain)) {
+    return NextResponse.json({ ok: false, error: "invalid domain shape" }, { status: 400 })
   }
   if (!getDomain(domain)) {
     return NextResponse.json(

@@ -897,6 +897,13 @@ async function step6GetOrProvisionServer(
       onProgress: (msg) => updateStep(domain, 6, "running", msg),
     })
     updateServer(serverId, { sa_server_id: saServerId, status: "ready" })
+    // Persist domain → server link NOW (not later in step 7) so a crash
+    // between this point and step 7's link write doesn't strand the smart-
+    // resume path: auto-heal's autoResumeStuckPipelines reads
+    // getDomain(domain).server_id to find the server when retrying. Before
+    // this, a kill mid-step-7 left the domain row with server_id=null and
+    // the operator had to manually associate the server.
+    updateDomain(domain, { server_id: serverId } as Parameters<typeof updateDomain>[1])
     updateStep(domain, 6, "completed",
       `Provisioned server #${serverId} ${serverName} (${ip})  sa_id=${saServerId}`)
     setStepArtifact(domain, 6, {
