@@ -15,8 +15,12 @@ export async function POST(req: NextRequest): Promise<Response> {
   const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null
   let droplets
   try {
-    // No tag filter — pull ALL droplets so the operator can see the full fleet
-    droplets = await listDroplets({ tag: undefined })
+    // tag=null disables the filter — pull ALL droplets on the account, not
+    // just ssr-server-tagged ones. Important: passing `tag: undefined` here
+    // would silently fall back to the default ssr-server filter (the bug
+    // pre-2026-05-01) and miss any droplets the operator tagged manually
+    // or didn't tag at all.
+    droplets = await listDroplets({ tag: null })
   } catch (e) {
     if (e instanceof DOAllTokensFailed) {
       return NextResponse.json(

@@ -247,8 +247,25 @@ interface Droplet {
   networks?: { v4?: { ip_address: string; type: string }[] }
 }
 
-export async function listDroplets(opts: { tag?: string } = {}): Promise<Droplet[]> {
-  const tag = opts.tag ?? "ssr-server"
+/**
+ * List droplets via the failover token chain.
+ *
+ * Tag-filter contract:
+ *   listDroplets()                     → filter by tag=ssr-server (default)
+ *   listDroplets({ tag: "foo" })       → filter by tag=foo
+ *   listDroplets({ tag: null })        → NO filter; returns the entire fleet
+ *   listDroplets({ tag: "" })          → NO filter; same as null
+ *
+ * Pass null when you actually want every droplet on the account (e.g.
+ * import-from-do for an operator who tagged some boxes manually). DO NOT
+ * use `tag: undefined` to mean "no filter" — that hits the default and
+ * silently filters; that was the bug pre-2026-05-01.
+ */
+export async function listDroplets(opts: { tag?: string | null } = {}): Promise<Droplet[]> {
+  // Distinguish "no filter requested" (tag is null/empty) from "default"
+  // (tag key absent). Reaching ?? on undefined falls back to default;
+  // explicit null/"" is honored as "no filter".
+  const tag = opts.tag === null || opts.tag === "" ? null : (opts.tag ?? "ssr-server")
   const all: Droplet[] = []
   let page = 1
   while (true) {
