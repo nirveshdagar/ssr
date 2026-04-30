@@ -887,7 +887,6 @@ function DomainsPageInner() {
                 </DataTableHeaderCell>
                 <DataTableHeaderCell>Domain</DataTableHeaderCell>
                 <DataTableHeaderCell className="w-12 text-center">SSL</DataTableHeaderCell>
-                <DataTableHeaderCell className="w-12 text-center">Live</DataTableHeaderCell>
                 <DataTableHeaderCell>Status</DataTableHeaderCell>
                 <DataTableHeaderCell>Step</DataTableHeaderCell>
                 <DataTableHeaderCell>Server</DataTableHeaderCell>
@@ -980,43 +979,55 @@ function DomainsPageInner() {
                       </button>
                     )}
                   </DataTableCell>
-                  <DataTableCell className="text-center">
-                    {/* Live HTTPS probe state. live-checker writes this every
-                        ~60s; click forces a fresh probe and shows the failure
-                        reason in the flash. Reasons: ok / timeout / dns_fail
-                        / connect_refused / ssl_error / http_4xx / http_5xx /
-                        fetch_error. */}
-                    {liveChecking.has(d.name) ? (
-                      <span className="inline-block" title="Re-probing live state…">
-                        <Loader2 className="h-4 w-4 mx-auto animate-spin text-muted-foreground" aria-label="Live probe in progress" />
-                      </span>
-                    ) : (() => {
-                      const tip = d.liveOk === true
-                        ? `Live — HTTP ${d.liveHttpStatus ?? "200"}${d.liveCheckedAt ? ` (checked ${d.liveCheckedAt})` : ""}. Click to re-probe.`
-                        : d.liveOk === false
+                  <DataTableCell>
+                    {/* Status badge — fused with live-checker signal. When the
+                        domain is past deploy (status=live/hosted) and the LATEST
+                        probe failed, render a "DOWN" override with the failure
+                        reason (the streak counter takes 3 ticks to flip status,
+                        so the badge would otherwise lag reality by ~3 min).
+                        Click anywhere on the badge to force a fresh probe. */}
+                    {(() => {
+                      const liveRelevant = d.rawStatus === "live" || d.rawStatus === "hosted"
+                      const checking = liveChecking.has(d.name)
+                      if (checking) {
+                        return (
+                          <span className="inline-flex items-center gap-1.5 rounded-md px-1.5 py-0.5 text-micro font-medium text-muted-foreground bg-muted/40">
+                            <Loader2 className="h-3 w-3 animate-spin" />
+                            Probing…
+                          </span>
+                        )
+                      }
+                      const showDown = liveRelevant && d.liveOk === false
+                      const tip = showDown
                         ? `DOWN — ${d.liveReason ?? "?"}${d.liveHttpStatus != null ? ` (HTTP ${d.liveHttpStatus})` : ""}${d.liveCheckedAt ? ` · last checked ${d.liveCheckedAt}` : ""}. Click to re-probe.`
-                        : "Live state unknown — never probed. Click to probe now."
-                      const cls = d.liveOk === true
-                        ? "text-status-completed hover:bg-status-completed/10 focus-visible:ring-status-completed"
-                        : d.liveOk === false
-                        ? "text-status-terminal hover:bg-status-terminal/10 focus-visible:ring-status-terminal"
-                        : "text-muted-foreground/60 hover:bg-muted hover:text-muted-foreground focus-visible:ring-muted-foreground"
-                      const label = d.liveOk === true ? "Live" : d.liveOk === false ? "Down" : "Unknown"
+                        : liveRelevant && d.liveOk === true
+                        ? `Live — HTTP ${d.liveHttpStatus ?? 200}${d.liveCheckedAt ? ` (checked ${d.liveCheckedAt})` : ""}. Click to re-probe.`
+                        : liveRelevant
+                        ? "Click to probe live state now"
+                        : `Status: ${d.status}`
+                      const badge = showDown ? (
+                        <StatusBadge
+                          status="terminal_error"
+                          label={`DOWN · ${d.liveReason ?? "?"}`}
+                        />
+                      ) : (
+                        <StatusBadge status={d.status} />
+                      )
+                      if (!liveRelevant) {
+                        return <span title={tip}>{badge}</span>
+                      }
                       return (
                         <button
                           type="button"
-                          className={`inline-flex items-center justify-center rounded-sm p-0.5 focus:outline-none focus-visible:ring-1 ${cls}`}
+                          className="rounded-md focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                           title={tip}
                           onClick={() => recheckLive(d.name)}
-                          aria-label={`${label} — re-probe ${d.name}`}
+                          aria-label={`Re-probe ${d.name}`}
                         >
-                          <span className="block h-2.5 w-2.5 rounded-full bg-current" />
+                          {badge}
                         </button>
                       )
                     })()}
-                  </DataTableCell>
-                  <DataTableCell>
-                    <StatusBadge status={d.status} />
                   </DataTableCell>
                   <DataTableCell>
                     <span className="font-mono tabular-nums text-muted-foreground">{d.step}/10</span>
