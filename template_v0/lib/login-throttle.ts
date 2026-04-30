@@ -21,7 +21,9 @@ function attempts(): Map<string, number[]> {
   return globalThis.__ssrLoginAttempts
 }
 
-/** True if the IP is allowed to try again. False = throttle, return 429. */
+/** True if the IP is allowed to try again. False = throttle, return 429.
+ *  Pure read; does NOT mutate the bucket. Use `loginThrottleCheckAndReserve`
+ *  in the actual route to close the parallel-request race. */
 export function loginThrottleCheck(ip: string | null): boolean {
   const key = ip || "?"
   const now = Date.now() / 1000
@@ -29,6 +31,28 @@ export function loginThrottleCheck(ip: string | null): boolean {
   const recent = (m.get(key) ?? []).filter((t) => now - t < WINDOW_SECONDS)
   m.set(key, recent)
   return recent.length < MAX_PER_WINDOW
+}
+
+/**
+ * Atomic check + reserve. Returns true if the attempt is allowed AND
+ * pre-records it as a (provisionally failed) attempt; returns false if
+ * the bucket is full. Single synchronous pass — N parallel requests
+ * cannot all read length<5 and proceed: the (N+1)th sees the bucket
+ * filled by the prior N. On successful auth the caller clears the
+ * bucket via `loginThrottleRecord(ip, true)`.
+ */
+export function loginThrottleCheckAndReserve(ip: string | null): boolean {
+  const key = ip || "?"
+  const now = Date.now() / 1000
+  const m = attempts()
+  const recent = (m.get(key) ?? []).filter((t) => now - t < WINDOW_SECONDS)
+  if (recent.length >= MAX_PER_WINDOW) {
+    m.set(key, recent)
+    return false
+  }
+  recent.push(now)
+  m.set(key, recent)
+  return true
 }
 
 export function loginThrottleRecord(ip: string | null, ok: boolean): void {
