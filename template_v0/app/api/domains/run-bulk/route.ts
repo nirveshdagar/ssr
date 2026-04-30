@@ -4,6 +4,8 @@ import { listDomains } from "@/lib/repos/domains"
 
 export const runtime = "nodejs"
 
+const MAX_BULK = 1000
+
 /**
  * Bulk pipeline by domain ID list. Accepts BOTH FormData (legacy /domains
  * page client) AND JSON (any new client wanting to send custom_provider /
@@ -40,6 +42,12 @@ export async function POST(req: NextRequest): Promise<Response> {
     serverId = sid ? Number.parseInt(sid, 10) : null
     customProvider = trimOrNull(form?.get("custom_provider"))
     customModel = trimOrNull(form?.get("custom_model"))
+  }
+  if (domainIds.length > MAX_BULK) {
+    return NextResponse.json(
+      { ok: false, error: `too many domains (${domainIds.length} > ${MAX_BULK})` },
+      { status: 413 },
+    )
   }
   const idSet = new Set(domainIds)
   const domainsList = listDomains()

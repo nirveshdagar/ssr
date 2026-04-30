@@ -6,6 +6,8 @@ import { VALID_SSL_MODES, type SslMode } from "@/lib/cloudflare"
 
 export const runtime = "nodejs"
 
+const MAX_BULK = 1000
+
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params
   const keyId = Number(id)
@@ -16,6 +18,12 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const ahRaw = ((form?.get("always_https") as string | null) || "").trim().toLowerCase()
 
   if (requested.length === 0) return NextResponse.json({ error: "No domains selected" }, { status: 400 })
+  if (requested.length > MAX_BULK) {
+    return NextResponse.json(
+      { error: `too many domains (${requested.length} > ${MAX_BULK})` },
+      { status: 413 },
+    )
+  }
 
   let sslMode: SslMode | null = null
   if (sslRaw) {

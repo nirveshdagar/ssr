@@ -15,7 +15,7 @@
  */
 import { getSetting, setSetting } from "./repos/settings"
 import { logPipeline } from "./repos/logs"
-import { addServer, updateServer } from "./repos/servers"
+import { addServer, listServers, updateServer } from "./repos/servers"
 
 const DO_API = "https://api.digitalocean.com/v2"
 
@@ -404,6 +404,11 @@ interface CreateDropletResult {
 /**
  * Provision a DO droplet with a cloud-init-set root password, poll for the
  * IPv4, insert a `servers` row, and return identifiers. Cost-capped.
+ *
+ * Idempotency: DO doesn't support idempotency keys, but droplet names are
+ * unique within an account+region. We pre-check by name before POSTing
+ * and re-check after a POST throw so a dropped response (timeout, 5xx,
+ * partner-token failover) cannot lead to a duplicate billed droplet.
  */
 export async function createDroplet(opts: CreateDropletOpts): Promise<CreateDropletResult> {
   const name = opts.name
@@ -413,6 +418,16 @@ export async function createDroplet(opts: CreateDropletOpts): Promise<CreateDrop
   const rootPassword = opts.rootPassword ?? getSetting("server_root_password") ?? ""
   if (!rootPassword) {
     throw new Error("server_root_password not set; refusing to provision a droplet without a password")
+  }
+
+  // Idempotency check 1 — pre-POST. If a droplet with this name already
+  // exists tagged ssr-server (across primary+backup tokens), reuse it.
+  // Skips the cost-cap because we're not creating anything.
+  const pre = await findExistingDroplet(name).catch(() => null)
+  if (pre) {
+    logPipeline(name, "do_create", "warning",
+      `Droplet '${name}' already exists on DO (id=${pre.id}); reusing instead of creating duplicate.`)
+    return await recoverDroplet(name, pre, region, size)
   }
 
   // Pre-flight cost cap — refuse before any API spend
@@ -452,16 +467,74 @@ export async function createDroplet(opts: CreateDropletOpts): Promise<CreateDrop
     }
     if (!ip) throw new Error("Droplet created but no public IP assigned after 5 minutes")
 
-    const serverId = addServer(name, ip, dropletId)
-    const maxSitesRaw = parseInt(getSetting("sites_per_server") || "60", 10)
-    const maxSites = Number.isFinite(maxSitesRaw) && maxSitesRaw > 0 ? maxSitesRaw : 60
-    updateServer(serverId, { region, size_slug: size, max_sites: maxSites } as Parameters<typeof updateServer>[1])
+    const serverId = upsertServerRow(name, ip, dropletId, region, size)
 
     logPipeline(name, "do_create", "completed",
       `Droplet ready: ${ip} (ID: ${dropletId})  region=${region}  size=${size}`)
     return { serverId, ip, dropletId }
   } catch (e) {
+    // Idempotency check 2 — post-error. The POST may have actually reached
+    // DO and created a droplet before the response was lost (timeout,
+    // network error, 5xx after the create succeeded server-side). Re-list
+    // by name; if we find the droplet, recover it instead of reporting
+    // failure (which would prompt the operator to retry → duplicate bill).
+    const recovered = await findExistingDroplet(name).catch(() => null)
+    if (recovered) {
+      logPipeline(name, "do_create", "warning",
+        `POST failed (${(e as Error).message}) but droplet ${recovered.id} exists on DO; recovering.`)
+      return await recoverDroplet(name, recovered, region, size)
+    }
     logPipeline(name, "do_create", "failed", (e as Error).message)
     throw e
   }
+}
+
+/**
+ * Find an existing droplet by name across primary + backup tokens.
+ * Bounded by tag (ssr-server) so we never accidentally reuse a droplet
+ * the operator created by hand for some other purpose.
+ */
+async function findExistingDroplet(name: string): Promise<Droplet | null> {
+  const { droplets } = await listDropletsAllTokens({ tag: "ssr-server" })
+  return droplets.find((d) => d.name === name) ?? null
+}
+
+/**
+ * Insert-or-reuse a `servers` row for this droplet. Returns the row id.
+ * If a row already exists with this do_droplet_id (e.g. previous run got
+ * the row in but crashed before completing), reuse it; otherwise insert.
+ */
+function upsertServerRow(name: string, ip: string, dropletId: string, region: string, size: string): number {
+  const existing = listServers().find((s) => s.do_droplet_id === dropletId)
+  const maxSitesRaw = parseInt(getSetting("sites_per_server") || "60", 10)
+  const maxSites = Number.isFinite(maxSitesRaw) && maxSitesRaw > 0 ? maxSitesRaw : 60
+  if (existing) {
+    updateServer(existing.id, { ip, region, size_slug: size, max_sites: maxSites } as Parameters<typeof updateServer>[1])
+    return existing.id
+  }
+  const serverId = addServer(name, ip, dropletId)
+  updateServer(serverId, { region, size_slug: size, max_sites: maxSites } as Parameters<typeof updateServer>[1])
+  return serverId
+}
+
+/**
+ * Treat a found-existing droplet as if we just created it — poll for its
+ * IP if not already assigned, then upsert the servers row.
+ */
+async function recoverDroplet(name: string, droplet: Droplet, region: string, size: string): Promise<CreateDropletResult> {
+  const dropletId = String(droplet.id)
+  const v4 = droplet.networks?.v4 ?? []
+  let ip = v4.find((n) => n.type === "public")?.ip_address ?? null
+  if (!ip) {
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 10_000))
+      const d = await getDroplet(dropletId).catch(() => null)
+      if (!d) continue
+      const pub = (d.networks?.v4 ?? []).find((n) => n.type === "public")
+      if (pub) { ip = pub.ip_address; break }
+    }
+  }
+  if (!ip) throw new Error(`Recovered droplet ${dropletId} but no public IP assigned after 5 minutes`)
+  const serverId = upsertServerRow(name, ip, dropletId, droplet.region?.slug ?? region, droplet.size_slug ?? size)
+  return { serverId, ip, dropletId }
 }

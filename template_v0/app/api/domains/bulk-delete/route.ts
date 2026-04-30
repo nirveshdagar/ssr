@@ -6,6 +6,8 @@ import { appendAudit } from "@/lib/repos/audit"
 
 export const runtime = "nodejs"
 
+const MAX_BULK = 1000
+
 /**
  * Bulk delete by domain ID list. `delete_from`:
  *   - "db_only"       → soft delete (release slot + drop row, in-process)
@@ -25,6 +27,12 @@ export async function POST(req: NextRequest): Promise<Response> {
   const deleteFrom = ((form?.get("delete_from") as string | null) || "all").trim()
   if (!domainIds.length) {
     return NextResponse.json({ ok: false, error: "No domains selected" }, { status: 400 })
+  }
+  if (domainIds.length > MAX_BULK) {
+    return NextResponse.json(
+      { ok: false, error: `too many domains (${domainIds.length} > ${MAX_BULK})` },
+      { status: 413 },
+    )
   }
   const idSet = new Set(domainIds)
   const domains = listDomains().filter((d) => idSet.has(String(d.id))).map((d) => d.domain)

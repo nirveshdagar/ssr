@@ -145,6 +145,10 @@ export function scheduleBootHooks(): void {
       })
     } catch { /* boot is best-effort */ }
   }, 3000).unref?.()
+  // Daily DB + Fernet-key backup. Self-skips in tests and when SSR_BACKUPS=0.
+  void import("./backup").then(({ startDailyBackup }) => startDailyBackup()).catch(() => {
+    /* boot is best-effort */
+  })
   // Auto-heal sweeper — reconcile SA orphans + auto-resume stuck pipelines
   // every SSR_AUTOHEAL_INTERVAL_MS (default 5 min). Self-skips in tests
   // and when SSR_AUTOHEAL=0.

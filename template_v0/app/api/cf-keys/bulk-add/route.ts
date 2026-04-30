@@ -4,6 +4,10 @@ import { appendAudit } from "@/lib/repos/audit"
 
 export const runtime = "nodejs"
 
+// Tighter cap than other bulk endpoints because each row makes a serial
+// CF /accounts probe with a 15s timeout — 200 rows ≈ 50 minutes worst-case.
+const MAX_BULK = 200
+
 interface BulkRow {
   email: string
   api_key: string
@@ -66,6 +70,12 @@ export async function POST(req: NextRequest): Promise<Response> {
       ok: false,
       error: "No valid rows found (each row needs both email and api_key)",
     }, { status: 400 })
+  }
+  if (rows.length > MAX_BULK) {
+    return NextResponse.json(
+      { ok: false, error: `too many rows (${rows.length} > ${MAX_BULK}); each row makes a CF API probe` },
+      { status: 413 },
+    )
   }
 
   const results: ResultRow[] = []

@@ -6,6 +6,8 @@ import { isIP } from "node:net"
 
 export const runtime = "nodejs"
 
+const MAX_BULK = 1000
+
 /**
  * Bulk A-record change for selected domains under one CF key.
  * Mirrors POST /api/cf-keys/<id>/bulk-set-ip on the Flask side.
@@ -24,6 +26,12 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
   if (requested.length === 0) {
     return NextResponse.json({ error: "No domains selected" }, { status: 400 })
+  }
+  if (requested.length > MAX_BULK) {
+    return NextResponse.json(
+      { error: `too many domains (${requested.length} > ${MAX_BULK})` },
+      { status: 413 },
+    )
   }
   if (!isIP(newIp)) {
     return NextResponse.json({ error: `Invalid IP: ${JSON.stringify(newIp)}` }, { status: 400 })

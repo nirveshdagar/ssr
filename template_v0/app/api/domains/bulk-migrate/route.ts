@@ -5,6 +5,8 @@ import { appendAudit } from "@/lib/repos/audit"
 
 export const runtime = "nodejs"
 
+const MAX_BULK = 1000
+
 /**
  * Bulk-migrate selected domains to a target server. Each domain goes through
  * the standard migrateDomain primitive — old SA app removed, new SA app
@@ -27,6 +29,12 @@ export async function POST(req: NextRequest): Promise<Response> {
 
   if (rawIds.length === 0) {
     return NextResponse.json({ ok: false, error: "no domain_ids provided" }, { status: 400 })
+  }
+  if (rawIds.length > MAX_BULK) {
+    return NextResponse.json(
+      { ok: false, error: `too many domains (${rawIds.length} > ${MAX_BULK})` },
+      { status: 413 },
+    )
   }
 
   // Accept either numeric DB ids OR raw domain names so callers from

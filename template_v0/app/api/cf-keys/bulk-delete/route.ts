@@ -4,6 +4,8 @@ import { appendAudit } from "@/lib/repos/audit"
 
 export const runtime = "nodejs"
 
+const MAX_BULK = 1000
+
 interface ResultRow {
   id: number
   email?: string | null
@@ -45,6 +47,12 @@ export async function POST(req: NextRequest): Promise<Response> {
 
   if (ids.length === 0) {
     return NextResponse.json({ ok: false, error: "no ids provided" }, { status: 400 })
+  }
+  if (ids.length > MAX_BULK) {
+    return NextResponse.json(
+      { ok: false, error: `too many ids (${ids.length} > ${MAX_BULK})` },
+      { status: 413 },
+    )
   }
 
   const results: ResultRow[] = []

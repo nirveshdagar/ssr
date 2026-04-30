@@ -19,6 +19,7 @@ interface QueueResult {
 }
 
 const DOMAIN_SHAPE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/i
+const MAX_BULK = 1000
 
 /**
  * One-shot operator endpoint for the /ai-generator page. Accepts a list of
@@ -45,6 +46,12 @@ export async function POST(req: NextRequest): Promise<Response> {
   const raw = body.domains
   if (!Array.isArray(raw)) {
     return NextResponse.json({ ok: false, error: "domains must be an array of strings" }, { status: 400 })
+  }
+  if (raw.length > MAX_BULK) {
+    return NextResponse.json(
+      { ok: false, error: `too many domains (${raw.length} > ${MAX_BULK})` },
+      { status: 413 },
+    )
   }
   // Normalize, dedup, validate.
   const seen = new Set<string>()
