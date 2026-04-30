@@ -412,6 +412,57 @@ export interface SaHealthResult {
   degraded: SaHealthEntry[]
 }
 
+// ---------------------------------------------------------------------------
+// Stuck-creating server insurance — re-enqueue reinstall_sa if a server has
+// been in 'creating' status for too long with no in-flight reinstall job.
+// ---------------------------------------------------------------------------
+
+export interface StuckCreatingResult {
+  stuck: { server_id: number; name: string | null; ip: string | null }[]
+  reEnqueued: { server_id: number; job_id: number }[]
+}
+
+/**
+ * Detect servers stuck in `status='creating'` for more than `staleMinutes`
+ * (default 30) with no currently-running or queued `server.reinstall_sa`
+ * job, and re-enqueue one. Covers the case where:
+ *   - Migration enqueued reinstall_sa
+ *   - Process restarted before the reinstall job claimed the row
+ *   - The reinstall_sa was orphan-recovered to 'queued' but then somehow
+ *     never got picked up (worker pool stuck, etc.)
+ * This is a true insurance net — the migration's enqueue is the primary
+ * mechanism; this just catches drops.
+ */
+export async function recoverStuckCreating(staleMinutes = 30): Promise<StuckCreatingResult> {
+  const cutoff = `datetime('now', '-${staleMinutes} minutes')`
+  const stuckRows = all<{ id: number; name: string | null; ip: string | null }>(
+    `SELECT id, name, ip FROM servers
+      WHERE status = 'creating' AND created_at < ${cutoff}`,
+  )
+  const result: StuckCreatingResult = { stuck: [], reEnqueued: [] }
+  if (stuckRows.length === 0) return result
+
+  const { enqueueJob } = await import("./jobs")
+  for (const s of stuckRows) {
+    result.stuck.push({ server_id: s.id, name: s.name, ip: s.ip })
+    // Skip if there's already a reinstall_sa job queued or running for this server.
+    const existing = all<{ id: number }>(
+      `SELECT id FROM jobs
+        WHERE kind = 'server.reinstall_sa'
+          AND status IN ('queued', 'running')
+          AND payload_json LIKE ?`,
+      `%"server_id":${s.id}%`,
+    )
+    if (existing.length > 0) continue
+    const jobId = enqueueJob("server.reinstall_sa", { server_id: s.id }, 1)
+    result.reEnqueued.push({ server_id: s.id, job_id: jobId })
+    logPipeline(`server-${s.id}`, "reinstall_sa", "running",
+      `Stuck-creating insurance: server has been in 'creating' for >${staleMinutes} min ` +
+      `with no in-flight reinstall job — auto-enqueueing reinstall_sa (job ${jobId}).`)
+  }
+  return result
+}
+
 /**
  * Walk every `status='ready'` server with a `sa_server_id` and ask SA whether
  * the agent is connected. Domains that still serve HTTPS won't trigger the
@@ -507,6 +558,7 @@ export interface AutoHealTickResult {
   retry: RetryResult | { error: string }
   brokenSsl: BrokenSslResult | { error: string }
   saHealth: SaHealthResult | { error: string }
+  stuckCreating: StuckCreatingResult | { error: string }
   ranAt: string
 }
 
@@ -558,6 +610,13 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
     saHealth = { error: (e as Error).message }
   }
 
+  let stuckCreating: StuckCreatingResult | { error: string }
+  try {
+    stuckCreating = await recoverStuckCreating()
+  } catch (e) {
+    stuckCreating = { error: (e as Error).message }
+  }
+
   // Only audit-log when something actually happened — avoids audit spam.
   const claimedN = "claimed" in reconcile ? reconcile.claimed.length : 0
   const resumedN = "resumed" in resume ? resume.resumed.length : 0
@@ -565,16 +624,18 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
   const retriedN = "retried" in retry ? retry.retried.length : 0
   const sslReissuedN = "reissued" in brokenSsl ? brokenSsl.reissued.length : 0
   const degradedN = "degraded" in saHealth ? saHealth.degraded.length : 0
-  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN > 0) {
+  const stuckN = "reEnqueued" in stuckCreating ? stuckCreating.reEnqueued.length : 0
+  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN + stuckN > 0) {
     appendAudit(
       "auto_heal_tick", "",
       `claimed=${claimedN} resumed=${resumedN} ns_resumed=${nsResumedN} ` +
-      `retried=${retriedN} ssl_reissued=${sslReissuedN} sa_degraded=${degradedN}`,
+      `retried=${retriedN} ssl_reissued=${sslReissuedN} sa_degraded=${degradedN} ` +
+      `stuck_recovered=${stuckN}`,
       null,
     )
   }
 
-  return { reconcile, resume, ns, retry, brokenSsl, saHealth, ranAt }
+  return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, ranAt }
 }
 
 // ---------------------------------------------------------------------------

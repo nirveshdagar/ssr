@@ -520,6 +520,10 @@ export async function migrateDomain(
 export interface MigrateServerResult {
   ok: string[]
   failed: { domain: string; reason: string }[]
+  /** Domains whose move is deferred — e.g. SA install timed out on a freshly
+   *  provisioned droplet, reinstall_sa was queued, and the original domain
+   *  migration will auto-resume once SA agent registers on the new server. */
+  deferred?: string[]
   new_server_id: number | null
   msg: string
 }
@@ -591,28 +595,70 @@ export async function migrateServer(
       const { serverId, ip: newIp, dropletId } = await createDroplet({ name: newName })
       logPipeline(anchorName, "migrate", "running",
         `Droplet ${dropletId} up at ${newIp} — installing SA agent (~5–15 min)…`)
-      const newSaId = await installAgentOnDroplet({ dropletIp: newIp, serverName: newName })
-      updateServer(serverId, { sa_server_id: newSaId, status: "ready" })
-      target = { id: serverId, ip: newIp, sa_server_id: newSaId }
-      logPipeline(anchorName, "migrate", "running",
-        `Provisioned server #${serverId} ${newName} (${newIp}) — beginning migration`)
 
-      // Notify the operator that a new server was created automatically
+      // Inner try: SA install can fail independently of droplet creation.
+      // When it does, we DON'T want to abandon the droplet (it's a working
+      // VM that just needs the install retried). Instead: enqueue
+      // server.reinstall_sa with `follow_up_migrate_from` so once the agent
+      // eventually comes alive, the original domain migration auto-resumes.
       try {
-        const { notify } = await import("./notify")
-        await notify(
-          `Auto-provisioned new server #${serverId}`,
-          `Migration off server #${oldServerId} had no eligible target. ` +
-          `New droplet ${newName} (${newIp}) was created and the SA agent installed. ` +
-          `Migrating ${oldRows.length} domain(s) onto it now.`,
-          { severity: "warning", dedupeKey: `auto_provision:${oldServerId}` },
-        )
-      } catch { /* notify is best-effort */ }
+        const newSaId = await installAgentOnDroplet({ dropletIp: newIp, serverName: newName })
+        updateServer(serverId, { sa_server_id: newSaId, status: "ready" })
+        target = { id: serverId, ip: newIp, sa_server_id: newSaId }
+        logPipeline(anchorName, "migrate", "running",
+          `Provisioned server #${serverId} ${newName} (${newIp}) — beginning migration`)
+        try {
+          const { notify } = await import("./notify")
+          await notify(
+            `Auto-provisioned new server #${serverId}`,
+            `Migration off server #${oldServerId} had no eligible target. ` +
+            `New droplet ${newName} (${newIp}) was created and the SA agent installed. ` +
+            `Migrating ${oldRows.length} domain(s) onto it now.`,
+            { severity: "warning", dedupeKey: `auto_provision:${oldServerId}` },
+          )
+        } catch { /* notify is best-effort */ }
+      } catch (saErr) {
+        // SA install timed out after the 2 internal retries-with-cleanup.
+        // Leave the droplet alive (status stays 'creating') and enqueue a
+        // server.reinstall_sa job that'll keep retrying. The follow-up
+        // payload tells reinstall-sa to resume THIS migration (move the
+        // OLD server's domains here) once SA is finally alive.
+        const { enqueueJob } = await import("./jobs")
+        const reinstallJobId = enqueueJob("server.reinstall_sa", {
+          server_id: serverId,
+          follow_up_migrate_from: oldServerId,
+        }, 1)
+        const saReason = (saErr as Error).message.slice(0, 200)
+        logPipeline(anchorName, "migrate", "warning",
+          `SA install timed out on droplet ${dropletId} (${newIp}) after 2 attempts. ` +
+          `Droplet kept alive; reinstall enqueued (job ${reinstallJobId}). ` +
+          `Domain migration will auto-resume once SA agent registers. Reason: ${saReason}`)
+        try {
+          const { notify } = await import("./notify")
+          await notify(
+            `SA install pending on new server #${serverId}`,
+            `Auto-migrate off #${oldServerId}: provisioned ${newName} (${newIp}) but SA agent ` +
+            `failed to register after 2 attempts. Reinstall queued (job ${reinstallJobId}); ` +
+            `domain migration will resume automatically once the agent is alive (typical ` +
+            `30-60 min). No action needed.\n\nFailure detail: ${saReason}`,
+            { severity: "warning", dedupeKey: `auto_provision_sa_pending:${oldServerId}` },
+          )
+        } catch { /* notify is best-effort */ }
+        return {
+          ok: [],
+          failed: [],
+          deferred: oldRows.map((r) => r.domain),
+          new_server_id: serverId,
+          msg: `SA install deferred on new droplet ${dropletId}. Reinstall queued (${reinstallJobId}); ` +
+               `${oldRows.length} domain(s) will migrate once agent registers.`,
+        }
+      }
     } catch (e) {
-      // Three failure modes:
+      // Three failure modes that bypass the SA-install inner-try (i.e. the
+      // outer createDroplet/setup itself failed):
       //   DOAllTokensFailed — DO rejected both tokens, nothing we can do
       //   DropletRateLimited — local cost cap, refuses provisioning
-      //   anything else — SSH/install timeout, unexpected
+      //   anything else — DO API non-401 5xx, name-uniqueness lookup error, etc.
       const { DOAllTokensFailed, DropletRateLimited } =
         await import("./digitalocean")
       let reason: string

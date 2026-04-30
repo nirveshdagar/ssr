@@ -21,6 +21,14 @@ import { appendAudit } from "../repos/audit"
 
 interface ReinstallSaPayload {
   server_id: number
+  /** When set, this reinstall is the recovery for a stalled migration —
+   *  the SA install timed out on a freshly-provisioned droplet during
+   *  migration of `follow_up_migrate_from`. Once this reinstall succeeds,
+   *  we automatically enqueue `server.migrate_now` to complete the
+   *  domain moves the migration deferred. Without this auto-resume the
+   *  operator would have to manually re-trigger migration once the
+   *  reinstall finishes. */
+  follow_up_migrate_from?: number
 }
 
 export async function reinstallSaHandler(payload: Record<string, unknown>): Promise<void> {
@@ -125,4 +133,30 @@ export async function reinstallSaHandler(payload: Record<string, unknown>): Prom
     `Server #${p.server_id} ready: SA agent installed (sa_server_id=${saServerId})`)
   appendAudit("server_reinstall_sa", `server-${p.server_id}`,
     `ip=${dropletIp} sa_server_id=${saServerId}`, null)
+
+  // Step 5: if this reinstall was the recovery for a stalled migration,
+  // auto-resume — enqueue server.migrate_now so the domains pending move
+  // off the OLD dead server get migrated here. Without this, the operator
+  // would have to manually click "Migrate Now" after every successful
+  // reinstall. follow_up_migrate_from is the OLD (dead) server id.
+  if (p.follow_up_migrate_from) {
+    const { enqueueJob } = await import("../jobs")
+    const followJobId = enqueueJob("server.migrate_now", {
+      server_id: p.follow_up_migrate_from,
+      target_server_id: p.server_id,
+    }, 1)
+    logPipeline(`server-${p.server_id}`, "reinstall_sa", "completed",
+      `Auto-resume: enqueued server.migrate_now (job ${followJobId}) to migrate ` +
+      `domains off dead server #${p.follow_up_migrate_from} onto this server.`)
+    try {
+      const { notify } = await import("../notify")
+      await notify(
+        `Auto-resume migration: server #${p.follow_up_migrate_from} → #${p.server_id}`,
+        `SA agent reinstall succeeded on server #${p.server_id} (${dropletIp}). ` +
+        `Original migration is resuming — domains off dead server #${p.follow_up_migrate_from} ` +
+        `are being moved here now (job ${followJobId}).`,
+        { severity: "info", dedupeKey: `auto_resume_migrate:${p.follow_up_migrate_from}:${p.server_id}` },
+      )
+    } catch { /* notify is best-effort */ }
+  }
 }
