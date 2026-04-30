@@ -35,6 +35,14 @@ export function getDb(): DatabaseSync {
   db.exec("PRAGMA journal_mode = WAL")
   db.exec("PRAGMA foreign_keys = ON")
   db.exec("PRAGMA busy_timeout = 10000")
+  // Indexes for hot dashboard queries. CREATE INDEX IF NOT EXISTS is
+  // idempotent so this is safe to run on every connection-cache-miss.
+  // Without these, OFFSET-paginated audit / pipeline_log queries scan
+  // the full table at 10k+ rows.
+  db.exec("CREATE INDEX IF NOT EXISTS idx_audit_action_id ON audit_log(action, id DESC)")
+  db.exec("CREATE INDEX IF NOT EXISTS idx_audit_created_at ON audit_log(created_at DESC)")
+  db.exec("CREATE INDEX IF NOT EXISTS idx_pipeline_log_domain_id ON pipeline_log(domain, id DESC)")
+  db.exec("CREATE INDEX IF NOT EXISTS idx_pipeline_log_created_at ON pipeline_log(created_at)")
   globalThis.__ssrDb = db
   return db
 }

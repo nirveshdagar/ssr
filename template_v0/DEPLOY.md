@@ -90,6 +90,10 @@ for TLS. Example nginx fragment:
 location / {
     proxy_pass http://127.0.0.1:3000;
     proxy_set_header Host $host;
+    # Strip client-supplied XFF first, then set our own. Without the
+    # underscore-prefixed empty assignment, an attacker can forge the IP
+    # the throttle keys on (if SSR_TRUST_PROXY=1) and the audit log
+    # records.
     proxy_set_header X-Forwarded-For $remote_addr;
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_read_timeout 600;     # long-poll heartbeats can hold ~5s
@@ -101,8 +105,12 @@ location = /healthz {
 }
 ```
 
-Set `X-Forwarded-For` so the login throttle and audit log capture client IPs
-correctly. The middleware already reads the first IP from that header.
+Set `SSR_TRUST_PROXY=1` in `.env.local` ONCE you've confirmed the proxy
+strips client-supplied X-Forwarded-For (the nginx fragment above does this
+implicitly because `proxy_set_header` replaces, not appends). Without that
+flag the login throttle falls back to a single shared bucket and audit-log
+actor IPs are recorded as null — both safer than blindly trusting forged
+headers.
 
 ## Operating side-by-side with Flask
 
@@ -126,7 +134,42 @@ journal captures them. Pipeline-level events also land in the SQLite
 
 ## Backups
 
-Back up `data/ssr.db` AND `data/.ssr_secret_fernet` together — the encrypted
-settings are useless without the matching key file. Both apps see the WAL-
-mode SQLite, so an `sqlite3 ssr.db ".backup target.db"` captures a consistent
-snapshot without stopping the app.
+`lib/backup.ts` runs a daily VACUUM INTO of `data/ssr.db` plus a copy of
+`.ssr_secret_fernet` to `data/backups/`, with 7-day rotation. First run
+fires 60s after boot, then every 24h. Override window with
+`SSR_BACKUP_KEEP_DAYS=14`; set the dir with `SSR_BACKUP_DIR=/path`; disable
+with `SSR_BACKUPS=0`.
+
+For off-host durability, copy `data/backups/` to S3 / restic / borg / etc.
+on whatever cadence you trust — the local rotation only protects against
+software corruption, not host loss.
+
+If the Fernet key file is ever lost, **the dashboard refuses to auto-
+generate a fresh one in production** when encrypted rows exist (would
+silently invalidate every secret). Restore from backup or delete the
+`enc:v1:`-prefixed rows explicitly.
+
+## Log retention
+
+`lib/log-retention.ts` runs daily and trims:
+
+| Table | Default | Override env |
+|---|---|---|
+| `pipeline_log` | 30 days | `SSR_RETAIN_PIPELINE_LOG_DAYS` |
+| `audit_log` | 90 days | `SSR_RETAIN_AUDIT_DAYS` |
+| `pipeline_runs` (+ step_runs) | 14 days | `SSR_RETAIN_RUNS_DAYS` |
+
+Disable with `SSR_LOG_RETENTION=0`.
+
+## Pre-deploy security checks
+
+Run these in CI before every deploy. None of them are wired into `npm run
+build` automatically — the build is type-correctness only.
+
+```sh
+npm audit --omit=dev --json   # high/critical CVEs in production deps
+npm outdated --json           # >2-major-behind security-relevant packages
+```
+
+If anything in `next`, `iron-session`, `better-sqlite3`, `ssh2`, `node-forge`,
+`tar`, or `nodemailer` shows as critical, treat as a blocker.

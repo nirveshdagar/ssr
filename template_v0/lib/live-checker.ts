@@ -90,7 +90,18 @@ async function tick(): Promise<void> {
   const rows = all<DomainProbeRow>(
     `SELECT domain, status, server_id FROM domains WHERE status IN ('hosted', 'live')`,
   )
-  if (rows.length === 0) return
+  if (rows.length === 0) {
+    // No active hosted/live domains — clear all streak entries so deleted
+    // domains don't linger in module memory until process restart.
+    streakUp.clear()
+    streakDown.clear()
+    return
+  }
+  // GC stale streak entries — domains deleted between ticks shouldn't linger.
+  // Build active set from this tick's rows and prune anything not in it.
+  const active = new Set<string>(rows.map((r) => r.domain))
+  for (const k of streakUp.keys()) if (!active.has(k)) streakUp.delete(k)
+  for (const k of streakDown.keys()) if (!active.has(k)) streakDown.delete(k)
 
   const upResults = await mapPool(rows, PROBE_MAX_WORKERS, (r) => checkOne(r.domain))
 

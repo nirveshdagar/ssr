@@ -635,7 +635,11 @@ async function pipelineWorkerImpl(
       return
     }
     const err = e as Error
-    const tb = (err.stack ?? "").slice(0, 4000)
+    // Pipeline log truncates messages at LOG_MESSAGE_MAX (2 KiB) anyway;
+    // keep the head of the stack tight so the operator sees the message
+    // first. Full stacks belong in a separate error store, not the row
+    // shown on the dashboard list.
+    const tb = (err.stack ?? "").slice(0, 800)
     logPipeline(domain, "pipeline", "failed",
       `Unhandled pipeline error: ${err.name}: ${err.message}\n\n${tb}`)
     updateDomain(domain, { status: "retryable_error" })
