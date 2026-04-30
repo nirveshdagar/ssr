@@ -435,6 +435,31 @@ export async function migrateDomain(
       logPipeline(domain, "migrate", "failed", `SSL install: ${installMsg}`)
       return { ok: false, message: `SSL install failed: ${installMsg}` }
     }
+    // Always log SUCCESS too — caller couldn't tell from the silent gap
+    // which install path succeeded (API / UI / SSH-fallback). Important:
+    // SSH-fallback succeeds without going through SA's bookkeeping so the
+    // SA dashboard won't show the cert, even though Apache is serving it.
+    logPipeline(domain, "migrate", "completed", `SSL install: ${installMsg}`)
+    // Verify via origin TLS probe — connect direct to the server IP with
+    // SNI=domain and confirm CloudFlare Origin Certificate is what's
+    // serving. Catches the rare case where SSL install reports success
+    // but a different cert (LE auto-issued, stale) is still on the wire.
+    try {
+      const probe = await sa.verifyOriginCertIsCustom(newIp, domain)
+      if (probe.ok === true) {
+        logPipeline(domain, "ssl_verify", "completed",
+          `Origin cert verified: subject="${probe.subjectCN ?? "?"}" issuer="${probe.issuerCN ?? "?"}"`)
+      } else if (probe.ok === false) {
+        logPipeline(domain, "ssl_verify", "warning",
+          `Origin cert MISMATCH: ${probe.message}. SSL install reported success but a different cert is serving — operator should investigate.`)
+      } else {
+        logPipeline(domain, "ssl_verify", "warning",
+          `Origin probe inconclusive (network blip): ${probe.message}`)
+      }
+    } catch (e) {
+      logPipeline(domain, "ssl_verify", "warning",
+        `Origin probe threw: ${(e as Error).message.slice(0, 160)}`)
+    }
 
     // 3. Upload content from archive (or DB fallback)
     let php: string | null = null
@@ -689,17 +714,41 @@ export async function migrateServer(
     }
   }
 
+  // Concurrent per-domain migration. Default 5-at-a-time fan-out. Tunable
+  // via `migrate_concurrency` setting (1 = sequential, 10 = aggressive).
+  // Each migrateDomain still runs the full per-domain pipeline (SA app
+  // create → SSL install → file upload → CF DNS update → old-app delete);
+  // the semaphore just bounds how many of those run concurrently.
+  //
+  // Why bound: SSL UI fallback uses patchright (heavy), SSH ops to one new
+  // droplet share OpenSSH's MaxSessions=10, SA app create on one server
+  // serializes inside SA anyway. 5 is the sweet spot between throughput
+  // and resource ceiling. SA + CF + DO API per-key semaphores already
+  // gate per-API concurrency.
+  const concRaw = parseInt(getSetting("migrate_concurrency") ?? "5", 10)
+  const concurrency = Number.isFinite(concRaw) && concRaw >= 1 && concRaw <= 10 ? concRaw : 5
+  logPipeline(anchorName, "migrate", "running",
+    `Migrating ${oldRows.length} domain(s) → server #${target.id} with concurrency=${concurrency}`)
+
   const ok: string[] = []
   const failed: { domain: string; reason: string }[] = []
-  for (const row of oldRows) {
-    try {
-      const result = await migrateDomain(row.domain, target)
-      if (result.ok) ok.push(row.domain)
-      else failed.push({ domain: row.domain, reason: result.message })
-    } catch (e) {
-      failed.push({ domain: row.domain, reason: `unhandled: ${(e as Error).message}` })
+  // Simple fan-out via Promise.allSettled with manual chunking.
+  let cursor = 0
+  const runOne = async (): Promise<void> => {
+    while (true) {
+      const i = cursor++
+      if (i >= oldRows.length) return
+      const row = oldRows[i]
+      try {
+        const result = await migrateDomain(row.domain, target)
+        if (result.ok) ok.push(row.domain)
+        else failed.push({ domain: row.domain, reason: result.message })
+      } catch (e) {
+        failed.push({ domain: row.domain, reason: `unhandled: ${(e as Error).message}` })
+      }
     }
   }
+  await Promise.all(Array.from({ length: Math.min(concurrency, oldRows.length) }, runOne))
 
   // ---- Post-migration cleanup of the OLD dead server -------------------
   // Only run when 100% of domains migrated cleanly. If anything failed,

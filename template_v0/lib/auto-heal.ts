@@ -413,6 +413,93 @@ export interface SaHealthResult {
 }
 
 // ---------------------------------------------------------------------------
+// SSL origin-cert sweep — verify every hosted/live domain is still serving
+// the CF Origin Cert. Catches the case where SSL install reported success
+// but a different cert is on the wire (stale LE auto-cert never replaced,
+// silent SSH-fallback that didn't write the conf properly, etc.).
+// ---------------------------------------------------------------------------
+
+export interface SslSweepResult {
+  checked: number
+  mismatched: { domain: string; serverIp: string; subjectCN: string | null; issuer: string | null }[]
+  enqueuedReinstalls: { domain: string; jobId: number }[]
+}
+
+/**
+ * Walk every domain in `hosted` / `live` status with a server attached and
+ * TLS-probe its origin IP (SNI=domain). Confirm the issuer is CF Origin CA.
+ * Mismatches are logged + audited + notified (deduped per domain).
+ *
+ * Auto-correction: when the cert is wrong AND auto_migrate_enabled=1,
+ * enqueue a `domain.teardown_app_then_reinstall_ssl` job (TODO future) —
+ * for now we just log + notify so the operator can decide. The
+ * Reinstall SA Agent button on /servers handles the SA-side of this for
+ * server-wide issues; per-domain SSL re-install is a manual flow today.
+ */
+export async function checkOriginCerts(): Promise<SslSweepResult> {
+  const rows = all<{ domain: string; server_id: number; current_proxy_ip: string | null }>(
+    `SELECT d.domain, d.server_id, s.ip AS current_proxy_ip
+       FROM domains d
+       JOIN servers s ON s.id = d.server_id
+      WHERE d.status IN ('hosted','live') AND s.ip IS NOT NULL`,
+  )
+  const result: SslSweepResult = { checked: 0, mismatched: [], enqueuedReinstalls: [] }
+  if (rows.length === 0) return result
+
+  const { verifyOriginCertIsCustom } = await import("./serveravatar")
+  for (const r of rows) {
+    if (!r.current_proxy_ip) continue
+    result.checked++
+    let probe
+    try {
+      probe = await verifyOriginCertIsCustom(r.current_proxy_ip, r.domain, 8000)
+    } catch (e) {
+      // Probe threw — log but don't flag as mismatch (might be transient).
+      logPipeline(r.domain, "ssl_verify", "warning",
+        `Origin probe threw: ${(e as Error).message.slice(0, 160)}`)
+      continue
+    }
+    if (probe.ok === true) continue  // verified — silent on the happy path
+    if (probe.ok === null) {
+      // Network blip / timeout — don't notify, just log so operator sees
+      // it if they're investigating.
+      logPipeline(r.domain, "ssl_verify", "warning",
+        `Origin probe inconclusive: ${probe.message}`)
+      continue
+    }
+    // probe.ok === false → wrong cert is serving
+    result.mismatched.push({
+      domain: r.domain, serverIp: r.current_proxy_ip,
+      subjectCN: probe.subjectCN, issuer: probe.issuerCN,
+    })
+    logPipeline(r.domain, "ssl_verify", "warning",
+      `Origin cert MISMATCH on ${r.current_proxy_ip}: ${probe.message}. ` +
+      `Re-run pipeline from step 8 (or migrate domain off this server).`)
+    try {
+      appendAudit(
+        "ssl_origin_mismatch", r.domain,
+        `server_id=${r.server_id} ip=${r.current_proxy_ip} ` +
+        `subject="${probe.subjectCN ?? "?"}" issuer="${probe.issuerCN ?? "?"}"`,
+        null,
+      )
+    } catch { /* ignore */ }
+    try {
+      const { notify } = await import("./notify")
+      await notify(
+        `SSL origin cert wrong: ${r.domain}`,
+        `Origin TLS probe at ${r.current_proxy_ip} returned a non-CF certificate:\n` +
+        `  subject: ${probe.subjectCN ?? "?"}\n  issuer:  ${probe.issuerCN ?? "?"}\n\n` +
+        `${probe.message}\n\n` +
+        `Likely fix: re-run the pipeline for this domain from step 8 (Issue + Install SSL), ` +
+        `or migrate the domain to a different server.`,
+        { severity: "warning", dedupeKey: `ssl_mismatch:${r.domain}` },
+      )
+    } catch { /* notify is best-effort */ }
+  }
+  return result
+}
+
+// ---------------------------------------------------------------------------
 // Stuck-creating server insurance — re-enqueue reinstall_sa if a server has
 // been in 'creating' status for too long with no in-flight reinstall job.
 // ---------------------------------------------------------------------------
@@ -559,6 +646,7 @@ export interface AutoHealTickResult {
   brokenSsl: BrokenSslResult | { error: string }
   saHealth: SaHealthResult | { error: string }
   stuckCreating: StuckCreatingResult | { error: string }
+  sslSweep: SslSweepResult | { error: string }
   ranAt: string
 }
 
@@ -617,6 +705,13 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
     stuckCreating = { error: (e as Error).message }
   }
 
+  let sslSweep: SslSweepResult | { error: string }
+  try {
+    sslSweep = await checkOriginCerts()
+  } catch (e) {
+    sslSweep = { error: (e as Error).message }
+  }
+
   // Only audit-log when something actually happened — avoids audit spam.
   const claimedN = "claimed" in reconcile ? reconcile.claimed.length : 0
   const resumedN = "resumed" in resume ? resume.resumed.length : 0
@@ -625,17 +720,18 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
   const sslReissuedN = "reissued" in brokenSsl ? brokenSsl.reissued.length : 0
   const degradedN = "degraded" in saHealth ? saHealth.degraded.length : 0
   const stuckN = "reEnqueued" in stuckCreating ? stuckCreating.reEnqueued.length : 0
-  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN + stuckN > 0) {
+  const sslMismatchedN = "mismatched" in sslSweep ? sslSweep.mismatched.length : 0
+  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN + stuckN + sslMismatchedN > 0) {
     appendAudit(
       "auto_heal_tick", "",
       `claimed=${claimedN} resumed=${resumedN} ns_resumed=${nsResumedN} ` +
       `retried=${retriedN} ssl_reissued=${sslReissuedN} sa_degraded=${degradedN} ` +
-      `stuck_recovered=${stuckN}`,
+      `stuck_recovered=${stuckN} ssl_mismatched=${sslMismatchedN}`,
       null,
     )
   }
 
-  return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, ranAt }
+  return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, sslSweep, ranAt }
 }
 
 // ---------------------------------------------------------------------------
