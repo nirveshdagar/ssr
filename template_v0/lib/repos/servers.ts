@@ -66,3 +66,33 @@ export function countDomainsOnServer(serverId: number): number {
   )
   return row?.n ?? 0
 }
+
+/**
+ * Find a server by its public IP. Used as an allowlist gate for SSH/SFTP
+ * routes that take a free-form `server_ip` query/form param — without this
+ * check, an authed operator (or a CSRF foothold) could target any IP with
+ * the dashboard's stored root password (lateral movement, fail2ban abuse
+ * complaints from third parties).
+ */
+export function findServerByIp(ip: string): ServerRow | undefined {
+  return one<ServerRow>(
+    `SELECT s.*,
+            (SELECT COUNT(*) FROM domains d WHERE d.server_id = s.id) AS sites_count
+       FROM servers s
+      WHERE s.ip = ?`,
+    ip,
+  )
+}
+
+/**
+ * Throw if `ip` isn't a known fleet server. Routes that take server_ip
+ * from the request and use it for SSH should call this before opening a
+ * connection. Returns the server row for any subsequent use.
+ */
+export function assertKnownServerIp(ip: string): ServerRow {
+  const row = findServerByIp(ip)
+  if (!row) {
+    throw new Error(`server_ip ${JSON.stringify(ip)} is not a known dashboard server`)
+  }
+  return row
+}

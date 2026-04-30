@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { restartApache, restartPhpFpm } from "@/lib/sa-control"
 import { appendAudit } from "@/lib/repos/audit"
+import { findServerByIp } from "@/lib/repos/servers"
 
 export const runtime = "nodejs"
 
@@ -19,6 +20,9 @@ export async function POST(req: NextRequest): Promise<Response> {
   const service = ((form?.get("service") as string | null) || "both").trim()
   if (!serverIp) {
     return NextResponse.json({ ok: false, error: "server_ip required" }, { status: 400 })
+  }
+  if (!findServerByIp(serverIp)) {
+    return NextResponse.json({ ok: false, error: "server_ip is not a known dashboard server" }, { status: 403 })
   }
   if (!["web", "php-fpm", "both"].includes(service)) {
     return NextResponse.json({ ok: false, error: "service must be web | php-fpm | both" }, { status: 400 })

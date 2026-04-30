@@ -31,30 +31,24 @@ export default function LoginPage() {
 function LoginPageInner() {
   const router = useRouter()
   const params = useSearchParams()
-  const next = params.get("next") || "/"
+  // Reject any `next` that isn't a same-origin path. Open-redirect prevention:
+  // a phisher who linked /login?next=https://evil.com/clone could otherwise
+  // bounce a successfully-authenticated operator to a credential-harvest clone.
+  // Same-origin paths start with "/" and never with "//" (which is a
+  // protocol-relative URL).
+  const rawNext = params.get("next") || "/"
+  const next = rawNext.startsWith("/") && !rawNext.startsWith("//") ? rawNext : "/"
   const [pwd, setPwd] = React.useState("")
   const [loading, setLoading] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
-  const [openAccess, setOpenAccess] = React.useState(false)
   const [env, setEnv] = React.useState<"LOCAL" | "PROD">("PROD")
   React.useEffect(() => { setEnv(detectEnv()) }, [])
-  // Probe whether a dashboard password is configured. We DON'T expose the
-  // hash — `/api/auth/login` returns 500 with a specific message when not set.
-  // The login form sends a sentinel byte to trigger that path without leaking.
-  React.useEffect(() => {
-    const fd = new FormData()
-    fd.set("password", "__probe__no_match__")
-    fetch("/api/auth/login", { method: "POST", body: fd, credentials: "same-origin" })
-      .then(async (r) => {
-        if (r.status === 500) {
-          const j = (await r.json().catch(() => ({}))) as { error?: string }
-          if ((j.error ?? "").includes("No dashboard password configured")) {
-            setOpenAccess(true)
-          }
-        }
-      })
-      .catch(() => { /* non-fatal */ })
-  }, [])
+  // Note: the unconfigured-password probe via "__probe__no_match__" was
+  // removed when /api/auth/login was changed to return generic 401
+  // (instead of a fingerprint-revealing 500) for both no-password and
+  // wrong-password cases. Open-access banner is no longer surfaced from
+  // the login page; check Settings → Security on first boot.
+  const openAccess = false
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault()

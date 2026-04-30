@@ -1,8 +1,11 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { bulkEditIndex, type BulkEditOp, type BulkEditTarget } from "@/lib/sa-control"
 import { appendAudit } from "@/lib/repos/audit"
+import { findServerByIp } from "@/lib/repos/servers"
 
 export const runtime = "nodejs"
+
+const MAX_BULK_TARGETS = 1000
 
 /**
  * Bulk edit /public_html/index.php across many apps.
@@ -36,6 +39,18 @@ export async function POST(req: NextRequest): Promise<Response> {
   )
   if (targets.length === 0) {
     return NextResponse.json({ ok: false, error: "no targets provided" }, { status: 400 })
+  }
+  if (targets.length > MAX_BULK_TARGETS) {
+    return NextResponse.json({
+      ok: false, error: `too many targets (${targets.length} > ${MAX_BULK_TARGETS})`,
+    }, { status: 413 })
+  }
+  const unknownIp = targets.find((t) => !findServerByIp(t.server_ip))
+  if (unknownIp) {
+    return NextResponse.json({
+      ok: false,
+      error: `target server_ip ${JSON.stringify(unknownIp.server_ip)} is not a known dashboard server`,
+    }, { status: 403 })
   }
   if (!body.op || !["insert_top", "append_end", "search_replace", "replace_line", "delete_top"].includes(body.op.kind)) {
     return NextResponse.json({ ok: false, error: "op.kind must be one of insert_top|append_end|search_replace|replace_line|delete_top" }, { status: 400 })

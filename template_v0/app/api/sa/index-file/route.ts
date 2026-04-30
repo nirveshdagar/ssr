@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { readIndexFile, writeIndexFile, restoreIndexFile } from "@/lib/sa-control"
 import { appendAudit } from "@/lib/repos/audit"
+import { findServerByIp } from "@/lib/repos/servers"
 
 export const runtime = "nodejs"
 
@@ -18,6 +19,9 @@ export async function GET(req: NextRequest): Promise<Response> {
   if (!domain || !serverIp) {
     return NextResponse.json({ ok: false, error: "domain and server_ip required" }, { status: 400 })
   }
+  if (!findServerByIp(serverIp)) {
+    return NextResponse.json({ ok: false, error: "server_ip is not a known dashboard server" }, { status: 403 })
+  }
   try {
     const r = await readIndexFile(domain, serverIp)
     return NextResponse.json({ ok: true, ...r })
@@ -34,6 +38,9 @@ export async function POST(req: NextRequest): Promise<Response> {
   const action = ((form?.get("action") as string | null) || "write").trim()
   if (!domain || !serverIp) {
     return NextResponse.json({ ok: false, error: "domain and server_ip required" }, { status: 400 })
+  }
+  if (!findServerByIp(serverIp)) {
+    return NextResponse.json({ ok: false, error: "server_ip is not a known dashboard server" }, { status: 403 })
   }
 
   try {
