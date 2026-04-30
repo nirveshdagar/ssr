@@ -74,6 +74,20 @@ export const domainActions = {
       .then(async (r) => ({ ok: r.ok, ...((await r.json()) as Record<string, unknown>) }))
   },
   cancelPipeline: (domain: string) => postForm(`/api/domains/${domain}/cancel-pipeline`),
+  /**
+   * Force a fresh TLS probe of the origin and update ssl_origin_ok in DB.
+   * Use this when the lock icon disagrees with the operator's expectation —
+   * `result === false` flips the lock red and shows what cert is actually
+   * being served (issuer / subject CN).
+   */
+  checkSslNow: (domain: string) => postForm<{
+    probed_ip?: string
+    result?: boolean | null
+    issuer?: string | null
+    subject?: string | null
+    message?: string
+    ssl_last_verified_at?: string | null
+  }>(`/api/domains/${domain}/check-ssl-now`),
   runPipeline: (
     domain: string,
     opts: {

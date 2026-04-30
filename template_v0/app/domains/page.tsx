@@ -296,6 +296,46 @@ function DomainsPageInner() {
       })
     }, 120_000)
   }
+
+  // Force a fresh SSL probe for one domain — used when the lock disagrees
+  // with the operator's expectation (e.g. green but they know the cert was
+  // removed). Bypasses the 5-min sweep cadence and writes ssl_origin_ok
+  // immediately, so the icon flips on the next refresh tick.
+  const [sslChecking, setSslChecking] = React.useState<Set<string>>(new Set())
+  async function recheckSsl(name: string) {
+    if (sslChecking.has(name)) return
+    setSslChecking((s) => new Set([...s, name]))
+    const r = await domainActions.checkSslNow(name) as {
+      ok: boolean
+      data?: {
+        probed_ip?: string
+        result?: boolean | null
+        issuer?: string | null
+        subject?: string | null
+        message?: string
+      }
+      error?: string
+    }
+    if (!r.ok) {
+      show("err", r.error ?? "SSL re-probe failed")
+    } else {
+      const d = r.data ?? {}
+      const verdict =
+        d.result === true ? "ok" :
+        d.result === false ? "err" :
+        "ok"
+      const text =
+        d.result === true ? `SSL verified — issuer=${d.issuer ?? "?"}` :
+        d.result === false ? `SSL MISMATCH on ${d.probed_ip ?? "origin"} — issuer=${d.issuer ?? "?"} subject=${d.subject ?? "?"}` :
+        `SSL probe inconclusive: ${d.message ?? ""}`
+      show(verdict, text)
+    }
+    void refresh()
+    setSslChecking((s) => {
+      if (!s.has(name)) return s
+      const n = new Set(s); n.delete(name); return n
+    })
+  }
   async function submitCfUpdate() {
     if (!cfModalDomain) return
     const r = await domainActions.updateCf(cfModalDomain, {
@@ -860,23 +900,27 @@ function DomainsPageInner() {
                                               enqueue a from-step-8 repair
                           spinner           = repair in flight (~30–120s)
                           gray lock         = never verified yet */}
-                    {sslFixing.has(d.name) ? (
+                    {sslFixing.has(d.name) || sslChecking.has(d.name) ? (
                       <span
                         className="inline-block"
-                        title="SSL repair in progress — re-running pipeline from step 8 (install cert + verify)"
+                        title={
+                          sslFixing.has(d.name)
+                            ? "SSL repair in progress — re-running pipeline from step 8 (install cert + verify)"
+                            : "Re-probing origin cert…"
+                        }
                       >
-                        <Loader2 className="h-4 w-4 mx-auto animate-spin text-muted-foreground" aria-label="SSL repair in progress" />
+                        <Loader2 className="h-4 w-4 mx-auto animate-spin text-muted-foreground" aria-label="SSL probe in progress" />
                       </span>
                     ) : d.sslOk === true ? (
-                      <span
-                        className="inline-block"
-                        title={`CloudFlare Origin Cert verified${d.sslVerifiedAt ? ` at ${d.sslVerifiedAt}` : ""}`}
+                      <button
+                        type="button"
+                        className="inline-flex items-center justify-center rounded-sm p-0.5 text-status-completed hover:bg-status-completed/10 focus:outline-none focus-visible:ring-1 focus-visible:ring-status-completed"
+                        title={`CloudFlare Origin Cert verified${d.sslVerifiedAt ? ` at ${d.sslVerifiedAt}` : ""}. Click to re-probe now.`}
+                        onClick={() => recheckSsl(d.name)}
+                        aria-label={`Re-probe SSL for ${d.name}`}
                       >
-                        <Lock
-                          className="h-4 w-4 mx-auto text-status-completed"
-                          aria-label="SSL OK"
-                        />
-                      </span>
+                        <Lock className="h-4 w-4" />
+                      </button>
                     ) : d.sslOk === false ? (
                       <button
                         type="button"
@@ -888,15 +932,15 @@ function DomainsPageInner() {
                         <Unlock className="h-4 w-4" />
                       </button>
                     ) : (
-                      <span
-                        className="inline-block"
-                        title="SSL never verified — pipeline hasn't reached step 8 yet, or last probe was inconclusive"
+                      <button
+                        type="button"
+                        className="inline-flex items-center justify-center rounded-sm p-0.5 text-muted-foreground/60 hover:bg-muted hover:text-muted-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-muted-foreground"
+                        title="SSL never verified — pipeline hasn't reached step 8 yet, or last probe was inconclusive. Click to probe now."
+                        onClick={() => recheckSsl(d.name)}
+                        aria-label={`Probe SSL for ${d.name}`}
                       >
-                        <Lock
-                          className="h-4 w-4 mx-auto text-muted-foreground/40"
-                          aria-label="SSL not verified yet"
-                        />
-                      </span>
+                        <Lock className="h-4 w-4 opacity-60" />
+                      </button>
                     )}
                   </DataTableCell>
                   <DataTableCell>
