@@ -28,6 +28,11 @@ export interface DomainRow {
   /** 1 = CF Origin Cert verified on the wire, 0 = wrong cert, NULL = unknown */
   ssl_origin_ok: number | null
   ssl_last_verified_at: string | null
+  /** 1 = HTTPS probe 2xx/3xx, 0 = failure, NULL = never probed */
+  live_ok: number | null
+  live_reason: string | null
+  live_http_status: number | null
+  live_checked_at: string | null
   created_at: string
   updated_at: string
 }
@@ -38,6 +43,7 @@ const DOMAIN_COLS = new Set<keyof DomainRow>([
   "cf_a_record_id", "cf_www_record_id", "origin_cert_pem", "origin_key_pem",
   "content_archive_path", "cancel_requested",
   "ssl_origin_ok", "ssl_last_verified_at",
+  "live_ok", "live_reason", "live_http_status", "live_checked_at",
 ])
 
 export function listDomains(): DomainRow[] {

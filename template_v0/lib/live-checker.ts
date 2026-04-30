@@ -41,7 +41,18 @@ let runningPromise: Promise<void> | null = null
 // One probe
 // ---------------------------------------------------------------------------
 
-async function checkOne(domain: string): Promise<boolean> {
+/**
+ * Per-domain probe result. `ok` is the boolean the streak counter cares
+ * about; `reason`+`status` are surfaced on the dashboard so the operator
+ * can see WHY a domain is down without tailing the live-checker log.
+ */
+export interface LiveProbeResult {
+  ok: boolean
+  reason: "ok" | "timeout" | "dns_fail" | "connect_refused" | "ssl_error" | "http_4xx" | "http_5xx" | "fetch_error"
+  status: number | null
+}
+
+export async function probeLive(domain: string): Promise<LiveProbeResult> {
   try {
     const res = await fetch(`https://${domain}/`, {
       method: "GET",
@@ -49,10 +60,41 @@ async function checkOne(domain: string): Promise<boolean> {
       headers: { "User-Agent": "SSR-live-checker/1.0" },
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     })
-    return res.status >= 200 && res.status < 400
-  } catch {
-    return false
+    if (res.status >= 200 && res.status < 400) {
+      return { ok: true, reason: "ok", status: res.status }
+    }
+    return {
+      ok: false,
+      reason: res.status >= 500 ? "http_5xx" : "http_4xx",
+      status: res.status,
+    }
+  } catch (e) {
+    const err = e as { name?: string; message?: string; code?: string; cause?: { code?: string } }
+    const code = err.code ?? err.cause?.code ?? ""
+    const msg = (err.message ?? "").toLowerCase()
+    // AbortSignal.timeout fires a TimeoutError / AbortError — both mean we
+    // never got a response in PROBE_TIMEOUT_MS.
+    if (err.name === "TimeoutError" || err.name === "AbortError" || msg.includes("timeout")) {
+      return { ok: false, reason: "timeout", status: null }
+    }
+    if (code === "ENOTFOUND" || msg.includes("getaddrinfo")) {
+      return { ok: false, reason: "dns_fail", status: null }
+    }
+    if (code === "ECONNREFUSED" || code === "ECONNRESET" || msg.includes("refused")) {
+      return { ok: false, reason: "connect_refused", status: null }
+    }
+    if (
+      msg.includes("certificate") || msg.includes("self-signed") || msg.includes("ssl") ||
+      msg.includes("tls") || code === "CERT_HAS_EXPIRED" || code === "DEPTH_ZERO_SELF_SIGNED_CERT"
+    ) {
+      return { ok: false, reason: "ssl_error", status: null }
+    }
+    return { ok: false, reason: "fetch_error", status: null }
   }
+}
+
+async function checkOne(domain: string): Promise<boolean> {
+  return (await probeLive(domain)).ok
 }
 
 /**
@@ -103,14 +145,28 @@ async function tick(): Promise<void> {
   for (const k of streakUp.keys()) if (!active.has(k)) streakUp.delete(k)
   for (const k of streakDown.keys()) if (!active.has(k)) streakDown.delete(k)
 
-  const upResults = await mapPool(rows, PROBE_MAX_WORKERS, (r) => checkOne(r.domain))
+  const probeResults = await mapPool(rows, PROBE_MAX_WORKERS, (r) => probeLive(r.domain))
+  const nowIso = new Date().toISOString().replace(/\.\d{3}Z$/, "Z")
 
   // Group by server for whole-server dead detection
   const byServer = new Map<number, { domain: string; downStreak: number }[]>()
 
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i]
-    const up = upResults[i]
+    const probe = probeResults[i]
+    const up = probe.ok
+    // Persist per-domain liveness so the /domains page renders the Live
+    // dot without re-probing on every render. Failure tracking still goes
+    // through the in-memory streak counters below — the DB columns are a
+    // snapshot of the LATEST probe, not a streak.
+    try {
+      run(
+        `UPDATE domains
+            SET live_ok = ?, live_reason = ?, live_http_status = ?, live_checked_at = ?
+          WHERE domain = ?`,
+        up ? 1 : 0, probe.reason, probe.status, nowIso, r.domain,
+      )
+    } catch { /* ignore — schema may not be migrated yet on first boot */ }
     if (up) {
       streakUp.set(r.domain, (streakUp.get(r.domain) ?? 0) + 1)
       streakDown.set(r.domain, 0)

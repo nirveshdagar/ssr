@@ -239,6 +239,20 @@ function applyMigrations(db: DatabaseSync): void {
   //   ssl_last_verified_at: ISO timestamp of last probe
   tryAlter(db, "ALTER TABLE domains ADD COLUMN ssl_origin_ok INTEGER")
   tryAlter(db, "ALTER TABLE domains ADD COLUMN ssl_last_verified_at TEXT")
+  // Live-checker per-row state. Updated every tick by live-checker.ts and
+  // on-demand by /api/domains/{d}/check-live-now. Surfaces in the /domains
+  // "Live" column so the operator can see WHY a domain is down without
+  // tailing the live-checker log.
+  // Values:
+  //   live_ok: 1 = HTTPS probe returned 2xx/3xx, 0 = failure, NULL = never probed
+  //   live_reason: short token — "ok", "timeout", "dns_fail",
+  //                "connect_refused", "ssl_error", "http_4xx", "http_5xx"
+  //   live_http_status: HTTP code if the probe got a response, else NULL
+  //   live_checked_at: ISO timestamp of last probe
+  tryAlter(db, "ALTER TABLE domains ADD COLUMN live_ok INTEGER")
+  tryAlter(db, "ALTER TABLE domains ADD COLUMN live_reason TEXT")
+  tryAlter(db, "ALTER TABLE domains ADD COLUMN live_http_status INTEGER")
+  tryAlter(db, "ALTER TABLE domains ADD COLUMN live_checked_at TEXT")
 }
 
 /**

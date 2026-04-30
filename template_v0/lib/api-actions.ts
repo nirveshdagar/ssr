@@ -88,6 +88,13 @@ export const domainActions = {
     message?: string
     ssl_last_verified_at?: string | null
   }>(`/api/domains/${domain}/check-ssl-now`),
+  /** Force a fresh HTTPS liveness probe and update live_* columns. */
+  checkLiveNow: (domain: string) => postForm<{
+    result?: boolean
+    reason?: string
+    http_status?: number | null
+    checked_at?: string
+  }>(`/api/domains/${domain}/check-live-now`),
   runPipeline: (
     domain: string,
     opts: {

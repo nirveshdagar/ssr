@@ -46,6 +46,15 @@ export interface DomainRow {
    *  Updated by migration ssl_verify step + auto-heal sweep every 5 min. */
   sslOk: boolean | null
   sslVerifiedAt: string | null
+  /** Live HTTPS probe result, updated every live-checker tick (~60s) and
+   *  on-demand via /api/domains/{d}/check-live-now.
+   *   true  = HTTPS 2xx/3xx (green)
+   *   false = probe failed (red — see liveReason for why)
+   *   null  = never probed (gray) */
+  liveOk: boolean | null
+  liveReason: string | null
+  liveHttpStatus: number | null
+  liveCheckedAt: string | null
 }
 
 interface ApiDomain {
@@ -65,6 +74,10 @@ interface ApiDomain {
   current_step_message: string | null
   ssl_origin_ok: number | null
   ssl_last_verified_at: string | null
+  live_ok: number | null
+  live_reason: string | null
+  live_http_status: number | null
+  live_checked_at: string | null
 }
 
 const NORMALIZE_STATUS: Record<string, PipelineStatus> = {
@@ -120,6 +133,10 @@ export function useDomains() {
     registrar: "Spaceship",
     sslOk: d.ssl_origin_ok === 1 ? true : d.ssl_origin_ok === 0 ? false : null,
     sslVerifiedAt: d.ssl_last_verified_at,
+    liveOk: d.live_ok === 1 ? true : d.live_ok === 0 ? false : null,
+    liveReason: d.live_reason,
+    liveHttpStatus: d.live_http_status,
+    liveCheckedAt: d.live_checked_at,
   }))
   return { rows, error, isLoading, refresh: mutate }
 }

@@ -297,6 +297,36 @@ function DomainsPageInner() {
     }, 120_000)
   }
 
+  // Force a fresh HTTPS live probe for one domain — used when the dashboard
+  // dot disagrees with what the operator sees (e.g. browser shows 200 but
+  // dot is red, or vice versa). The live-checker tick runs every ~60s; this
+  // bypasses that cadence.
+  const [liveChecking, setLiveChecking] = React.useState<Set<string>>(new Set())
+  async function recheckLive(name: string) {
+    if (liveChecking.has(name)) return
+    setLiveChecking((s) => new Set([...s, name]))
+    const r = await domainActions.checkLiveNow(name) as {
+      ok: boolean
+      data?: { result?: boolean; reason?: string; http_status?: number | null }
+      error?: string
+    }
+    if (!r.ok) {
+      show("err", r.error ?? "Live re-probe failed")
+    } else {
+      const d = r.data ?? {}
+      const verdict = d.result ? "ok" : "err"
+      const text = d.result
+        ? `Live — HTTP ${d.http_status ?? "?"}`
+        : `DOWN — ${d.reason ?? "?"}${d.http_status != null ? ` (HTTP ${d.http_status})` : ""}`
+      show(verdict, text)
+    }
+    void refresh()
+    setLiveChecking((s) => {
+      if (!s.has(name)) return s
+      const n = new Set(s); n.delete(name); return n
+    })
+  }
+
   // Force a fresh SSL probe for one domain — used when the lock disagrees
   // with the operator's expectation (e.g. green but they know the cert was
   // removed). Bypasses the 5-min sweep cadence and writes ssl_origin_ok
@@ -857,6 +887,7 @@ function DomainsPageInner() {
                 </DataTableHeaderCell>
                 <DataTableHeaderCell>Domain</DataTableHeaderCell>
                 <DataTableHeaderCell className="w-12 text-center">SSL</DataTableHeaderCell>
+                <DataTableHeaderCell className="w-12 text-center">Live</DataTableHeaderCell>
                 <DataTableHeaderCell>Status</DataTableHeaderCell>
                 <DataTableHeaderCell>Step</DataTableHeaderCell>
                 <DataTableHeaderCell>Server</DataTableHeaderCell>
@@ -948,6 +979,41 @@ function DomainsPageInner() {
                         <Lock className="h-4 w-4 opacity-60" />
                       </button>
                     )}
+                  </DataTableCell>
+                  <DataTableCell className="text-center">
+                    {/* Live HTTPS probe state. live-checker writes this every
+                        ~60s; click forces a fresh probe and shows the failure
+                        reason in the flash. Reasons: ok / timeout / dns_fail
+                        / connect_refused / ssl_error / http_4xx / http_5xx /
+                        fetch_error. */}
+                    {liveChecking.has(d.name) ? (
+                      <span className="inline-block" title="Re-probing live state…">
+                        <Loader2 className="h-4 w-4 mx-auto animate-spin text-muted-foreground" aria-label="Live probe in progress" />
+                      </span>
+                    ) : (() => {
+                      const tip = d.liveOk === true
+                        ? `Live — HTTP ${d.liveHttpStatus ?? "200"}${d.liveCheckedAt ? ` (checked ${d.liveCheckedAt})` : ""}. Click to re-probe.`
+                        : d.liveOk === false
+                        ? `DOWN — ${d.liveReason ?? "?"}${d.liveHttpStatus != null ? ` (HTTP ${d.liveHttpStatus})` : ""}${d.liveCheckedAt ? ` · last checked ${d.liveCheckedAt}` : ""}. Click to re-probe.`
+                        : "Live state unknown — never probed. Click to probe now."
+                      const cls = d.liveOk === true
+                        ? "text-status-completed hover:bg-status-completed/10 focus-visible:ring-status-completed"
+                        : d.liveOk === false
+                        ? "text-status-terminal hover:bg-status-terminal/10 focus-visible:ring-status-terminal"
+                        : "text-muted-foreground/60 hover:bg-muted hover:text-muted-foreground focus-visible:ring-muted-foreground"
+                      const label = d.liveOk === true ? "Live" : d.liveOk === false ? "Down" : "Unknown"
+                      return (
+                        <button
+                          type="button"
+                          className={`inline-flex items-center justify-center rounded-sm p-0.5 focus:outline-none focus-visible:ring-1 ${cls}`}
+                          title={tip}
+                          onClick={() => recheckLive(d.name)}
+                          aria-label={`${label} — re-probe ${d.name}`}
+                        >
+                          <span className="block h-2.5 w-2.5 rounded-full bg-current" />
+                        </button>
+                      )
+                    })()}
                   </DataTableCell>
                   <DataTableCell>
                     <StatusBadge status={d.status} />
