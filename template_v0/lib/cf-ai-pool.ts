@@ -16,6 +16,7 @@
  */
 import { getDb, one } from "./db"
 import { ensureCfAiKeysSchema } from "./repos/cf-ai-keys"
+import { decrypt } from "./secrets-vault"
 
 export class AiPoolExhausted extends Error {
   constructor(message: string) {
@@ -74,7 +75,7 @@ export function getNextAiKey(excludeIds: number[] = []): CfAiKeyWithCreds {
         `UPDATE cf_workers_ai_keys SET last_call_at = datetime('now') WHERE id = ?`,
       ).run(row.id)
       db.exec("COMMIT")
-      return row
+      return { ...row, api_token: decrypt(row.api_token) }
     }
     db.exec("COMMIT")
   } catch (e) {

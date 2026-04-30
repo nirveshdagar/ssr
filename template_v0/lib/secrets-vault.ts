@@ -32,6 +32,7 @@ export const SECRET_KEYS_EXACT = new Set<string>([
   "twilio_auth_token",
   "dashboard_password",
   "server_root_password",
+  "cloudflare_workers_ai_token",
 ])
 
 export const SECRET_KEYS_PREFIX = ["llm_api_key_"] as const

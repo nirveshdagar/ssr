@@ -131,6 +131,20 @@ export function scheduleBootHooks(): void {
   // settings reads have settled before we hit external APIs.
   setTimeout(() => { void recoverGreyCloudOnce() }, 5000).unref?.()
   setTimeout(() => { void orphanDropletSweepOnce() }, 8000).unref?.()
+  // One-shot encrypt-at-rest migration for the CF Workers AI pool. Plaintext
+  // tokens written before secrets-vault coverage was extended to this table
+  // get re-saved as Fernet ciphertexts; idempotent on already-encrypted rows.
+  setTimeout(() => {
+    try {
+      void import("./repos/cf-ai-keys").then(({ encryptExistingAiTokens }) => {
+        const { converted } = encryptExistingAiTokens()
+        if (converted > 0) {
+          logPipeline("(startup)", "secrets_vault", "completed",
+            `Encrypted ${converted} legacy plaintext CF Workers AI token(s) at rest.`)
+        }
+      })
+    } catch { /* boot is best-effort */ }
+  }, 3000).unref?.()
   // Auto-heal sweeper — reconcile SA orphans + auto-resume stuck pipelines
   // every SSR_AUTOHEAL_INTERVAL_MS (default 5 min). Self-skips in tests
   // and when SSR_AUTOHEAL=0.
