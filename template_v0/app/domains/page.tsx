@@ -25,6 +25,7 @@ import {
   ArrowLeftRight,
   Lock,
   Unlock,
+  Loader2,
 } from "lucide-react"
 import { AppShell } from "@/components/ssr/app-shell"
 import { StatusBadge } from "@/components/ssr/status-badge"
@@ -273,6 +274,27 @@ function DomainsPageInner() {
   function openFiles(domain: string, serverIp: string) {
     setFilesDomain(domain)
     setFilesServerIp(serverIp)
+  }
+
+  // SSL one-click repair — clicking the red lock enqueues a pipeline.full from
+  // step 8 (skip-purchase). We track the domain in a Set so the icon shows a
+  // spinner while the job is in flight; auto-heal's SSL sweep (every 5 min)
+  // and the periodic data refresh will flip the lock green once the new cert
+  // verifies. Drop the busy state after 120s either way so a stuck job doesn't
+  // pin the spinner forever.
+  const [sslFixing, setSslFixing] = React.useState<Set<string>>(new Set())
+  async function fixSsl(name: string) {
+    if (sslFixing.has(name)) return
+    setSslFixing((s) => new Set([...s, name]))
+    const r = await domainActions.runFromStep(name, 8, { skipPurchase: true })
+    show(r.ok ? "ok" : "err", r.message ?? r.error ?? "ssl repair failed")
+    void refresh()
+    window.setTimeout(() => {
+      setSslFixing((s) => {
+        if (!s.has(name)) return s
+        const n = new Set(s); n.delete(name); return n
+      })
+    }, 120_000)
   }
   async function submitCfUpdate() {
     if (!cfModalDomain) return
@@ -834,11 +856,18 @@ function DomainsPageInner() {
                     {/* SSL origin-cert lock icon. Updated by auto-heal sweep
                         every 5 min + by migration's ssl_verify step.
                           green closed lock = CF Origin Cert serving (verified)
-                          red open lock     = wrong cert serving (auto-fix queued
-                                              if auto_migrate_enabled, else
-                                              operator should run from step 8)
+                          red open lock     = wrong cert serving — clickable to
+                                              enqueue a from-step-8 repair
+                          spinner           = repair in flight (~30–120s)
                           gray lock         = never verified yet */}
-                    {d.sslOk === true ? (
+                    {sslFixing.has(d.name) ? (
+                      <span
+                        className="inline-block"
+                        title="SSL repair in progress — re-running pipeline from step 8 (install cert + verify)"
+                      >
+                        <Loader2 className="h-4 w-4 mx-auto animate-spin text-muted-foreground" aria-label="SSL repair in progress" />
+                      </span>
+                    ) : d.sslOk === true ? (
                       <span
                         className="inline-block"
                         title={`CloudFlare Origin Cert verified${d.sslVerifiedAt ? ` at ${d.sslVerifiedAt}` : ""}`}
@@ -849,15 +878,15 @@ function DomainsPageInner() {
                         />
                       </span>
                     ) : d.sslOk === false ? (
-                      <span
-                        className="inline-block"
-                        title={`Wrong / missing cert on origin${d.sslVerifiedAt ? ` (last checked ${d.sslVerifiedAt})` : ""}. Auto-fix runs every 5 min when auto-migrate is enabled.`}
+                      <button
+                        type="button"
+                        className="inline-flex items-center justify-center rounded-sm p-0.5 text-status-terminal hover:bg-status-terminal/10 focus:outline-none focus-visible:ring-1 focus-visible:ring-status-terminal"
+                        title={`Wrong / missing cert on origin${d.sslVerifiedAt ? ` (last checked ${d.sslVerifiedAt})` : ""}. Click to repair — re-runs pipeline from step 8.`}
+                        onClick={() => fixSsl(d.name)}
+                        aria-label={`Repair SSL for ${d.name}`}
                       >
-                        <Unlock
-                          className="h-4 w-4 mx-auto text-status-terminal"
-                          aria-label="SSL MISSING / WRONG CERT"
-                        />
-                      </span>
+                        <Unlock className="h-4 w-4" />
+                      </button>
                     ) : (
                       <span
                         className="inline-block"
