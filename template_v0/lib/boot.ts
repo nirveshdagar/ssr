@@ -172,11 +172,12 @@ export function scheduleBootHooks(): void {
   void import("./auto-heal").then(({ startAutoHeal }) => startAutoHeal()).catch(() => {
     /* boot is best-effort — never wedge the server */
   })
-  // Live-checker — opt-in via SSR_LIVE_CHECKER=1. OFF by default because
-  // Flask runs its own; running both against the same SQLite DB causes
-  // status thrash (both apps' streak counters race to flip the row).
-  // Skip in test mode so vitest doesn't spawn the loop.
-  if (process.env.SSR_LIVE_CHECKER === "1" && process.env.NODE_ENV !== "test") {
+  // Live-checker — ON by default now that Flask is gone (Flask used to
+  // run its own; double-running against the same DB caused status thrash).
+  // Set SSR_LIVE_CHECKER=0 to opt out (e.g. during a parallel migration
+  // where another instance owns the probe loop). Skipped in test mode so
+  // vitest doesn't spawn the loop.
+  if (process.env.SSR_LIVE_CHECKER !== "0" && process.env.NODE_ENV !== "test") {
     void import("./live-checker").then(({ start }) => {
       start()
       logPipeline("(live-checker)", "live_check", "running",
