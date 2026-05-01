@@ -70,12 +70,17 @@ export default function AiGeneratorPage() {
     watchers: Record<string, StepTrackerRow[]>
     active_domains: string[]
   }>("/api/watcher", fetcher, { refreshInterval: 4000, revalidateOnFocus: false })
-  const { data: domains } = useSWR<{ rows: { domain: string; status: string }[] }>(
+  // /api/domains returns `{ domains: [...] }` (not `{ rows: ... }` — that
+  // shape was a typo here that left the queue's status badge always
+  // falling back to the watcher's last-seen step).
+  const { data: domainsResp } = useSWR<{
+    domains: { domain: string; status: string }[]
+  }>(
     "/api/domains", fetcher,
     { refreshInterval: 6000, revalidateOnFocus: false },
   )
   const queueRows = React.useMemo<QueueRow[]>(() => {
-    const dmap = new Map((domains?.rows ?? []).map((d) => [d.domain, d.status]))
+    const dmap = new Map((domainsResp?.domains ?? []).map((d) => [d.domain, d.status]))
     const wmap = watcher?.watchers ?? {}
     const out: QueueRow[] = []
     for (const d of recent) {
@@ -95,7 +100,7 @@ export default function AiGeneratorPage() {
       })
     }
     return out
-  }, [recent, watcher, domains])
+  }, [recent, watcher, domainsResp])
 
   function parseDomains(text: string): string[] {
     return text
@@ -401,7 +406,7 @@ export default function AiGeneratorPage() {
 
           <div className="p-5">
             {(() => {
-              const hosted = (domains?.rows ?? [])
+              const hosted = (domainsResp?.domains ?? [])
                 .filter((r) => r.status === "live" || r.status === "hosted")
                 .sort((a, b) => a.domain.localeCompare(b.domain))
               if (hosted.length === 0) {
