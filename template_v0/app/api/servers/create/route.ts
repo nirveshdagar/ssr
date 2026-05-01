@@ -2,6 +2,7 @@ import { NextResponse, type NextRequest } from "next/server"
 import { enqueueJob } from "@/lib/jobs"
 import { generateServerName } from "@/lib/server-names"
 import { appendAudit } from "@/lib/repos/audit"
+import { getSetting } from "@/lib/repos/settings"
 
 export const runtime = "nodejs"
 
@@ -24,8 +25,13 @@ export async function POST(req: NextRequest): Promise<Response> {
   const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null
   const form = await req.formData().catch(() => null)
   const explicitName = ((form?.get("name") as string | null) || "").trim()
-  const region = (((form?.get("region") as string | null) || "nyc1")).trim() || "nyc1"
-  const size = (((form?.get("size") as string | null) || "s-1vcpu-1gb")).trim() || "s-1vcpu-1gb"
+  // Region / size fallback chain: explicit form value → setting →
+  // legacy hardcode. Lets the operator set a fleet-wide default in
+  // /settings → DigitalOcean instead of editing the form every time.
+  const formRegion = ((form?.get("region") as string | null) || "").trim()
+  const formSize = ((form?.get("size") as string | null) || "").trim()
+  const region = formRegion || (getSetting("do_default_region") || "").trim() || "nyc1"
+  const size = formSize || (getSetting("do_default_size") || "").trim() || "s-1vcpu-1gb"
 
   let name: string
   if (explicitName) {

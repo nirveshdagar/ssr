@@ -18,6 +18,7 @@
  */
 import { logPipeline } from "../repos/logs"
 import { updateServer } from "../repos/servers"
+import { getSetting } from "../repos/settings"
 
 interface ServerCreatePayload {
   name: string
@@ -28,8 +29,12 @@ interface ServerCreatePayload {
 export async function serverCreateHandler(payload: Record<string, unknown>): Promise<void> {
   const p = payload as unknown as ServerCreatePayload
   const name = p.name
-  const region = p.region || "nyc1"
-  const size = p.size || "s-1vcpu-1gb"
+  // Fallback chain: payload → settings (do_default_region/size) → legacy
+  // hardcode. Defensive in case any caller enqueues a job without
+  // explicit region/size (e.g. an internal handler that pre-dates the
+  // settings field).
+  const region = p.region || (getSetting("do_default_region") || "").trim() || "nyc1"
+  const size = p.size || (getSetting("do_default_size") || "").trim() || "s-1vcpu-1gb"
   try {
     const { createDroplet } = await import("../digitalocean")
     const { installAgentOnDroplet } = await import("../serveravatar")

@@ -68,6 +68,14 @@ export interface SettingsValues {
   max_droplets_per_hour: string
   sites_per_server: string
   cf_domains_per_key: string
+  /** Default DO region slug for new droplets + migration (e.g. "nyc1",
+   *  "blr1", "fra1"). Empty falls through to the legacy "nyc1" hardcode. */
+  do_default_region: string
+  /** Default DO size slug for new droplets + migration (e.g.
+   *  "s-1vcpu-1gb", "s-2vcpu-8gb-160gb-intel"). Empty falls through to
+   *  the legacy "s-1vcpu-1gb" hardcode for /api/servers/create and
+   *  "s-2vcpu-4gb" for SA-side create. */
+  do_default_size: string
   // booleans
   auto_migrate_enabled: boolean
   auto_cleanup_dead_servers: boolean

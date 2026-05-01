@@ -443,8 +443,12 @@ export async function createServer(opts: {
   size?: string
 }): Promise<{ saServerId: string; ip: string }> {
   const { serverName, serverIdDb } = opts
-  const region = opts.region ?? "nyc1"
-  const size = opts.size ?? "s-2vcpu-4gb"
+  // Fallback chain: explicit opts → settings (do_default_region/size) →
+  // legacy SA-side hardcode (s-2vcpu-4gb is a slightly heavier default
+  // than the create-route's s-1vcpu-1gb because SA-driven provisioning
+  // is for production servers, not throwaway smoke tests).
+  const region = opts.region ?? ((getSetting("do_default_region") || "").trim() || "nyc1")
+  const size = opts.size ?? ((getSetting("do_default_size") || "").trim() || "s-2vcpu-4gb")
   logPipeline(serverName, "sa_create", "running", `Creating server via ServerAvatar...`)
   try {
     const providerId = parseInt(getSetting("sa_cloud_provider_id") || "0", 10) || 0

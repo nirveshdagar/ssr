@@ -350,6 +350,76 @@ export default function SettingsPage() {
                   current cap.
                 </FieldDescription>
               </Field>
+
+              {/* Default droplet region + size — used by:
+                    • /servers → "New droplet" dialog (pre-fills both fields)
+                    • migration (manual + auto) when the operator doesn't
+                      override on the bulk-migrate dialog
+                    • any handler that enqueues server.create without an
+                      explicit region/size in the payload
+                  Empty = legacy hardcode (nyc1 / s-1vcpu-1gb for /api/servers/create,
+                  s-2vcpu-4gb for SA-driven create). */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <Field>
+                  <FieldLabel>
+                    <span className="inline-flex items-center gap-1.5">
+                      Default region
+                      <span className="rounded bg-status-running/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-status-running">
+                        new + migrate
+                      </span>
+                    </span>
+                  </FieldLabel>
+                  <Select
+                    value={get("do_default_region") || "__default__"}
+                    onValueChange={(v) => set("do_default_region", v === "__default__" ? "" : v)}
+                  >
+                    <SelectTrigger className="h-8 text-small"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__default__">(leave blank — uses nyc1)</SelectItem>
+                      <SelectItem value="nyc1">NYC1 — New York 1</SelectItem>
+                      <SelectItem value="nyc3">NYC3 — New York 3</SelectItem>
+                      <SelectItem value="sfo3">SFO3 — San Francisco 3</SelectItem>
+                      <SelectItem value="ams3">AMS3 — Amsterdam 3</SelectItem>
+                      <SelectItem value="lon1">LON1 — London 1</SelectItem>
+                      <SelectItem value="fra1">FRA1 — Frankfurt 1</SelectItem>
+                      <SelectItem value="tor1">TOR1 — Toronto 1</SelectItem>
+                      <SelectItem value="sgp1">SGP1 — Singapore 1</SelectItem>
+                      <SelectItem value="blr1">BLR1 — Bangalore 1</SelectItem>
+                      <SelectItem value="syd1">SYD1 — Sydney 1</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <FieldDescription>
+                    Falls through to <code className="font-mono">nyc1</code> if blank. Override on
+                    the New droplet / Bulk migrate dialog as needed.
+                  </FieldDescription>
+                </Field>
+
+                <Field>
+                  <FieldLabel>Default size</FieldLabel>
+                  <Select
+                    value={get("do_default_size") || "__default__"}
+                    onValueChange={(v) => set("do_default_size", v === "__default__" ? "" : v)}
+                  >
+                    <SelectTrigger className="h-8 text-small"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__default__">(leave blank — uses s-1vcpu-1gb)</SelectItem>
+                      <SelectItem value="s-1vcpu-1gb">s-1vcpu-1gb · $4/mo · smoke test</SelectItem>
+                      <SelectItem value="s-1vcpu-2gb">s-1vcpu-2gb · $7/mo</SelectItem>
+                      <SelectItem value="s-2vcpu-2gb">s-2vcpu-2gb · $9/mo</SelectItem>
+                      <SelectItem value="s-2vcpu-4gb">s-2vcpu-4gb · $14/mo</SelectItem>
+                      <SelectItem value="s-2vcpu-4gb-amd">s-2vcpu-4gb-amd · $16/mo · AMD</SelectItem>
+                      <SelectItem value="s-2vcpu-8gb-160gb-intel">s-2vcpu-8gb-160gb-intel · $24/mo · prod default</SelectItem>
+                      <SelectItem value="s-4vcpu-8gb">s-4vcpu-8gb · $36/mo</SelectItem>
+                      <SelectItem value="s-4vcpu-16gb">s-4vcpu-16gb · $56/mo</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <FieldDescription>
+                    Falls through to <code className="font-mono">s-1vcpu-1gb</code> for the New
+                    droplet button and <code className="font-mono">s-2vcpu-4gb</code> for SA-driven
+                    create when blank. The Servers page New droplet dialog pre-fills with this value.
+                  </FieldDescription>
+                </Field>
+              </div>
             </FieldGroup>
           </SettingsSection>
 

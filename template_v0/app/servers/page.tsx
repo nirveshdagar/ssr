@@ -21,6 +21,7 @@ import {
 import { AppShell } from "@/components/ssr/app-shell"
 import { StatusBadge } from "@/components/ssr/status-badge"
 import { Button } from "@/components/ui/button"
+import { useSettings } from "@/hooks/use-settings"
 import { ButtonGroup, ButtonGroupSeparator } from "@/components/ui/button-group"
 import { Input } from "@/components/ui/input"
 import {
@@ -74,6 +75,11 @@ export default function ServersPage() {
   const [query, setQuery] = React.useState("")
   const [statusFilter, setStatusFilter] = React.useState<"all" | "active" | "dead" | "migrating">("all")
   const { rows: SERVERS, refresh } = useServers()
+  // Pull operator-set defaults for the New droplet dialog so the region
+  // and size start as whatever /settings → DigitalOcean → "Default
+  // region" + "Default size" specify, instead of always hardcoding nyc1
+  // / s-2vcpu-8gb-160gb-intel.
+  const { settings } = useSettings()
   const [busy, setBusy] = React.useState<string | null>(null)
   const [flash, setFlash] = React.useState<{ kind: "ok" | "err"; text: string } | null>(null)
 
@@ -267,7 +273,9 @@ export default function ServersPage() {
     }
   }
 
-  // New Droplet modal — region + size dropdowns
+  // New Droplet modal — region + size dropdowns. Defaults come from
+  // /settings → DigitalOcean and fall back to nyc1 / s-2vcpu-8gb-160gb-intel
+  // when the operator hasn't set a fleet-wide default.
   const [newOpen, setNewOpen] = React.useState(false)
   const [newName, setNewName] = React.useState("")
   const [newRegion, setNewRegion] = React.useState("nyc1")
@@ -276,7 +284,9 @@ export default function ServersPage() {
   function openNewDroplet() {
     setNewOpen(true)
     setNewName(`ssr-${Math.floor(Date.now() / 1000)}`)
-    setNewRegion("nyc1"); setNewSize("s-2vcpu-8gb-160gb-intel"); setNewResult(null)
+    setNewRegion(((settings?.do_default_region) || "").trim() || "nyc1")
+    setNewSize(((settings?.do_default_size) || "").trim() || "s-2vcpu-8gb-160gb-intel")
+    setNewResult(null)
   }
   async function submitNewDroplet() {
     if (!newName.trim()) { setNewResult({ kind: "err", text: "Name is required" }); return }
