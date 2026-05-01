@@ -31,7 +31,7 @@ import { appendAudit } from "./repos/audit"
 import { isRetryableError } from "./status-taxonomy"
 import { isPipelineRunning, runFullPipeline } from "./pipeline"
 import { getZoneStatus } from "./cloudflare"
-import { all } from "./db"
+import { all, one } from "./db"
 
 // ---------------------------------------------------------------------------
 // 1. Reconcile orphan servers from SA
@@ -457,15 +457,41 @@ export async function checkOriginCerts(): Promise<SslSweepResult> {
   for (const r of rows) {
     if (!r.current_proxy_ip) continue
     result.checked++
+    // Probe with retry-on-mismatch. The SA UI cert install isn't atomic —
+    // it writes the CA bundle, triggers an Apache reload (which fails
+    // mod_ssl init briefly), then writes the leaf cert + key, then reloads
+    // again (which succeeds). For ~30-60s in between, Apache serves the
+    // default vhost cert as a fallback. If our verify probe hits that
+    // window, we get a false-positive mismatch and trigger ANOTHER install,
+    // repeat infinitely. The retry-with-backoff catches the race: by the
+    // time the third probe fires (~60s after the first), any in-progress
+    // install has settled. Only persistent mismatch reaches the auto-fix.
     let probe
+    let probeAttempts = 0
+    const RETRY_DELAYS_MS = [15_000, 45_000]  // 0s, +15s, +60s total
     try {
-      probe = await verifyOriginCertIsCustom(r.current_proxy_ip, r.domain, 8000)
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        probeAttempts++
+        probe = await verifyOriginCertIsCustom(r.current_proxy_ip, r.domain, 8000)
+        if (probe.ok !== false) break
+        const nextDelay = RETRY_DELAYS_MS[probeAttempts - 1]
+        if (nextDelay === undefined) break
+        logPipeline(r.domain, "ssl_verify", "running",
+          `Mismatch on probe #${probeAttempts} (might be install-race) — ` +
+          `retrying in ${Math.round(nextDelay / 1000)}s before declaring real mismatch.`)
+        await new Promise((res) => setTimeout(res, nextDelay))
+      }
     } catch (e) {
       logPipeline(r.domain, "ssl_verify", "warning",
         `Origin probe threw: ${(e as Error).message.slice(0, 160)}`)
       continue
     }
     if (probe.ok === true) {
+      if (probeAttempts > 1) {
+        logPipeline(r.domain, "ssl_verify", "completed",
+          `Cert verified on probe #${probeAttempts} — earlier mismatch was an install-race, no fix needed.`)
+      }
       updateDomain(r.domain, {
         ssl_origin_ok: 1,
         ssl_last_verified_at: nowIso,
@@ -477,7 +503,7 @@ export async function checkOriginCerts(): Promise<SslSweepResult> {
         `Origin probe inconclusive: ${probe.message}`)
       continue
     }
-    // probe.ok === false → wrong cert is serving
+    // probe.ok === false after all retries → genuine mismatch
     updateDomain(r.domain, {
       ssl_origin_ok: 0,
       ssl_last_verified_at: nowIso,
@@ -500,29 +526,77 @@ export async function checkOriginCerts(): Promise<SslSweepResult> {
     // Auto-fix: re-run pipeline from step 8 to re-issue + install SSL on
     // the same server. Skips if a recent in-flight pipeline.full job
     // for this domain is queued or running (avoid stacking retries).
+    //
+    // Hard cap: if we've already audit-logged N ssl_origin_mismatch entries
+    // for this domain in the last 60 min, the install isn't actually
+    // fixing the problem — it's a server-side issue (Apache vhost config,
+    // SA agent broken, etc.). Stop firing reinstalls forever and surface
+    // a hard warning so the operator notices instead of letting it loop
+    // overnight burning DO/SA cycles. Reset only when probe.ok=true (the
+    // cert actually serves correctly) — that path doesn't reach here.
     if (autoFixEnabled) {
-      const inflight = all<{ id: number }>(
-        `SELECT id FROM jobs
-          WHERE kind = 'pipeline.full'
-            AND status IN ('queued', 'running')
-            AND payload_json LIKE ?`,
-        `%"domain":"${r.domain}"%`,
-      )
-      if (inflight.length === 0) {
-        const { enqueueJob } = await import("./jobs")
-        const jobId = enqueueJob("pipeline.full", {
-          domain: r.domain,
-          skip_purchase: true,
-          server_id: r.server_id,
-          start_from: 8,        // Re-issue + install SSL only
-          force_new_server: false,
-        }, 1)
-        result.enqueuedReinstalls.push({ domain: r.domain, jobId })
-        logPipeline(r.domain, "ssl_verify", "running",
-          `Auto-fix: enqueued pipeline.full from step 8 (job ${jobId}) to re-install SSL.`)
-      } else {
+      const MAX_REINSTALLS_PER_HOUR = Number.parseInt(
+        process.env.SSR_SSL_MAX_AUTOFIX_PER_HOUR ?? "", 10,
+      ) || 3
+      const recentMismatches = (one<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM audit_log
+          WHERE action = 'ssl_origin_mismatch'
+            AND target = ?
+            AND created_at >= datetime('now', '-60 minutes')`,
+        r.domain,
+      )?.n ?? 0)
+      if (recentMismatches >= MAX_REINSTALLS_PER_HOUR) {
         logPipeline(r.domain, "ssl_verify", "warning",
-          `Mismatch detected but pipeline.full is already queued/running for this domain — skipping auto-fix to avoid stacking.`)
+          `Persistent cert mismatch — ${recentMismatches} in last 60 min. ` +
+          `Auto-fix DISABLED for this domain until the issuer flips ` +
+          `(reinstall isn't fixing it; check Apache vhost config / SA ` +
+          `agent on server #${r.server_id} via apachectl -S).`)
+        try {
+          appendAudit(
+            "ssl_origin_autofix_giveup", r.domain,
+            `count=${recentMismatches}/60min  server_id=${r.server_id}  ` +
+            `subject="${probe.subjectCN ?? "?"}" issuer="${probe.issuerCN ?? "?"}"`,
+            null,
+          )
+        } catch { /* ignore */ }
+        // Skip both the inflight check AND the enqueue — the operator
+        // will see the warning + audit entry and intervene manually.
+        try {
+          const { notify } = await import("./notify")
+          await notify(
+            `SSL persistent mismatch (${r.domain})`,
+            `Auto-fix gave up after ${recentMismatches} re-installs in 60 min ` +
+            `did not flip the issuer. Server #${r.server_id} (${r.current_proxy_ip}) ` +
+            `is serving "${probe.subjectCN ?? "?"}" instead of CF Origin CA. ` +
+            `Likely Apache vhost config or SA agent issue — manual intervention required.`,
+            { severity: "error", dedupeKey: `ssl_autofix_giveup:${r.domain}` },
+          )
+        } catch { /* notify is best-effort */ }
+      } else {
+        const inflight = all<{ id: number }>(
+          `SELECT id FROM jobs
+            WHERE kind = 'pipeline.full'
+              AND status IN ('queued', 'running')
+              AND payload_json LIKE ?`,
+          `%"domain":"${r.domain}"%`,
+        )
+        if (inflight.length === 0) {
+          const { enqueueJob } = await import("./jobs")
+          const jobId = enqueueJob("pipeline.full", {
+            domain: r.domain,
+            skip_purchase: true,
+            server_id: r.server_id,
+            start_from: 8,        // Re-issue + install SSL only
+            force_new_server: false,
+          }, 1)
+          result.enqueuedReinstalls.push({ domain: r.domain, jobId })
+          logPipeline(r.domain, "ssl_verify", "running",
+            `Auto-fix: enqueued pipeline.full from step 8 (job ${jobId}) ` +
+            `to re-install SSL (attempt ${recentMismatches + 1}/${MAX_REINSTALLS_PER_HOUR}).`)
+        } else {
+          logPipeline(r.domain, "ssl_verify", "warning",
+            `Mismatch detected but pipeline.full is already queued/running for this domain — skipping auto-fix to avoid stacking.`)
+        }
       }
     }
 
@@ -824,6 +898,29 @@ export interface AutoHealTickResult {
 
 export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
   const ranAt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z")
+
+  // Operator pause switch — when settings.auto_heal_paused = '1', the entire
+  // tick early-returns. Lets the operator stop a runaway reinstall loop or
+  // any other auto-heal misbehavior without restarting the dev server. Read
+  // on every tick so toggling it takes effect within one interval (default
+  // 5 min).
+  try {
+    const { getSetting } = await import("./repos/settings")
+    if ((getSetting("auto_heal_paused") || "").trim() === "1") {
+      return {
+        ranAt,
+        reconcile: { error: "paused" },
+        resume: { error: "paused" },
+        ns: { error: "paused" },
+        retry: { error: "paused" },
+        brokenSsl: { error: "paused" },
+        saHealth: { error: "paused" },
+        stuckCreating: { error: "paused" },
+        sslSweep: { error: "paused" },
+        downAutoFix: { error: "paused" },
+      }
+    }
+  } catch { /* if settings read fails, just proceed normally */ }
 
   let reconcile: ReconcileResult | { error: string }
   let claimedIds: number[] = []

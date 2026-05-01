@@ -22,6 +22,7 @@
 import { all, getDb, one, run } from "./db"
 import { getSetting } from "./repos/settings"
 import { logPipeline } from "./repos/logs"
+import { isPipelineRunning } from "./pipeline"
 
 // Concurrent HTTPS probe cap — keeps a 60-domain fleet under ~10s/tick even
 // when many timeout. Without bounding, 60 simultaneous fetches would flood
@@ -169,16 +170,41 @@ interface DomainProbeRow {
 }
 
 async function tick(): Promise<void> {
-  const rows = all<DomainProbeRow>(
+  const allRows = all<DomainProbeRow>(
     `SELECT domain, status, server_id FROM domains WHERE status IN ('hosted', 'live')`,
   )
-  if (rows.length === 0) {
+  if (allRows.length === 0) {
     // No active hosted/live domains — clear all streak entries so deleted
     // domains don't linger in module memory until process restart.
     streakUp.clear()
     streakDown.clear()
     return
   }
+  // Pipeline-aware skip — when a pipeline is currently running on a domain
+  // (e.g. a UI cert install is mid-cycle and Apache is briefly down for
+  // the cert swap), we MUST NOT count probe failures toward the streak.
+  // Otherwise we false-positive flip live → hosted on every cert reinstall
+  // and the dashboard fills with "OFFLINE" warnings for sites that are
+  // actually fine; the pipeline owns the domain's status during its own
+  // runs. Reset both streak counters for skipped domains so a stale
+  // failure from an earlier tick doesn't carry over once the pipeline
+  // finishes.
+  const skipped: string[] = []
+  const rows = allRows.filter((r) => {
+    if (isPipelineRunning(r.domain)) {
+      skipped.push(r.domain)
+      streakUp.delete(r.domain)
+      streakDown.delete(r.domain)
+      return false
+    }
+    return true
+  })
+  if (skipped.length > 0) {
+    logPipeline("(live-checker)", "live_check", "running",
+      `Skipped ${skipped.length} domain(s) under active pipeline: ${skipped.slice(0, 5).join(", ")}` +
+      (skipped.length > 5 ? `, +${skipped.length - 5} more` : ""))
+  }
+  if (rows.length === 0) return
   // GC stale streak entries — domains deleted between ticks shouldn't linger.
   // Build active set from this tick's rows and prune anything not in it.
   const active = new Set<string>(rows.map((r) => r.domain))
