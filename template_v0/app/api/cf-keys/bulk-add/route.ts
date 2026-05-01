@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { addCfKey } from "@/lib/cf-key-pool"
+import { findExistingEmails } from "@/lib/repos/cf-keys"
 import { appendAudit } from "@/lib/repos/audit"
 
 export const runtime = "nodejs"
@@ -78,9 +79,21 @@ export async function POST(req: NextRequest): Promise<Response> {
     )
   }
 
+  // Pre-flight dedup against the existing pool. At 500-key scale, the
+  // operator's CSV will absolutely contain rows that were already imported
+  // in a previous run; we don't want to burn a 15s CF /accounts probe per
+  // dupe just to learn it then explodes on the unique-constraint INSERT
+  // with a vague message.
+  const existing = findExistingEmails(rows.map((r) => r.email))
+
   const results: ResultRow[] = []
   for (const r of rows) {
     const result: ResultRow = { email: r.email, alias: r.alias, ok: false }
+    if (existing.has(r.email)) {
+      result.error = "already in pool"
+      results.push(result)
+      continue
+    }
     // Per-row verify via CF /accounts. Same as single-add — surface CF's
     // own error verbatim so the operator can fix typos / wrong-account-type.
     let acctId = ""
@@ -117,25 +130,31 @@ export async function POST(req: NextRequest): Promise<Response> {
       result.id = id
     } catch (e) {
       const msg = (e as Error).message
-      result.error = /already exists/.test(msg) ? "already exists" : msg
+      // Race-only fallback: another caller could still slip a dupe in
+      // between our pre-flight SELECT and the INSERT. Treat the same way.
+      result.error = /already exists/.test(msg) ? "already in pool" : msg
     }
     results.push(result)
   }
 
   const added = results.filter((r) => r.ok).length
-  const errored = results.length - added
+  const duplicates = results.filter((r) => r.error === "already in pool").length
+  const errored = results.length - added - duplicates
   appendAudit(
     "cf_key_bulk_add", "",
-    `submitted=${rows.length} added=${added} errored=${errored}`,
+    `submitted=${rows.length} added=${added} duplicates=${duplicates} errored=${errored}`,
     ip,
   )
   return NextResponse.json({
     ok: true,
     submitted: rows.length,
     added,
+    duplicates,
     errored,
     results,
-    message: `Added ${added}/${rows.length} CF key(s)` + (errored > 0 ? `; ${errored} failed` : ""),
+    message: `Added ${added}/${rows.length} CF key(s)` +
+      (duplicates > 0 ? `; ${duplicates} already in pool` : "") +
+      (errored > 0 ? `; ${errored} failed` : ""),
   })
 }
 

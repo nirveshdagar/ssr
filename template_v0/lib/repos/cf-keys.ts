@@ -11,6 +11,8 @@ export interface CfKeyRow {
   is_active: number
   created_at: string
   last_used_at: string | null
+  last_error: string | null
+  last_error_at: string | null
 }
 
 export interface CfKeyWithPreview extends CfKeyRow {
@@ -40,6 +42,8 @@ interface RawPreviewRow {
   is_active: number
   created_at: string
   last_used_at: string | null
+  last_error: string | null
+  last_error_at: string | null
   api_key: string
   domains_count: number
 }
@@ -48,7 +52,7 @@ export function listCfKeysWithPreview(): CfKeyWithPreview[] {
   const rows = all<RawPreviewRow>(`
     SELECT k.id, k.email, k.alias, k.cf_account_id,
            k.domains_used, k.max_domains, k.is_active,
-           k.created_at, k.last_used_at, k.api_key,
+           k.created_at, k.last_used_at, k.last_error, k.last_error_at, k.api_key,
            (SELECT COUNT(*) FROM domains d WHERE d.cf_key_id = k.id) AS domains_count
       FROM cf_keys k
      ORDER BY k.id ASC
@@ -63,6 +67,8 @@ export function listCfKeysWithPreview(): CfKeyWithPreview[] {
     is_active: r.is_active,
     created_at: r.created_at,
     last_used_at: r.last_used_at,
+    last_error: r.last_error,
+    last_error_at: r.last_error_at,
     domains_count: r.domains_count,
     key_preview: previewCredential(decrypt(r.api_key)),
   }))
@@ -141,4 +147,97 @@ export function editCfKey(id: number, alias: string | null, max_domains: number)
     max_domains,
     id,
   )
+}
+
+/**
+ * Set last_error + last_error_at on a CF key row. Pass null to clear.
+ * Truncates msg to 500 chars to keep the column tame for grids.
+ */
+export function setCfKeyLastError(id: number, msg: string | null): void {
+  if (msg === null) {
+    run("UPDATE cf_keys SET last_error = NULL, last_error_at = NULL WHERE id = ?", id)
+    return
+  }
+  const trimmed = msg.length > 500 ? msg.slice(0, 497) + "..." : msg
+  run(
+    "UPDATE cf_keys SET last_error = ?, last_error_at = datetime('now') WHERE id = ?",
+    trimmed,
+    id,
+  )
+}
+
+/**
+ * Bulk update fields on a set of CF key ids. Returns count updated.
+ *
+ * For alias_pattern, the caller has already substituted {n} placeholders so
+ * we receive parallel arrays (ids[i] gets aliases[i]). Per-row in a single
+ * IMMEDIATE transaction so a partial failure doesn't leave half-applied
+ * pattern aliases.
+ */
+export function bulkEditCfKeys(opts: {
+  ids: number[]
+  alias?: (string | null)[]
+  max_domains?: number
+  is_active?: 0 | 1
+}): { updated: number; missing: number[] } {
+  const { ids, alias, max_domains, is_active } = opts
+  if (ids.length === 0) return { updated: 0, missing: [] }
+  if (alias && alias.length !== ids.length) {
+    throw new Error("bulkEditCfKeys: alias[] length must match ids[] length")
+  }
+
+  const db = getDb()
+  db.exec("BEGIN IMMEDIATE")
+  try {
+    const exists = db.prepare("SELECT 1 FROM cf_keys WHERE id = ?")
+    const upAlias = db.prepare("UPDATE cf_keys SET alias = ? WHERE id = ?")
+    const upMax = db.prepare("UPDATE cf_keys SET max_domains = ? WHERE id = ?")
+    const upActive = db.prepare("UPDATE cf_keys SET is_active = ? WHERE id = ?")
+
+    let updated = 0
+    const missing: number[] = []
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i]
+      if (!exists.get(id)) { missing.push(id); continue }
+      if (alias) upAlias.run(alias[i], id)
+      if (max_domains !== undefined) upMax.run(max_domains, id)
+      if (is_active !== undefined) upActive.run(is_active, id)
+      updated++
+    }
+    db.exec("COMMIT")
+    return { updated, missing }
+  } catch (e) {
+    try { db.exec("ROLLBACK") } catch { /* ignore */ }
+    throw e
+  }
+}
+
+/**
+ * Substitute {n} or {n:0K} placeholders in `pattern` with `start + i`. Used
+ * by bulk-rename so the operator can apply "CF-{n:03}" across N selected
+ * rows and get CF-001, CF-002, ...
+ */
+export function applyAliasPattern(pattern: string, count: number, start = 1): string[] {
+  const out: string[] = []
+  for (let i = 0; i < count; i++) {
+    const n = start + i
+    out.push(
+      pattern.replace(/\{n(?::0(\d+))?\}/g, (_m, padRaw) => {
+        const pad = padRaw ? Number.parseInt(padRaw, 10) : 0
+        return pad > 0 ? String(n).padStart(pad, "0") : String(n)
+      }),
+    )
+  }
+  return out
+}
+
+/** Existence check + dedup helper for bulk-add pre-flight. */
+export function findExistingEmails(emails: string[]): Set<string> {
+  if (emails.length === 0) return new Set()
+  const placeholders = emails.map(() => "?").join(",")
+  const rows = all<{ email: string }>(
+    `SELECT email FROM cf_keys WHERE email IN (${placeholders})`,
+    ...emails,
+  )
+  return new Set(rows.map((r) => r.email))
 }

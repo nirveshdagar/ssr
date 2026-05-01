@@ -111,7 +111,9 @@ const CREATE_TABLES = `
     max_domains     INTEGER NOT NULL DEFAULT 20,
     is_active       INTEGER NOT NULL DEFAULT 1,
     created_at      TEXT DEFAULT (datetime('now')),
-    last_used_at    TEXT
+    last_used_at    TEXT,
+    last_error      TEXT,
+    last_error_at   TEXT
   );
 
   CREATE TABLE IF NOT EXISTS cf_workers_ai_keys (
@@ -264,6 +266,12 @@ function applyMigrations(db: DatabaseSync): void {
   //               NULL = probe failed or content check was skipped
   tryAlter(db, "ALTER TABLE domains ADD COLUMN content_ok INTEGER")
   tryAlter(db, "ALTER TABLE domains ADD COLUMN content_checked_at TEXT")
+  // CF key health surfacing — stores the most recent failure reason from a
+  // CF API call (refresh-status probe, verify-accounts, etc.) so operators
+  // managing 500+ keys can spot broken ones in the Issues column without
+  // expanding each row.
+  tryAlter(db, "ALTER TABLE cf_keys ADD COLUMN last_error TEXT")
+  tryAlter(db, "ALTER TABLE cf_keys ADD COLUMN last_error_at TEXT")
 }
 
 /**

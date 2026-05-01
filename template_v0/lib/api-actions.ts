@@ -130,6 +130,9 @@ export const domainActions = {
       /** When true, step 9 ignores the cached site_html and re-runs the
        *  LLM. Used by the AI Generator's Regenerate flow. */
       forceRegen?: boolean
+      /** Per-run override of the system/master prompt — wins over the
+       *  global llm_master_prompt setting for THIS pipeline run only. */
+      customMasterPrompt?: string | null
     } = {},
   ): Promise<ActionResult> => {
     try {
@@ -142,6 +145,7 @@ export const domainActions = {
           custom_prompt: opts.customPrompt ?? undefined,
           custom_provider: opts.customProvider ?? undefined,
           custom_model: opts.customModel ?? undefined,
+          custom_master_prompt: opts.customMasterPrompt ?? undefined,
           force_regen: opts.forceRegen ? "on" : undefined,
         }),
       })
@@ -325,6 +329,33 @@ export const cfKeyActions = {
   /** Bulk delete — checks per-row that no domain still references the key. */
   bulkDelete: (ids: number[]) =>
     fetch("/api/cf-keys/bulk-delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ ids }),
+    }).then(async (r) => ({ ok: r.ok, ...((await r.json()) as Record<string, unknown>) })),
+  /** Bulk edit selected keys: any combo of max_domains, is_active, alias_pattern. */
+  bulkEdit: (
+    ids: number[],
+    fields: { max_domains?: number; is_active?: 0 | 1; alias_pattern?: string; alias_start?: number },
+  ) =>
+    fetch("/api/cf-keys/bulk-edit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ ids, ...fields }),
+    }).then(async (r) => ({ ok: r.ok, ...((await r.json()) as Record<string, unknown>) })),
+  /** Probe domains under selected keys and flip status decisively. Persists last_error on failures. */
+  bulkRefreshStatus: (ids: number[]) =>
+    fetch("/api/cf-keys/bulk-refresh-status", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ ids }),
+    }).then(async (r) => ({ ok: r.ok, ...((await r.json()) as Record<string, unknown>) })),
+  /** Re-fetch CF /accounts for selected keys; persists last_error on failures. */
+  bulkVerifyAccounts: (ids: number[]) =>
+    fetch("/api/cf-keys/bulk-verify-accounts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "same-origin",

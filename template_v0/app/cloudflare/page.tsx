@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { useRouter, useSearchParams } from "next/navigation"
 import {
   Plus,
   RefreshCw,
@@ -20,6 +21,17 @@ import {
   Info,
   CloudOff,
   FileUp,
+  Pause,
+  Play,
+  Edit3,
+  Download,
+  AlertTriangle,
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
+  ChevronsLeft,
+  ChevronsRight,
+  ChevronLeft,
 } from "lucide-react"
 import { AppShell } from "@/components/ssr/app-shell"
 import { StatusBadge } from "@/components/ssr/status-badge"
@@ -88,7 +100,83 @@ interface ZonesListResult {
   error?: string
 }
 
+type FilterChip = "all" | "active" | "paused" | "exhausted" | "idle"
+type SortKey = "alias" | "email" | "domains" | "rate" | "lastUsed" | "status" | "issue"
+type SortDir = "asc" | "desc"
+const VALID_FILTERS: FilterChip[] = ["all", "active", "paused", "exhausted", "idle"]
+const VALID_SORTS: SortKey[] = ["alias", "email", "domains", "rate", "lastUsed", "status", "issue"]
+const VALID_PAGE_SIZES = [25, 50, 100, 200] as const
+
+/** Inline sort-toggle for a column header. Active column shows direction arrow;
+ *  inactive columns show a faint up/down hint so the affordance is discoverable. */
+function SortBtn(props: {
+  k: SortKey
+  cur: SortKey
+  dir: SortDir
+  onClick: (k: SortKey) => void
+  alignRight?: boolean
+  children: React.ReactNode
+}) {
+  const active = props.cur === props.k
+  const Icon = !active ? ArrowUpDown : props.dir === "asc" ? ArrowUp : ArrowDown
+  return (
+    <button
+      type="button"
+      onClick={() => props.onClick(props.k)}
+      className={cn(
+        "inline-flex items-center gap-1 rounded text-inherit hover:text-foreground transition-colors",
+        props.alignRight && "justify-end",
+        active ? "text-foreground" : "text-muted-foreground",
+      )}
+      title={`Sort by ${String(props.k)}${active ? ` (${props.dir})` : ""}`}
+    >
+      <span>{props.children}</span>
+      <Icon className={cn("h-3 w-3", active ? "opacity-100" : "opacity-40")} />
+    </button>
+  )
+}
+
 export default function CloudflarePage() {
+  const router = useRouter()
+  const searchParams = useSearchParams()
+
+  // ---- URL-synced state — survives reload, bookmarkable, shareable. ----
+  // The setters below patch the URL via router.replace + scroll: false so
+  // page state changes don't yank the operator back to the top.
+  const search = searchParams.get("q") ?? ""
+  const filter: FilterChip = (() => {
+    const v = searchParams.get("filter")
+    return (VALID_FILTERS as string[]).includes(v ?? "") ? (v as FilterChip) : "all"
+  })()
+  const sortKey: SortKey = (() => {
+    const v = searchParams.get("sort")
+    return (VALID_SORTS as string[]).includes(v ?? "") ? (v as SortKey) : "alias"
+  })()
+  const sortDir: SortDir = (searchParams.get("dir") === "desc" ? "desc" : "asc")
+  const page = Math.max(1, Number.parseInt(searchParams.get("page") ?? "1", 10) || 1)
+  const pageSize = (() => {
+    const v = Number.parseInt(searchParams.get("per") ?? "50", 10)
+    return (VALID_PAGE_SIZES as readonly number[]).includes(v) ? v : 50
+  })()
+
+  function patchUrl(patch: Record<string, string | number | null>): void {
+    const next = new URLSearchParams(searchParams.toString())
+    for (const [k, v] of Object.entries(patch)) {
+      if (v === null || v === "" || v === undefined) next.delete(k)
+      else next.set(k, String(v))
+    }
+    const qs = next.toString()
+    router.replace(qs ? `?${qs}` : "?", { scroll: false })
+  }
+  const setSearch = (v: string) => patchUrl({ q: v || null, page: null })
+  const setFilter = (v: FilterChip) => patchUrl({ filter: v === "all" ? null : v, page: null })
+  const setSort = (k: SortKey) => {
+    if (k === sortKey) patchUrl({ dir: sortDir === "asc" ? "desc" : "asc" })
+    else patchUrl({ sort: k, dir: "asc" })
+  }
+  const setPage = (n: number) => patchUrl({ page: n <= 1 ? null : n })
+  const setPageSize = (n: number) => patchUrl({ per: n === 50 ? null : n, page: null })
+
   const [expanded, setExpanded] = React.useState<string | null>(null)
   const [selected, setSelected] = React.useState<Set<string>>(new Set())
   // Row-level checkbox selection of CF KEYS (separate from `selected` which
@@ -98,7 +186,6 @@ export default function CloudflarePage() {
   const { rows: CF_KEYS, domainsByKey, refresh } = useCfKeys()
   const [busy, setBusy] = React.useState<string | null>(null)
   const [flash, setFlash] = React.useState<{ kind: "ok" | "err"; text: string } | null>(null)
-  const [search, setSearch] = React.useState("")
 
   function show(kind: "ok" | "err", text: string) {
     setFlash({ kind, text })
@@ -281,7 +368,12 @@ export default function CloudflarePage() {
   const [bulkAddText, setBulkAddText] = React.useState("")
   const [bulkAddFile, setBulkAddFile] = React.useState<File | null>(null)
   const [bulkAddResult, setBulkAddResult] = React.useState<
-    { added: number; errored: number; results: { email: string; ok: boolean; error?: string }[] } | null
+    {
+      added: number
+      duplicates: number
+      errored: number
+      results: { email: string; ok: boolean; error?: string }[]
+    } | null
   >(null)
   function openBulkAdd() {
     setBulkAddText("")
@@ -296,14 +388,17 @@ export default function CloudflarePage() {
     }
     setBusy("bulk-add")
     const r = await cfKeyActions.bulkAddCsv(bulkAddText, bulkAddFile ?? undefined) as
-      { ok?: boolean; submitted?: number; added?: number; errored?: number;
+      { ok?: boolean; submitted?: number; added?: number; duplicates?: number; errored?: number;
         results?: { email: string; ok: boolean; error?: string }[]; error?: string; message?: string }
     if (!r.ok) {
       show("err", r.error ?? "Bulk add failed")
     } else {
       show(r.errored && r.errored > 0 ? "err" : "ok", r.message ?? "")
       setBulkAddResult({
-        added: r.added ?? 0, errored: r.errored ?? 0, results: r.results ?? [],
+        added: r.added ?? 0,
+        duplicates: r.duplicates ?? 0,
+        errored: r.errored ?? 0,
+        results: r.results ?? [],
       })
     }
     await refresh()
@@ -450,18 +545,195 @@ export default function CloudflarePage() {
     setSelected(next)
   }
 
-  // ---- Search filter — matches alias, email, account id, OR any assigned domain
+  // ---- Search + filter chip + sort. Pagination applied separately so the
+  //      sort label can read the full filtered length even when paged.
   const filteredKeys = React.useMemo(() => {
     const q = search.trim().toLowerCase()
-    if (!q) return CF_KEYS
-    return CF_KEYS.filter((k) => {
-      if (k.label.toLowerCase().includes(q)) return true
-      if (k.email.toLowerCase().includes(q)) return true
-      if (k.accountId.toLowerCase().includes(q)) return true
-      const doms = domainsByKey[Number(k.id)] ?? []
-      return doms.some((d) => d.domain.toLowerCase().includes(q))
+    let rows = CF_KEYS
+    if (q) {
+      rows = rows.filter((k) => {
+        if (k.label.toLowerCase().includes(q)) return true
+        if (k.email.toLowerCase().includes(q)) return true
+        if (k.accountId.toLowerCase().includes(q)) return true
+        if (k.lastError.toLowerCase().includes(q)) return true
+        const doms = domainsByKey[Number(k.id)] ?? []
+        return doms.some((d) => d.domain.toLowerCase().includes(q))
+      })
+    }
+    if (filter !== "all") {
+      rows = rows.filter((k) => {
+        if (filter === "active") return k.isActive && k.status !== "exhausted"
+        if (filter === "paused") return !k.isActive
+        if (filter === "exhausted") return k.rateLimitUsed >= 90
+        if (filter === "idle") return k.domains === 0
+        return true
+      })
+    }
+    // Sort. String columns lower-cased; numeric columns compared numerically;
+    // ISO timestamps compared as strings (ISO sorts lexically). Issue column
+    // sorts presence first (rows WITH an error before rows without when desc).
+    const dir = sortDir === "asc" ? 1 : -1
+    const sorted = [...rows].sort((a, b) => {
+      let cmp = 0
+      switch (sortKey) {
+        case "alias": cmp = (a.alias || a.email).localeCompare(b.alias || b.email); break
+        case "email": cmp = a.email.localeCompare(b.email); break
+        case "domains": cmp = a.domains - b.domains; break
+        case "rate": cmp = a.rateLimitUsed - b.rateLimitUsed; break
+        case "lastUsed": cmp = (a.lastUsed === "—" ? "" : a.lastUsed)
+          .localeCompare(b.lastUsed === "—" ? "" : b.lastUsed); break
+        case "status": cmp = a.status.localeCompare(b.status); break
+        case "issue": cmp = (a.lastError ? 1 : 0) - (b.lastError ? 1 : 0); break
+      }
+      if (cmp === 0) cmp = Number(a.id) - Number(b.id)
+      return cmp * dir
     })
-  }, [CF_KEYS, domainsByKey, search])
+    return sorted
+  }, [CF_KEYS, domainsByKey, search, filter, sortKey, sortDir])
+
+  // Pagination — clamp page if filter shrunk the dataset under us.
+  const totalPages = Math.max(1, Math.ceil(filteredKeys.length / pageSize))
+  const safePage = Math.min(page, totalPages)
+  const pagedKeys = React.useMemo(() => {
+    const start = (safePage - 1) * pageSize
+    return filteredKeys.slice(start, start + pageSize)
+  }, [filteredKeys, safePage, pageSize])
+
+  // Filter chip counts — surface in chip labels so the operator sees how many
+  // rows each chip will show without clicking through every one.
+  const counts = React.useMemo(() => ({
+    all: CF_KEYS.length,
+    active: CF_KEYS.filter((k) => k.isActive && k.status !== "exhausted").length,
+    paused: CF_KEYS.filter((k) => !k.isActive).length,
+    exhausted: CF_KEYS.filter((k) => k.rateLimitUsed >= 90).length,
+    idle: CF_KEYS.filter((k) => k.domains === 0).length,
+    withError: CF_KEYS.filter((k) => k.lastError).length,
+  }), [CF_KEYS])
+
+  // ---- Bulk-edit max_domains dialog ----
+  const [bulkMaxOpen, setBulkMaxOpen] = React.useState(false)
+  const [bulkMaxValue, setBulkMaxValue] = React.useState("20")
+  const [bulkMaxResult, setBulkMaxResult] = React.useState<{ kind: "ok" | "err"; text: string } | null>(null)
+  function openBulkMax() {
+    if (keysSelected.size === 0) return
+    setBulkMaxValue("20")
+    setBulkMaxResult(null)
+    setBulkMaxOpen(true)
+  }
+  async function submitBulkMax() {
+    const max = Number.parseInt(bulkMaxValue, 10)
+    if (!Number.isFinite(max) || max < 1 || max > 1000) {
+      setBulkMaxResult({ kind: "err", text: "max_domains must be 1..1000" }); return
+    }
+    setBusy("bulk-max")
+    const r = await cfKeyActions.bulkEdit([...keysSelected], { max_domains: max }) as
+      { ok?: boolean; updated?: number; submitted?: number; message?: string; error?: string }
+    if (r.ok) {
+      setBulkMaxOpen(false)
+      show("ok", r.message ?? `Updated ${r.updated}/${r.submitted} key(s)`)
+      await refresh()
+    } else {
+      setBulkMaxResult({ kind: "err", text: r.error ?? "Bulk edit failed" })
+    }
+    setBusy(null)
+  }
+
+  // ---- Bulk-rename pattern dialog ----
+  const [bulkRenameOpen, setBulkRenameOpen] = React.useState(false)
+  const [renamePattern, setRenamePattern] = React.useState("CF-{n:03}")
+  const [renameStart, setRenameStart] = React.useState("1")
+  const [renameResult, setRenameResult] = React.useState<{ kind: "ok" | "err"; text: string } | null>(null)
+  function openBulkRename() {
+    if (keysSelected.size === 0) return
+    setRenamePattern("CF-{n:03}")
+    setRenameStart("1")
+    setRenameResult(null)
+    setBulkRenameOpen(true)
+  }
+  /** Live preview of the alias pattern — same logic as the server-side
+   *  applyAliasPattern(). Shown in the dialog so operators see the result
+   *  before applying to all 500 selected rows. */
+  const renamePreview = React.useMemo(() => {
+    const start = Number.parseInt(renameStart || "1", 10) || 1
+    const count = Math.min(keysSelected.size, 5)
+    const out: string[] = []
+    for (let i = 0; i < count; i++) {
+      const n = start + i
+      out.push(renamePattern.replace(/\{n(?::0(\d+))?\}/g, (_m, padRaw) => {
+        const pad = padRaw ? Number.parseInt(padRaw, 10) : 0
+        return pad > 0 ? String(n).padStart(pad, "0") : String(n)
+      }))
+    }
+    return out
+  }, [renamePattern, renameStart, keysSelected.size])
+  async function submitBulkRename() {
+    if (!renamePattern.trim()) {
+      setRenameResult({ kind: "err", text: "Pattern is required" }); return
+    }
+    const start = Number.parseInt(renameStart || "1", 10)
+    if (!Number.isFinite(start) || start < 0) {
+      setRenameResult({ kind: "err", text: "Start must be a non-negative integer" }); return
+    }
+    setBusy("bulk-rename")
+    const r = await cfKeyActions.bulkEdit([...keysSelected], {
+      alias_pattern: renamePattern.trim(),
+      alias_start: start,
+    }) as { ok?: boolean; updated?: number; submitted?: number; message?: string; error?: string }
+    if (r.ok) {
+      setBulkRenameOpen(false)
+      show("ok", r.message ?? `Renamed ${r.updated}/${r.submitted} key(s)`)
+      await refresh()
+    } else {
+      setRenameResult({ kind: "err", text: r.error ?? "Bulk rename failed" })
+    }
+    setBusy(null)
+  }
+
+  // ---- Bulk pause/activate (sticky-bar buttons) ----
+  async function bulkSetActive(active: boolean) {
+    const ids = [...keysSelected]
+    if (ids.length === 0) return
+    if (!confirm(
+      `${active ? "Activate" : "Pause"} ${ids.length} CF key(s)?\n\n` +
+      (active
+        ? "Activated keys are eligible for new domain assignments."
+        : "Paused keys won't be picked for new domain assignments — existing domains keep working."),
+    )) return
+    setBusy(active ? "bulk-activate" : "bulk-pause")
+    const r = await cfKeyActions.bulkEdit(ids, { is_active: active ? 1 : 0 }) as
+      { ok?: boolean; updated?: number; submitted?: number; message?: string; error?: string }
+    show(r.ok ? "ok" : "err", r.message ?? r.error ?? "Bulk toggle failed")
+    await refresh()
+    setBusy(null)
+  }
+
+  // ---- Bulk refresh-status / verify-accounts (selected scope) ----
+  async function bulkRefreshSelected() {
+    const ids = [...keysSelected]
+    if (ids.length === 0) return
+    setBusy("bulk-refresh")
+    const r = await cfKeyActions.bulkRefreshStatus(ids) as
+      { ok?: boolean; keys_probed?: number; domains_probed?: number; flipped?: number;
+        errored?: number; message?: string; error?: string }
+    show(r.ok ? "ok" : "err", r.message ?? r.error ?? "Bulk refresh failed")
+    await refresh()
+    setBusy(null)
+  }
+  async function bulkVerifySelected() {
+    const ids = [...keysSelected]
+    if (ids.length === 0) return
+    if (!confirm(
+      `Re-verify CF /accounts for ${ids.length} selected key(s)? ` +
+      `Each key makes one CF API call (rate-limit friendly: 4 in flight at a time).`,
+    )) return
+    setBusy("bulk-verify")
+    const r = await cfKeyActions.bulkVerifyAccounts(ids) as
+      { ok?: boolean; verified?: number; submitted?: number; errored?: number;
+        message?: string; error?: string }
+    show(r.ok ? "ok" : "err", r.message ?? r.error ?? "Bulk verify failed")
+    await refresh()
+    setBusy(null)
+  }
 
   return (
     <AppShell
@@ -486,6 +758,16 @@ export default function CloudflarePage() {
             title="Walk every active CF key, list its zones, reconcile against the domains table — auto-backfills cf_zone_id when name matches CF, reports orphans + untracked zones for review"
           >
             <RefreshCw className={cn("h-3.5 w-3.5", busy === "cfsync" && "animate-spin")} /> Sync from CF
+          </Button>
+          <Button
+            asChild
+            variant="outline" size="sm"
+            className="gap-1.5 hidden sm:inline-flex btn-soft-info"
+            title="Download every CF key in the pool as CSV (api_key is masked, never exported in full)"
+          >
+            <a href="/api/cf-keys/export" download>
+              <Download className="h-3.5 w-3.5" /> Export CSV
+            </a>
           </Button>
           <Button
             variant="outline" size="sm"
@@ -564,11 +846,71 @@ export default function CloudflarePage() {
           </DataTableToolbar>
 
           {keysSelected.size > 0 && (
-            <div className="sticky top-[56px] z-10 -mx-1 mb-2 flex flex-wrap items-center gap-3 rounded-md border border-status-terminal/40 bg-status-terminal/5 px-3 py-2 text-small">
+            <div className="sticky top-[56px] z-10 -mx-1 mb-2 flex flex-wrap items-center gap-2 rounded-md border border-status-running/40 bg-status-running/5 px-3 py-2 text-small">
               <span className="font-medium">
                 {keysSelected.size} key{keysSelected.size === 1 ? "" : "s"} selected
               </span>
+              {/* Cross-page select-all: when only the current page is checked but
+                  more rows match the filter, expose a one-click "select all N"
+                  link. Critical at 500-key scale where the operator wants to bulk
+                  edit max_domains for all filtered keys, not just the visible 50. */}
+              {filteredKeys.length > keysSelected.size && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    setKeysSelected(new Set(filteredKeys.map((k) => Number(k.id))))
+                  }
+                  className="rounded border border-status-running/40 bg-status-running/10 px-2 py-0.5 text-micro text-status-running hover:bg-status-running/20"
+                  title="Add every row that matches the current search + filter to the selection (not just this page)"
+                >
+                  Select all {filteredKeys.length} matching
+                </button>
+              )}
               <span className="mx-1 h-4 w-px bg-border" aria-hidden />
+              <Button
+                size="sm" variant="outline" className="gap-1.5"
+                onClick={openBulkMax} disabled={busy === "bulk-max"}
+                title="Set max_domains across all selected keys (1..1000)"
+              >
+                <Edit3 className="h-3.5 w-3.5" /> Edit max
+              </Button>
+              <Button
+                size="sm" variant="outline" className="gap-1.5"
+                onClick={openBulkRename} disabled={busy === "bulk-rename"}
+                title="Rename selected keys with a pattern like CF-{n:03} → CF-001, CF-002, …"
+              >
+                <Edit3 className="h-3.5 w-3.5" /> Rename pattern
+              </Button>
+              <Button
+                size="sm" variant="outline" className="gap-1.5 btn-soft-warning"
+                onClick={() => bulkSetActive(false)} disabled={busy === "bulk-pause"}
+                title="Pause selected keys — they won't receive new domain assignments"
+              >
+                <Pause className="h-3.5 w-3.5" /> Pause
+              </Button>
+              <Button
+                size="sm" variant="outline" className="gap-1.5 btn-soft-success"
+                onClick={() => bulkSetActive(true)} disabled={busy === "bulk-activate"}
+                title="Activate selected keys"
+              >
+                <Play className="h-3.5 w-3.5" /> Activate
+              </Button>
+              <Button
+                size="sm" variant="outline" className="gap-1.5 btn-soft-success"
+                onClick={bulkRefreshSelected} disabled={busy === "bulk-refresh"}
+                title="HTTPS-probe every domain under selected keys; flip status decisively"
+              >
+                <RefreshCw className={cn("h-3.5 w-3.5", busy === "bulk-refresh" && "animate-spin")} />
+                Refresh status
+              </Button>
+              <Button
+                size="sm" variant="outline" className="gap-1.5 btn-soft-info"
+                onClick={bulkVerifySelected} disabled={busy === "bulk-verify"}
+                title="Re-fetch CF /accounts for selected keys (records last_error on failures)"
+              >
+                <ShieldCheck className={cn("h-3.5 w-3.5", busy === "bulk-verify" && "animate-spin")} />
+                Verify accounts
+              </Button>
               <Button
                 size="sm" variant="outline"
                 className="gap-1.5 btn-soft-destructive"
@@ -587,6 +929,40 @@ export default function CloudflarePage() {
             </div>
           )}
 
+          {/* Filter chips — counts in label so operator knows what each chip will reveal. */}
+          <div className="-mx-1 mb-2 flex flex-wrap items-center gap-1.5 px-3 py-1 text-small">
+            {([
+              ["all", "All", counts.all],
+              ["active", "Active", counts.active],
+              ["paused", "Paused", counts.paused],
+              ["exhausted", "Exhausted (≥90%)", counts.exhausted],
+              ["idle", "Idle (0 domains)", counts.idle],
+            ] as [FilterChip, string, number][]).map(([id, label, n]) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setFilter(id)}
+                className={cn(
+                  "rounded-full border px-2.5 py-0.5 text-micro transition-colors",
+                  filter === id
+                    ? "border-status-running/60 bg-status-running/15 text-status-running font-medium"
+                    : "border-border bg-card text-muted-foreground hover:bg-muted",
+                )}
+              >
+                {label} <span className="font-mono tabular-nums">{n}</span>
+              </button>
+            ))}
+            {counts.withError > 0 && (
+              <span
+                className="ml-2 inline-flex items-center gap-1 rounded-full border border-status-terminal/40 bg-status-terminal/10 px-2 py-0.5 text-micro text-status-terminal"
+                title="Keys whose last CF API call failed — sort by Issue column to bring them to the top"
+              >
+                <AlertTriangle className="h-3 w-3" />
+                {counts.withError} with error
+              </span>
+            )}
+          </div>
+
           <DataTable>
             <DataTableHead>
               <DataTableRow>
@@ -595,39 +971,40 @@ export default function CloudflarePage() {
                     type="checkbox"
                     aria-label="Select all keys on this page"
                     checked={
-                      filteredKeys.length > 0 &&
-                      filteredKeys.every((k) => keysSelected.has(Number(k.id)))
+                      pagedKeys.length > 0 &&
+                      pagedKeys.every((k) => keysSelected.has(Number(k.id)))
                     }
                     ref={(el) => {
                       if (!el) return
-                      const allOn = filteredKeys.length > 0 &&
-                        filteredKeys.every((k) => keysSelected.has(Number(k.id)))
-                      const someOn = filteredKeys.some((k) => keysSelected.has(Number(k.id)))
+                      const allOn = pagedKeys.length > 0 &&
+                        pagedKeys.every((k) => keysSelected.has(Number(k.id)))
+                      const someOn = pagedKeys.some((k) => keysSelected.has(Number(k.id)))
                       el.indeterminate = !allOn && someOn
                     }}
                     onChange={(e) => {
                       const next = new Set(keysSelected)
                       if (e.target.checked) {
-                        for (const k of filteredKeys) next.add(Number(k.id))
+                        for (const k of pagedKeys) next.add(Number(k.id))
                       } else {
-                        for (const k of filteredKeys) next.delete(Number(k.id))
+                        for (const k of pagedKeys) next.delete(Number(k.id))
                       }
                       setKeysSelected(next)
                     }}
                   />
                 </DataTableHeaderCell>
                 <DataTableHeaderCell className="w-9" />
-                <DataTableHeaderCell>Key label</DataTableHeaderCell>
-                <DataTableHeaderCell>Email</DataTableHeaderCell>
-                <DataTableHeaderCell>Domains</DataTableHeaderCell>
-                <DataTableHeaderCell>Rate limit</DataTableHeaderCell>
-                <DataTableHeaderCell>Status</DataTableHeaderCell>
-                <DataTableHeaderCell align="right">Last used</DataTableHeaderCell>
+                <DataTableHeaderCell><SortBtn k="alias" cur={sortKey} dir={sortDir} onClick={setSort}>Key label</SortBtn></DataTableHeaderCell>
+                <DataTableHeaderCell><SortBtn k="email" cur={sortKey} dir={sortDir} onClick={setSort}>Email</SortBtn></DataTableHeaderCell>
+                <DataTableHeaderCell><SortBtn k="domains" cur={sortKey} dir={sortDir} onClick={setSort}>Domains</SortBtn></DataTableHeaderCell>
+                <DataTableHeaderCell><SortBtn k="rate" cur={sortKey} dir={sortDir} onClick={setSort}>Rate limit</SortBtn></DataTableHeaderCell>
+                <DataTableHeaderCell><SortBtn k="status" cur={sortKey} dir={sortDir} onClick={setSort}>Status</SortBtn></DataTableHeaderCell>
+                <DataTableHeaderCell><SortBtn k="issue" cur={sortKey} dir={sortDir} onClick={setSort}>Issue</SortBtn></DataTableHeaderCell>
+                <DataTableHeaderCell align="right"><SortBtn k="lastUsed" cur={sortKey} dir={sortDir} onClick={setSort} alignRight>Last used</SortBtn></DataTableHeaderCell>
                 <DataTableHeaderCell align="right">Actions</DataTableHeaderCell>
               </DataTableRow>
             </DataTableHead>
             <tbody>
-              {filteredKeys.map((k) => {
+              {pagedKeys.map((k) => {
                 const isOpen = expanded === k.id
                 const realDomains = domainsByKey[Number(k.id)] ?? []
                 const assigned = realDomains.map((d) => ({
@@ -724,6 +1101,19 @@ export default function CloudflarePage() {
                       <DataTableCell>
                         <StatusBadge status={k.status} />
                       </DataTableCell>
+                      <DataTableCell>
+                        {k.lastError ? (
+                          <span
+                            className="inline-flex items-center gap-1 rounded-sm bg-status-terminal/10 px-1.5 py-0.5 text-micro text-status-terminal max-w-[220px] truncate"
+                            title={`${k.lastError}${k.lastErrorAt ? ` · ${k.lastErrorAt}` : ""}`}
+                          >
+                            <AlertTriangle className="h-3 w-3 shrink-0" aria-hidden />
+                            <span className="truncate">{k.lastError}</span>
+                          </span>
+                        ) : (
+                          <span className="text-muted-foreground" aria-label="no recent error">—</span>
+                        )}
+                      </DataTableCell>
                       <DataTableCell align="right">
                         <span className="font-mono text-micro text-muted-foreground">{k.lastUsed}</span>
                       </DataTableCell>
@@ -760,7 +1150,7 @@ export default function CloudflarePage() {
 
                     {isOpen && (
                       <tr>
-                        <td colSpan={9} className="bg-muted/30 p-0 border-b border-border">
+                        <td colSpan={10} className="bg-muted/30 p-0 border-b border-border">
                           <div className="px-4 py-3">
                             <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
                               <div className="flex items-center gap-2">
@@ -1033,13 +1423,69 @@ export default function CloudflarePage() {
               })}
               {filteredKeys.length === 0 && CF_KEYS.length > 0 && (
                 <tr>
-                  <td colSpan={9} className="px-4 py-8 text-center text-small text-muted-foreground">
-                    No keys match {JSON.stringify(search)}.
+                  <td colSpan={10} className="px-4 py-8 text-center text-small text-muted-foreground">
+                    No keys match the current search/filter.
                   </td>
                 </tr>
               )}
             </tbody>
           </DataTable>
+
+          {/* Pagination footer — visible whenever the dataset spans more than one page. */}
+          {filteredKeys.length > pageSize && (
+            <div className="flex flex-wrap items-center gap-3 border-t border-border px-3 py-2 text-small">
+              <span className="text-micro text-muted-foreground tabular-nums">
+                Showing {((safePage - 1) * pageSize) + 1}-
+                {Math.min(safePage * pageSize, filteredKeys.length)}{" "}
+                of {filteredKeys.length}
+              </span>
+              <div className="ml-auto flex items-center gap-1">
+                <label className="text-micro text-muted-foreground mr-1">
+                  Per page
+                </label>
+                <select
+                  value={pageSize}
+                  onChange={(e) => setPageSize(Number.parseInt(e.target.value, 10))}
+                  className="h-7 rounded border border-border bg-background px-2 text-micro"
+                >
+                  {VALID_PAGE_SIZES.map((n) => (
+                    <option key={n} value={n}>{n}</option>
+                  ))}
+                </select>
+                <Button
+                  size="icon" variant="ghost" className="h-7 w-7"
+                  onClick={() => setPage(1)} disabled={safePage <= 1}
+                  aria-label="First page"
+                >
+                  <ChevronsLeft className="h-3.5 w-3.5" />
+                </Button>
+                <Button
+                  size="icon" variant="ghost" className="h-7 w-7"
+                  onClick={() => setPage(safePage - 1)} disabled={safePage <= 1}
+                  aria-label="Previous page"
+                >
+                  <ChevronLeft className="h-3.5 w-3.5" />
+                </Button>
+                <span className="px-2 font-mono tabular-nums text-micro">
+                  {safePage} / {totalPages}
+                </span>
+                <Button
+                  size="icon" variant="ghost" className="h-7 w-7"
+                  onClick={() => setPage(safePage + 1)} disabled={safePage >= totalPages}
+                  aria-label="Next page"
+                >
+                  <ChevronRight className="h-3.5 w-3.5" />
+                </Button>
+                <Button
+                  size="icon" variant="ghost" className="h-7 w-7"
+                  onClick={() => setPage(totalPages)} disabled={safePage >= totalPages}
+                  aria-label="Last page"
+                >
+                  <ChevronsRight className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            </div>
+          )}
         </DataTableShell>
         )}
       </div>
@@ -1140,8 +1586,16 @@ export default function CloudflarePage() {
           </>
         ) : (
           <div className="flex flex-col gap-2">
-            <div className="flex items-center gap-3 rounded-md border border-border/60 px-3 py-2 text-small">
+            <div className="flex flex-wrap items-center gap-3 rounded-md border border-border/60 px-3 py-2 text-small">
               <span className="text-status-completed font-semibold">✓ {bulkAddResult.added} added</span>
+              {bulkAddResult.duplicates > 0 && (
+                <span
+                  className="text-muted-foreground font-semibold"
+                  title="Already in pool — pre-flight dedup; no CF API call burned"
+                >
+                  ⊘ {bulkAddResult.duplicates} already in pool
+                </span>
+              )}
               {bulkAddResult.errored > 0 && (
                 <span className="text-status-terminal font-semibold">✗ {bulkAddResult.errored} errored</span>
               )}
@@ -1155,21 +1609,104 @@ export default function CloudflarePage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {bulkAddResult.results.map((r, i) => (
-                    <tr key={i} className="border-b border-border/30 last:border-0">
-                      <td className="px-2 py-1 font-mono text-micro">{r.email}</td>
-                      <td className="px-2 py-1 text-micro">
-                        {r.ok
-                          ? <span className="text-status-completed">added</span>
-                          : <span className="text-status-terminal" title={r.error}>{r.error ?? "failed"}</span>}
-                      </td>
-                    </tr>
-                  ))}
+                  {bulkAddResult.results.map((r, i) => {
+                    const isDupe = !r.ok && r.error === "already in pool"
+                    return (
+                      <tr key={i} className="border-b border-border/30 last:border-0">
+                        <td className="px-2 py-1 font-mono text-micro">{r.email}</td>
+                        <td className="px-2 py-1 text-micro">
+                          {r.ok ? (
+                            <span className="text-status-completed">added</span>
+                          ) : isDupe ? (
+                            <span className="text-muted-foreground" title="Already exists in pool">already in pool</span>
+                          ) : (
+                            <span className="text-status-terminal" title={r.error}>{r.error ?? "failed"}</span>
+                          )}
+                        </td>
+                      </tr>
+                    )
+                  })}
                 </tbody>
               </table>
             </div>
           </div>
         )}
+      </OperatorDialog>
+
+      {/* ---------- Bulk edit max_domains dialog ---------- */}
+      <OperatorDialog
+        open={bulkMaxOpen}
+        onOpenChange={(o) => { if (!o) setBulkMaxOpen(false) }}
+        title={`Set max_domains across ${keysSelected.size} key(s)`}
+        description="Each CF account allows up to 1000 zones; we cap per-key to spread load. Applies to all selected keys in a single transaction."
+        submitLabel="Apply to selected"
+        onSubmit={submitBulkMax}
+        resultMessage={bulkMaxResult?.text ?? null}
+        resultKind={bulkMaxResult?.kind ?? null}
+      >
+        <Field>
+          <FieldLabel>Max domains (1–1000)</FieldLabel>
+          <Input
+            type="number" min={1} max={1000}
+            value={bulkMaxValue}
+            onChange={(e) => setBulkMaxValue(e.target.value)}
+            autoFocus
+          />
+          <FieldDescription>
+            Sites already assigned past the new cap will not be removed — the new value
+            only restricts further assignments.
+          </FieldDescription>
+        </Field>
+      </OperatorDialog>
+
+      {/* ---------- Bulk rename pattern dialog ---------- */}
+      <OperatorDialog
+        open={bulkRenameOpen}
+        onOpenChange={(o) => { if (!o) setBulkRenameOpen(false) }}
+        title={`Rename ${keysSelected.size} key(s) by pattern`}
+        description="Use {n} for an auto-incrementing counter, or {n:03} for zero-padded numbers (CF-001, CF-002, …). Counter starts at the value below."
+        submitLabel="Apply pattern"
+        onSubmit={submitBulkRename}
+        resultMessage={renameResult?.text ?? null}
+        resultKind={renameResult?.kind ?? null}
+      >
+        <Field>
+          <FieldLabel>Pattern</FieldLabel>
+          <Input
+            value={renamePattern}
+            onChange={(e) => setRenamePattern(e.target.value)}
+            placeholder="CF-{n:03}"
+            autoFocus
+          />
+          <FieldDescription>
+            Examples: <code className="font-mono">CF-{"{n}"}</code>,{" "}
+            <code className="font-mono">CF-{"{n:03}"}</code>,{" "}
+            <code className="font-mono">pool-a-{"{n:02}"}</code>
+          </FieldDescription>
+        </Field>
+        <Field>
+          <FieldLabel>Start at</FieldLabel>
+          <Input
+            type="number" min={0}
+            value={renameStart}
+            onChange={(e) => setRenameStart(e.target.value)}
+          />
+        </Field>
+        <Field>
+          <FieldLabel>Preview (first {renamePreview.length} of {keysSelected.size})</FieldLabel>
+          <div className="rounded-md border border-border bg-muted/30 p-2 font-mono text-micro flex flex-wrap gap-1.5">
+            {renamePreview.length === 0 ? (
+              <span className="text-muted-foreground">(no preview)</span>
+            ) : (
+              renamePreview.map((p, i) => (
+                <span key={i} className="rounded bg-card border border-border/60 px-1.5 py-0.5">{p}</span>
+              ))
+            )}
+            {keysSelected.size > renamePreview.length && (
+              <span className="text-muted-foreground self-center">…</span>
+            )}
+          </div>
+        </Field>
       </OperatorDialog>
 
       {/* ---------- Edit CF key dialog ---------- */}

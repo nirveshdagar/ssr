@@ -26,6 +26,10 @@ export interface CfKeyRow {
   rateLimitUsed: number
   status: "healthy" | "warning" | "exhausted" | "paused"
   lastUsed: string
+  /** Most recent CF API failure persisted on the row, or "" if none. */
+  lastError: string
+  /** ISO timestamp the last_error was recorded, or "" if none. */
+  lastErrorAt: string
 }
 
 export interface CfKeyDomain {
@@ -43,6 +47,8 @@ interface ApiCfKey {
   max_domains: number
   is_active: number
   last_used_at: string | null
+  last_error: string | null
+  last_error_at: string | null
   key_preview: string
   domains_count: number
 }
@@ -77,6 +83,8 @@ export function useCfKeys() {
       : 0,
     status: deriveStatus(k.domains_used, k.max_domains, k.is_active),
     lastUsed: k.last_used_at ?? "—",
+    lastError: k.last_error ?? "",
+    lastErrorAt: k.last_error_at ?? "",
   }))
   return {
     rows,
