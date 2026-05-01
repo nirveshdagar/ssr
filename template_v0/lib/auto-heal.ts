@@ -988,6 +988,18 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
     downAutoFix = { error: (e as Error).message }
   }
 
+  // Daily Claude-Code OAuth sentinel — confirms the operator's
+  // CLAUDE_CODE_OAUTH_TOKEN still works before the operator gets surprised
+  // by a step-9 failure mid-batch. Self-rate-limits to one ping per 24h
+  // (skipped entirely when there's been a successful real call within
+  // the same window — saves the API quota).
+  let claudeCodeAuth: { status: string; skipped?: boolean; reason?: string } = { status: "skipped" }
+  try {
+    claudeCodeAuth = await checkClaudeCodeOauthHealth()
+  } catch (e) {
+    claudeCodeAuth = { status: "error", reason: (e as Error).message }
+  }
+
   // Only audit-log when something actually happened — avoids audit spam.
   const claimedN = "claimed" in reconcile ? reconcile.claimed.length : 0
   const resumedN = "resumed" in resume ? resume.resumed.length : 0
@@ -1010,6 +1022,83 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
   }
 
   return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, sslSweep, downAutoFix, ranAt }
+}
+
+// ---------------------------------------------------------------------------
+// Claude Code OAuth token sentinel
+// ---------------------------------------------------------------------------
+//
+// Operator pastes a long-lived OAuth token into Settings → LLM →
+// CLAUDE_CODE_OAUTH_TOKEN. Token expires roughly every ~90 days (tied to
+// the Pro/Max subscription cycle). When it does, every step-9 call starts
+// failing with "Authentication required" — operator notices first when a
+// regen they triggered explodes. This sentinel pings the CLI once per 24h
+// to detect expiry preemptively + notify with the exact refresh recipe.
+//
+// Self-rate-limited two ways:
+//   1. Skips entirely if no token is configured (operator using API path)
+//   2. Skips if a real CLI call succeeded within the last 24h (proven live
+//      by real traffic — no need to burn extra quota on a sentinel ping)
+//   3. Else pings (~5 tokens of output) at most once per 24h
+//
+// Persists status to settings (claude_code_oauth_token_status,
+// _last_check_at, _last_ok_at) so the Settings UI can show a live badge.
+const SENTINEL_INTERVAL_MS = 24 * 60 * 60 * 1000  // 24 hours
+
+export async function checkClaudeCodeOauthHealth(): Promise<{
+  status: "ok" | "expired" | "missing" | "skipped" | "error"
+  skipped?: boolean
+  reason?: string
+}> {
+  const { getSetting, setSetting } = await import("./repos/settings")
+  const token = (getSetting("claude_code_oauth_token") || "").trim()
+  if (!token) {
+    setSetting("claude_code_oauth_token_status", "missing")
+    return { status: "missing", skipped: true, reason: "no token configured" }
+  }
+  const now = Date.now()
+  const lastCheck = getSetting("claude_code_oauth_token_last_check_at") || ""
+  const lastOk = getSetting("claude_code_oauth_token_last_ok_at") || ""
+  const lastCheckMs = lastCheck ? new Date(lastCheck).getTime() : 0
+  const lastOkMs = lastOk ? new Date(lastOk).getTime() : 0
+  // Recent real-traffic success proves liveness — skip the probe.
+  if (now - lastOkMs < SENTINEL_INTERVAL_MS) {
+    return { status: "ok", skipped: true, reason: "recent successful call" }
+  }
+  // Otherwise, rate-limit to one probe per 24h.
+  if (now - lastCheckMs < SENTINEL_INTERVAL_MS) {
+    return { status: "skipped", skipped: true, reason: `last probe ${lastCheck}` }
+  }
+  // Time to ping. Use the smallest, cheapest model + a one-token prompt.
+  const { probeLlmCli } = await import("./llm-cli")
+  const result = await probeLlmCli("anthropic_cli", "claude-haiku-4-5-20251001")
+  const nowIso = new Date().toISOString().replace(/\.\d{3}Z$/, "Z")
+  const prevStatus = (getSetting("claude_code_oauth_token_status") || "unknown").trim()
+  setSetting("claude_code_oauth_token_last_check_at", nowIso)
+  if (result.ok) {
+    setSetting("claude_code_oauth_token_status", "ok")
+    setSetting("claude_code_oauth_token_last_ok_at", nowIso)
+    return { status: "ok" }
+  }
+  setSetting("claude_code_oauth_token_status", "expired")
+  // Notify on transition into expired — once per transition, dedupe key
+  // means re-firings during the same broken stretch don't spam.
+  if (prevStatus !== "expired") {
+    try {
+      const { notify } = await import("./notify")
+      await notify(
+        "Claude Code OAuth token expired (sentinel)",
+        `Daily sentinel ping failed: ${result.error ?? "unknown"}\n\n` +
+        `Refresh on your local machine: run \`claude setup-token\`, copy the ` +
+        `sk-ant-oat01-... value, then paste it into Settings → LLM → ` +
+        `Claude Code CLI → CLAUDE_CODE_OAUTH_TOKEN.\n\n` +
+        `Until refreshed, switch the active provider to a paid API key ` +
+        `(Anthropic / OpenAI) or to Cloudflare Workers AI POOL (free).`,
+        { severity: "error", dedupeKey: "claude_code_token_expired" },
+      )
+    } catch { /* notify is best-effort */ }
+  }
+  return { status: "expired", reason: result.error }
 }
 
 // ---------------------------------------------------------------------------

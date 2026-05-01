@@ -232,6 +232,14 @@ export async function runLlmCli(
       if (lookedLikeFailure) {
         const classified = classifyCliFailure(provider, combined)
         if (classified) {
+          // Persist auth status if this was an auth-class failure — lets the
+          // sentinel sweep skip its own probe (we already proved token is
+          // bad) and the settings UI surface a clear "Token expired" badge
+          // without waiting for the next sweep cycle. Notify is dedupe-keyed
+          // so we don't spam every retry.
+          if (/not signed in|CLAUDE_CODE_OAUTH_TOKEN|unauthenticated|invalid.*token/i.test(classified)) {
+            void persistCliAuthStatus(provider, "expired", classified)
+          }
           reject(new Error(classified))
           return
         }
@@ -241,9 +249,55 @@ export async function runLlmCli(
         reject(new Error(`${bin} exit ${code}: ${detail}`))
         return
       }
+      // Success — record liveness so the sentinel can skip its 24h probe.
+      void persistCliAuthStatus(provider, "ok", null)
       resolve({ text: stdout, exitCode: code ?? 0 })
     })
   })
+}
+
+/**
+ * Persist the CLI auth status into settings + notify on transitions to bad
+ * state. Called from the success / auth-failure branches of runLlmCli so the
+ * settings UI can show "Token last verified: 2h ago ✓" or "Token expired"
+ * without waiting for the daily sentinel sweep. notify is best-effort and
+ * dedupe-keyed so a stuck pipeline retrying every 5min doesn't spam.
+ */
+async function persistCliAuthStatus(
+  provider: CliProvider,
+  status: "ok" | "expired",
+  reason: string | null,
+): Promise<void> {
+  // Only track Claude Code today — codex CLI has its own quirks (exit-0 on
+  // quota) that the classifier handles, and a status-tracking layer adds
+  // complexity I haven't validated against codex's behavior. Easy to extend
+  // when we see the analogous codex failures in the wild.
+  if (provider !== "anthropic_cli") return
+  try {
+    const { getSetting, setSetting } = await import("./repos/settings")
+    const nowIso = new Date().toISOString().replace(/\.\d{3}Z$/, "Z")
+    const prevStatus = (getSetting("claude_code_oauth_token_status") || "unknown").trim()
+    setSetting("claude_code_oauth_token_status", status)
+    setSetting("claude_code_oauth_token_last_check_at", nowIso)
+    if (status === "ok") {
+      setSetting("claude_code_oauth_token_last_ok_at", nowIso)
+    }
+    // Notify on transition into bad state — once per transition, dedupe key
+    // means re-firings during the same broken stretch don't spam.
+    if (status === "expired" && prevStatus !== "expired") {
+      try {
+        const { notify } = await import("./notify")
+        await notify(
+          "Claude Code OAuth token expired",
+          `${reason ?? "Token rejected"}\n\n` +
+          `Refresh on your local machine: run \`claude setup-token\`, copy the ` +
+          `sk-ant-oat01-... value, then paste it into Settings → LLM → ` +
+          `Claude Code CLI → CLAUDE_CODE_OAUTH_TOKEN.`,
+          { severity: "error", dedupeKey: "claude_code_token_expired" },
+        )
+      } catch { /* notify is best-effort */ }
+    }
+  } catch { /* settings unreachable — drop the breadcrumb but never break the LLM call */ }
 }
 
 /**
