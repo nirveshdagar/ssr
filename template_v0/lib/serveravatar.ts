@@ -806,6 +806,36 @@ async function installAgentOnDropletAttempt(opts: {
   logPipeline(serverName, "sa_install", "running", `Waiting for SSH on ${dropletIp}...`)
   const ssh = await waitForSsh(dropletIp, rootPassword, "root", 240_000)
   try {
+    // Wait for cloud-init to finish before starting the SA install script.
+    // SSH becomes available within ~30-60s of droplet boot, but cloud-init
+    // (which sets up apt, kernel modules, system services) keeps running
+    // for another 3-7 minutes. Operator policy 2026-05-01: SA install
+    // launched too early was racing cloud-init — the install script's
+    // "is this droplet clean?" check fires while apt is mid-update or a
+    // package is still configuring → SA flags "Conflict detected" /
+    // "Not supported" and the install dead-ends. Blocking on cloud-init's
+    // own completion signal is the proper fix (vs a flat sleep that's
+    // either too short for slow boots or wastes time on fast ones).
+    //
+    // `cloud-init status --wait`:
+    //   - returns 0 when cloud-init done successfully
+    //   - returns 0 with "status: done" stdout when already complete (cheap on reinstall)
+    //   - blocks up to its internal timeout (~10 min worst case) otherwise
+    //   - returns non-zero on cloud-init error or missing binary
+    // We wrap in a 6-min ssh.exec timeout as a hard ceiling. Failures fall
+    // through (logged warning) — better to attempt the install than block
+    // forever on a corrupt cloud-init.
+    logPipeline(serverName, "sa_install", "running",
+      `Waiting for cloud-init to complete on ${dropletIp} (typical 3-7 min on fresh droplets)...`)
+    try {
+      const ci = await ssh.exec("cloud-init status --wait 2>&1 || true", { timeoutMs: 360_000 })
+      const status = ci.stdout.trim().slice(0, 200)
+      logPipeline(serverName, "sa_install", "running",
+        `cloud-init wait returned exit=${ci.code}: ${status || "(no output)"}`)
+    } catch (e) {
+      logPipeline(serverName, "sa_install", "warning",
+        `cloud-init wait failed/timed out: ${(e as Error).message.slice(0, 200)} — proceeding with install anyway`)
+    }
     logPipeline(serverName, "sa_install", "running",
       `Running install script on ${dropletIp} (takes 5-15 min)`)
     const escaped = `'${cmd.replace(/'/g, "'\\''")}'`
