@@ -136,7 +136,22 @@ function SortBtn(props: {
   )
 }
 
+/**
+ * Wrapper exists ONLY to satisfy Next.js's static-prerender constraint:
+ * `useSearchParams()` must live under a <Suspense> boundary so the build
+ * can fall back to client-side hydration without bailing the whole route.
+ * The fallback is intentionally null — real content lands within ~50ms
+ * of hydration, and the AppShell already renders its own skeleton.
+ */
 export default function CloudflarePage() {
+  return (
+    <React.Suspense fallback={null}>
+      <CloudflarePageInner />
+    </React.Suspense>
+  )
+}
+
+function CloudflarePageInner() {
   const router = useRouter()
   const searchParams = useSearchParams()
 
