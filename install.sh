@@ -166,6 +166,20 @@ npx --yes patchright install-deps chromium >/dev/null
 ok "chromium system deps installed"
 
 # ---------------------------------------------------------------------------
+# Step 6b — Global LLM CLIs (claude, codex)
+# ---------------------------------------------------------------------------
+# The dashboard's /settings → LLM "Install" button runs npm install -g as
+# the ssr user, which fails with EACCES on the default global prefix
+# (/usr/lib/node_modules is root-only). Install both CLIs as root here
+# during setup so they're on PATH for everyone — operator never has to
+# wrestle the Install button. Both are idempotent (npm i -g just exits 0
+# when already at the latest version).
+log "global LLM CLIs (claude, codex)"
+npm install -g @anthropic-ai/claude-code @openai/codex >/dev/null 2>&1 \
+  && ok "claude $(claude --version 2>/dev/null | head -1) · codex $(codex --version 2>/dev/null | head -1)" \
+  || warn "global LLM CLI install failed — operator can retry via /settings → LLM Install button"
+
+# ---------------------------------------------------------------------------
 # Step 7 — hand ownership to ssr user
 # ---------------------------------------------------------------------------
 log "ownership → ssr:ssr"

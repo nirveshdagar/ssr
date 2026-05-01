@@ -1264,6 +1264,17 @@ function ClaudeTokenHealthBadge({
       </span>
     )
   }
+  if (status === "binary_missing") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded bg-status-waiting/15 px-1.5 py-0.5 text-[10px] font-semibold text-status-waiting"
+        title="The `claude` binary isn't on PATH — install it on the server before the token can be tested"
+      >
+        <AlertCircle className="h-2.5 w-2.5" />
+        claude CLI not installed
+      </span>
+    )
+  }
   // status === "" / "unknown" / anything else — token is set but never tested.
   return (
     <span

@@ -1080,6 +1080,32 @@ export async function checkClaudeCodeOauthHealth(): Promise<{
     setSetting("claude_code_oauth_token_last_ok_at", nowIso)
     return { status: "ok" }
   }
+  // Distinguish "binary not on PATH" / "binary not installed" from "token
+  // rejected by Claude". The former is an OPERATIONAL issue (install the
+  // CLI), not an auth issue — different status + different notify message.
+  // Without this branch every fresh server with no `claude` binary would
+  // get a misleading "token expired" badge even though the token might be
+  // perfectly valid; operator wastes time refreshing a token that's fine.
+  const errMsg = result.error ?? ""
+  const looksLikeMissingBinary =
+    /not found on PATH|ENOENT|claude.*install|binary.*missing/i.test(errMsg)
+  if (looksLikeMissingBinary) {
+    setSetting("claude_code_oauth_token_status", "binary_missing")
+    if (prevStatus !== "binary_missing") {
+      try {
+        const { notify } = await import("./notify")
+        await notify(
+          "Claude Code CLI not installed",
+          `Sentinel ping couldn't find the claude binary: ${errMsg}\n\n` +
+          `On the server, run as root:\n` +
+          `  sudo npm install -g @anthropic-ai/claude-code\n\n` +
+          `Or use a different provider in Settings → LLM until then.`,
+          { severity: "error", dedupeKey: "claude_code_binary_missing" },
+        )
+      } catch { /* notify is best-effort */ }
+    }
+    return { status: "expired", reason: errMsg }
+  }
   setSetting("claude_code_oauth_token_status", "expired")
   // Notify on transition into expired — once per transition, dedupe key
   // means re-firings during the same broken stretch don't spam.
@@ -1088,7 +1114,7 @@ export async function checkClaudeCodeOauthHealth(): Promise<{
       const { notify } = await import("./notify")
       await notify(
         "Claude Code OAuth token expired (sentinel)",
-        `Daily sentinel ping failed: ${result.error ?? "unknown"}\n\n` +
+        `Daily sentinel ping failed: ${errMsg}\n\n` +
         `Refresh on your local machine: run \`claude setup-token\`, copy the ` +
         `sk-ant-oat01-... value, then paste it into Settings → LLM → ` +
         `Claude Code CLI → CLAUDE_CODE_OAUTH_TOKEN.\n\n` +
@@ -1098,7 +1124,7 @@ export async function checkClaudeCodeOauthHealth(): Promise<{
       )
     } catch { /* notify is best-effort */ }
   }
-  return { status: "expired", reason: result.error }
+  return { status: "expired", reason: errMsg }
 }
 
 // ---------------------------------------------------------------------------

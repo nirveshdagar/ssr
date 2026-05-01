@@ -44,7 +44,7 @@ export interface SettingsValues {
   /** Read-only telemetry — populated by lib/llm-cli.ts (real-time, on every
    *  CLI call) and lib/auto-heal.ts:checkClaudeCodeOauthHealth (24h
    *  sentinel). Surfaced in the Settings UI as a colored health badge. */
-  claude_code_oauth_token_status: string  // "ok" | "expired" | "missing" | "unknown" | ""
+  claude_code_oauth_token_status: string  // "ok" | "expired" | "missing" | "binary_missing" | "unknown" | ""
   claude_code_oauth_token_last_check_at: string  // ISO timestamp
   claude_code_oauth_token_last_ok_at: string     // ISO timestamp
   // CLI-auth toggles — when on, ignore the per-provider API key above and
