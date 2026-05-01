@@ -893,6 +893,7 @@ export interface AutoHealTickResult {
   stuckCreating: StuckCreatingResult | { error: string }
   sslSweep: SslSweepResult | { error: string }
   downAutoFix: DownAutoFixResult | { error: string }
+  deadRetry: DeadServerRetryResult | { error: string }
   ranAt: string
 }
 
@@ -918,6 +919,7 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
         stuckCreating: { error: "paused" },
         sslSweep: { error: "paused" },
         downAutoFix: { error: "paused" },
+        deadRetry: { error: "paused" },
       }
     }
   } catch { /* if settings read fails, just proceed normally */ }
@@ -988,6 +990,18 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
     downAutoFix = { error: (e as Error).message }
   }
 
+  // Retry servers that are status='dead' AND whose last migration attempt
+  // failed. The dead-detect sweep is one-shot per server (skips status!='ready'),
+  // so without this a transient provision failure (DO size/region issue, OOM,
+  // network blip) leaves the server stuck dead forever even after the operator
+  // fixes the underlying config in /settings.
+  let deadRetry: DeadServerRetryResult | { error: string }
+  try {
+    deadRetry = await autoRetryDeadServers()
+  } catch (e) {
+    deadRetry = { error: (e as Error).message }
+  }
+
   // Daily Claude-Code OAuth sentinel — confirms the operator's
   // CLAUDE_CODE_OAUTH_TOKEN still works before the operator gets surprised
   // by a step-9 failure mid-batch. Self-rate-limits to one ping per 24h
@@ -1010,18 +1024,166 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
   const stuckN = "reEnqueued" in stuckCreating ? stuckCreating.reEnqueued.length : 0
   const sslMismatchedN = "mismatched" in sslSweep ? sslSweep.mismatched.length : 0
   const downRepairsN = "fired" in downAutoFix ? downAutoFix.fired.length : 0
-  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN + stuckN + sslMismatchedN + downRepairsN > 0) {
+  const deadRetryN = "retried" in deadRetry ? deadRetry.retried.length : 0
+  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN + stuckN + sslMismatchedN + downRepairsN + deadRetryN > 0) {
     appendAudit(
       "auto_heal_tick", "",
       `claimed=${claimedN} resumed=${resumedN} ns_resumed=${nsResumedN} ` +
       `retried=${retriedN} ssl_reissued=${sslReissuedN} sa_degraded=${degradedN} ` +
       `stuck_recovered=${stuckN} ssl_mismatched=${sslMismatchedN} ` +
-      `down_repairs=${downRepairsN}`,
+      `down_repairs=${downRepairsN} dead_retried=${deadRetryN}`,
       null,
     )
   }
 
-  return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, sslSweep, downAutoFix, ranAt }
+  return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, sslSweep, downAutoFix, deadRetry, ranAt }
+}
+
+// ---------------------------------------------------------------------------
+// Dead-server auto-retry — closes the gap left by checkDeadServers being
+// one-shot (it only scans status='ready', so a server that flipped to 'dead'
+// and then had its migration attempt fail stays stuck forever).
+// ---------------------------------------------------------------------------
+//
+// Trigger: server.status = 'dead' AND auto_migrate_enabled=1 AND last
+// migration attempt was either failed/warning OR more than COOLDOWN ago.
+//
+// Guardrails:
+//   - cooldown (default 15 min, env SSR_DEAD_SERVER_RETRY_COOLDOWN_MS) since
+//     the previous attempt — gives external services time to recover from a
+//     transient outage and the operator time to fix config in /settings
+//   - per-server cap (default 6/24h, env SSR_DEAD_SERVER_RETRY_MAX_PER_DAY)
+//     — gives up after 24h of trying so we don't burn DO/SA quota on a truly
+//     broken case
+//   - skips servers with no domains (nothing to migrate; they'll be cleaned
+//     up by the post-migration cleanup or a separate sweep)
+//   - skips servers where migration is currently in flight (live-checker's
+//     in-memory `migrating` Set isn't visible across module boundaries; we
+//     use the jobs table as the cross-process source of truth)
+
+export interface DeadServerRetryResult {
+  retried: { server_id: number; attempts_24h: number; reason: string }[]
+  skipped: { server_id: number; reason: string }[]
+}
+
+const DEFAULT_DEAD_RETRY_COOLDOWN_MS = 15 * 60 * 1000
+const DEFAULT_DEAD_RETRY_MAX_PER_DAY = 6
+
+export async function autoRetryDeadServers(): Promise<DeadServerRetryResult> {
+  const retried: DeadServerRetryResult["retried"] = []
+  const skipped: DeadServerRetryResult["skipped"] = []
+
+  // Honor the same enable flag as the initial dead-detect → migrate trigger.
+  // No surprise — operator opts in once, both code paths respect it.
+  const autoMigrate = (getSetting("auto_migrate_enabled") || "0") === "1"
+  if (!autoMigrate) return { retried, skipped }
+
+  const cooldownMs = Math.max(
+    60_000,
+    Number.parseInt(process.env.SSR_DEAD_SERVER_RETRY_COOLDOWN_MS ?? "", 10) || DEFAULT_DEAD_RETRY_COOLDOWN_MS,
+  )
+  const maxPerDay = Math.max(
+    1,
+    Number.parseInt(process.env.SSR_DEAD_SERVER_RETRY_MAX_PER_DAY ?? "", 10) || DEFAULT_DEAD_RETRY_MAX_PER_DAY,
+  )
+
+  const dead = all<{ id: number; name: string }>(
+    `SELECT id, name FROM servers WHERE status = 'dead'`,
+  )
+  if (dead.length === 0) return { retried, skipped }
+
+  for (const s of dead) {
+    // Has any domain still pointing at this dead server? If not, the prior
+    // migration succeeded for all rows and there's nothing left to retry —
+    // server is awaiting cleanup, not retry.
+    const stillReferencing = (one<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM domains WHERE server_id = ? AND status NOT IN ('soft_deleted','deleted','canceled','terminal_error')`,
+      s.id,
+    )?.n ?? 0)
+    if (stillReferencing === 0) {
+      skipped.push({ server_id: s.id, reason: "no domains reference this server — awaiting cleanup, not retry" })
+      continue
+    }
+
+    // Cross-process check: any pipeline.full / domain.bulk_migrate job in
+    // flight that targets this server? If so, defer.
+    const inflight = (one<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM jobs
+        WHERE status IN ('queued','running')
+          AND (kind = 'pipeline.full' OR kind = 'domain.bulk_migrate')
+          AND payload_json LIKE ?`,
+      `%"server_id":${s.id}%`,
+    )?.n ?? 0)
+    if (inflight > 0) {
+      skipped.push({ server_id: s.id, reason: "migration already in flight" })
+      continue
+    }
+
+    // Last attempt time — most recent auto_migrate or migrate log entry for
+    // this server's anchor row. Use audit_log's auto_migrate_failed +
+    // pipeline_log's migrate/auto_migrate entries; whichever is newest.
+    const lastAttempt = one<{ ts: string }>(
+      `SELECT created_at AS ts FROM pipeline_log
+        WHERE step IN ('auto_migrate','migrate','do_create','sa_install','bulk_migrate')
+          AND domain = ?
+        ORDER BY id DESC LIMIT 1`,
+      `server-${s.id}`,
+    )
+    const lastTs = lastAttempt?.ts ?? null
+    if (lastTs) {
+      // SQLite text "YYYY-MM-DD HH:MM:SS" — Date.parse handles it but be
+      // explicit about TZ (SQLite stores localish, dashboard convention is
+      // UTC). Use unix epoch math on the parsed value.
+      const lastMs = new Date(lastTs.includes("T") ? lastTs : lastTs.replace(" ", "T") + "Z").getTime()
+      if (Number.isFinite(lastMs) && Date.now() - lastMs < cooldownMs) {
+        const minsAgo = Math.round((Date.now() - lastMs) / 60_000)
+        skipped.push({ server_id: s.id, reason: `last attempt ${minsAgo}m ago, cooldown=${Math.round(cooldownMs / 60_000)}m` })
+        continue
+      }
+    }
+
+    // Per-day cap — count failed/warning auto_migrate entries in the last
+    // 24h. If we've already exhausted retries, give up + leave for operator
+    // to manually click "Migrate Now" or investigate.
+    const attemptsToday = (one<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM pipeline_log
+        WHERE domain = ?
+          AND step IN ('auto_migrate','do_create','sa_install','bulk_migrate')
+          AND status IN ('failed','warning')
+          AND created_at >= datetime('now','-24 hours')`,
+      `server-${s.id}`,
+    )?.n ?? 0)
+    if (attemptsToday >= maxPerDay) {
+      skipped.push({ server_id: s.id, reason: `${attemptsToday}/${maxPerDay} retries exhausted in 24h — manual intervention needed` })
+      continue
+    }
+
+    // Fire the retry. spawnMigration is in live-checker.ts but is closure-
+    // bound to its own `migrating` Set; safer to call migrateServer directly
+    // here (same primitive both code paths use). Run in background — don't
+    // block the auto-heal tick (each migration takes 5-15 min).
+    void (async () => {
+      try {
+        const { migrateServer } = await import("./migration")
+        logPipeline(`server-${s.id}`, "auto_migrate", "running",
+          `Auto-retry: dead server #${s.id} (${s.name}), attempt ${attemptsToday + 1}/${maxPerDay} in 24h`)
+        const result = await migrateServer(s.id)
+        logPipeline(`server-${s.id}`, "auto_migrate",
+          result.failed.length === 0 ? "completed" : "warning",
+          `Auto-retry result: ok=${result.ok.length} failed=${result.failed.length}` +
+          (result.failed.length > 0 ? ` · ${result.failed.slice(0, 3).map((f) => `${f.domain}(${f.reason.slice(0, 60)})`).join("; ")}` : ""))
+      } catch (e) {
+        logPipeline(`server-${s.id}`, "auto_migrate", "failed",
+          `Auto-retry threw: ${(e as Error).message.slice(0, 200)}`)
+      }
+    })()
+    retried.push({
+      server_id: s.id,
+      attempts_24h: attemptsToday + 1,
+      reason: lastTs ? `last failed ${lastTs}` : "first auto-retry attempt",
+    })
+  }
+  return { retried, skipped }
 }
 
 // ---------------------------------------------------------------------------
