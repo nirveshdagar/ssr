@@ -138,6 +138,10 @@ function loadKeys(): FernetKeys {
   return cachedKeys
 }
 
+export function hasAnyEncryptedRows(): boolean {
+  return encryptedRowsExist()
+}
+
 function encryptedRowsExist(): boolean {
   try {
     const rows = all<{ value: string }>(
