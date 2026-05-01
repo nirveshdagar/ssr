@@ -663,7 +663,17 @@ export default function SettingsPage() {
                     auths without the creds file. */}
                 <div className="mt-2">
                   <FieldLabel className="text-micro">
-                    OAuth token <span className="text-muted-foreground">(optional — headless-server fallback)</span>
+                    <span className="inline-flex items-center justify-between gap-2 w-full">
+                      <span>
+                        OAuth token <span className="text-muted-foreground">(optional — headless-server fallback)</span>
+                      </span>
+                      <ClaudeTokenHealthBadge
+                        status={(get("claude_code_oauth_token_status") as string) || ""}
+                        lastOkAt={(get("claude_code_oauth_token_last_ok_at") as string) || ""}
+                        lastCheckAt={(get("claude_code_oauth_token_last_check_at") as string) || ""}
+                        hasToken={Boolean(((get("claude_code_oauth_token") as string) ?? "").trim())}
+                      />
+                    </span>
                   </FieldLabel>
                   <SecretInput
                     value={(get("claude_code_oauth_token") as string) ?? ""}
@@ -1203,6 +1213,83 @@ function ToggleRow({
       <Switch checked={checked} onCheckedChange={onChange} aria-label={title} title={title} />
     </div>
   )
+}
+
+/**
+ * Live health indicator for the Claude Code OAuth token. Reads three settings
+ * values written by lib/llm-cli.ts (real-time, on every CLI call) and
+ * lib/auto-heal.ts:checkClaudeCodeOauthHealth (24h sentinel). Renders a
+ * one-line badge so the operator can glance at /settings → LLM and know
+ * whether their token still works without waiting for a notify.
+ */
+function ClaudeTokenHealthBadge({
+  status, lastOkAt, lastCheckAt, hasToken,
+}: {
+  status: string
+  lastOkAt: string
+  lastCheckAt: string
+  hasToken: boolean
+}) {
+  if (!hasToken) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded bg-muted/40 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+        no token configured
+      </span>
+    )
+  }
+  // Prefer last_ok_at for the "verified X ago" copy — it's stronger evidence
+  // (a real successful call) than last_check_at (which could be a sentinel
+  // probe that hasn't run yet on a freshly-pasted token).
+  const refIso = lastOkAt || lastCheckAt
+  const ago = refIso ? formatRelativeAgo(refIso) : null
+  if (status === "ok") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded bg-status-completed/15 px-1.5 py-0.5 text-[10px] font-medium text-status-completed"
+        title={refIso ? `Last successful CLI call: ${refIso}` : "Token marked OK by sentinel sweep"}
+      >
+        <Check className="h-2.5 w-2.5" />
+        {ago ? `verified ${ago}` : "verified"}
+      </span>
+    )
+  }
+  if (status === "expired") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded bg-status-terminal/15 px-1.5 py-0.5 text-[10px] font-semibold text-status-terminal"
+        title={refIso ? `Last check at ${refIso} — auth rejected` : "Token rejected by Anthropic"}
+      >
+        <AlertCircle className="h-2.5 w-2.5" />
+        token expired — refresh
+      </span>
+    )
+  }
+  // status === "" / "unknown" / anything else — token is set but never tested.
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded bg-muted/40 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+      title="Token saved but not verified yet — first CLI call or daily sentinel will populate this"
+    >
+      not verified yet
+    </span>
+  )
+}
+
+/** "2h ago" / "3 days ago" / "just now" — same shape as relative timestamps
+ *  used elsewhere on the dashboard. ISO-tolerant (accepts both "Z" and
+ *  space-separated SQLite formats). */
+function formatRelativeAgo(iso: string): string {
+  const t = new Date(iso.includes("T") ? iso : iso.replace(" ", "T") + "Z").getTime()
+  if (!Number.isFinite(t)) return ""
+  const sec = Math.floor((Date.now() - t) / 1000)
+  if (sec < 0) return "just now"
+  if (sec < 60) return `${sec}s ago`
+  const min = Math.floor(sec / 60)
+  if (min < 60) return `${min}m ago`
+  const hr = Math.floor(min / 60)
+  if (hr < 48) return `${hr}h ago`
+  const days = Math.floor(hr / 24)
+  return `${days}d ago`
 }
 
 function SecretInput({

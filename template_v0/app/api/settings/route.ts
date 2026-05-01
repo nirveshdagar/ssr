@@ -23,6 +23,12 @@ const STRING_FIELDS = [
   "llm_api_key_anthropic", "llm_api_key_openai",
   "llm_api_key_gemini", "llm_api_key_openrouter",
   "llm_api_key_moonshot",
+  // Long-lived OAuth token for the local `claude` CLI — pasted by the
+  // operator in the headless-server flow (sk-ant-oat01-… from
+  // `claude setup-token` on a desktop). Was missing from this list,
+  // which silently dropped saves in the POST loop. Treated as sensitive
+  // (Fernet at rest, masked-tail GET) per secrets-vault SENSITIVE_KEYS.
+  "claude_code_oauth_token",
   "llm_timeout_ms",
   "llm_max_output_tokens",
   "cloudflare_account_id", "cloudflare_workers_ai_token",
@@ -110,6 +116,16 @@ export async function GET(_req: NextRequest): Promise<Response> {
   // which token last worked. Not a secret value (it's just "primary" or
   // "backup"), but is not editable.
   out["do_last_working_token"] = getSetting("do_last_working_token") ?? ""
+
+  // Claude Code OAuth token health — written by lib/llm-cli.ts on every
+  // CLI call (real-time) and lib/auto-heal.ts:checkClaudeCodeOauthHealth
+  // (24h sentinel). Read-only telemetry so the Settings UI badge can
+  // render "verified 2h ago ✓" / "token expired — refresh" without an
+  // extra fetch. Status enum: "ok" | "expired" | "missing" | "unknown".
+  out["claude_code_oauth_token_status"] = getSetting("claude_code_oauth_token_status") ?? ""
+  out["claude_code_oauth_token_last_check_at"] = getSetting("claude_code_oauth_token_last_check_at") ?? ""
+  out["claude_code_oauth_token_last_ok_at"] = getSetting("claude_code_oauth_token_last_ok_at") ?? ""
+
   return NextResponse.json({ settings: out })
 }
 
