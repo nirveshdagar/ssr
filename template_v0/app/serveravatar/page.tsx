@@ -17,6 +17,7 @@ import { Field, FieldLabel, FieldDescription, FieldGroup } from "@/components/ui
 import { Checkbox } from "@/components/ui/checkbox"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { cn } from "@/lib/utils"
+import { FileBrowserDialog } from "@/components/ssr/file-browser-dialog"
 
 // ---------------------------------------------------------------------------
 // Types — match lib/sa-control return shapes
@@ -77,6 +78,11 @@ export default function ServerAvatarPage() {
 
   // --- App drawer state -----------------------------------------------------
   const [drawerApp, setDrawerApp] = React.useState<{ app: FleetApp; server: FleetServer } | null>(null)
+  // Per-app /public_html browser — list/view/edit/upload/delete files in
+  // the app's webroot directly. Reuses the same FileBrowserDialog the
+  // /domains page uses; this just lets the operator launch it from here
+  // for any app on any server, not just SSR-tracked domains.
+  const [filesCtx, setFilesCtx] = React.useState<{ domain: string; server_ip: string } | null>(null)
 
   // --- Upload dialog state — shared single + bulk -------------------------
   const [uploadCtx, setUploadCtx] = React.useState<
@@ -315,6 +321,14 @@ export default function ServerAvatarPage() {
                                 <div className="flex justify-end gap-1">
                                   <Button
                                     size="sm" variant="outline" className="h-7 gap-1 px-2 text-xs"
+                                    onClick={() => a.domain && s.ip && setFilesCtx({ domain: a.domain, server_ip: s.ip })}
+                                    title="Browse /public_html — list, view, edit, delete, upload files"
+                                    disabled={!a.domain || !s.ip}
+                                  >
+                                    <FileUp className="h-3 w-3" /> Files
+                                  </Button>
+                                  <Button
+                                    size="sm" variant="outline" className="h-7 gap-1 px-2 text-xs"
                                     onClick={() => setDrawerApp({ app: a, server: s })}
                                     title="Open app control panel — edit index.php, restart, SSL"
                                     disabled={!a.domain || !s.ip}
@@ -342,9 +356,12 @@ export default function ServerAvatarPage() {
           <Boxes className="h-3.5 w-3.5 text-muted-foreground" /> Coming when ServerAvatar exposes API
         </div>
         <p className="mt-1 text-micro text-muted-foreground">
-          Database management · Firewall management · Backups · Cron jobs · Git deployments · Full file browser ·
-          Historical monitoring graphs. These are operationally high-risk to glue via SSH alone — we'll add them
+          Database management · Firewall management · Backups · Cron jobs · Git deployments ·
+          Historical monitoring graphs. These are operationally high-risk to glue via SSH alone — we&apos;ll add them
           here as soon as SA publishes proper REST endpoints.
+          <br />
+          <span className="text-status-completed">File browser is live</span> — click <strong>Files</strong> on
+          any app row to list / view / edit / upload / delete files in <code className="font-mono">/public_html</code>.
         </p>
       </section>
 
@@ -373,6 +390,13 @@ export default function ServerAvatarPage() {
           onDone={(msg, ok) => { setUploadCtx(null); show(ok ? "ok" : "err", msg) }}
         />
       )}
+
+      <FileBrowserDialog
+        open={filesCtx !== null}
+        onOpenChange={(o) => { if (!o) setFilesCtx(null) }}
+        domain={filesCtx?.domain ?? ""}
+        serverIp={filesCtx?.server_ip ?? ""}
+      />
 
       {bulkOpen && (
         <BulkEditDialog
