@@ -14,7 +14,7 @@
  */
 
 import { getSetting } from "./repos/settings"
-import { getMasterPrompt } from "./master-prompt"
+import { getMasterPrompt, substituteMasterPromptPlaceholders } from "./master-prompt"
 import { logPipeline } from "./repos/logs"
 import { withSemaphore, getSemaphore } from "./concurrency"
 import { runLlmCli, type CliProvider } from "./llm-cli"
@@ -24,6 +24,7 @@ import {
   recordAiKeyCall,
   recordAiKeyError,
 } from "./cf-ai-pool"
+import { resolveModelForCall } from "./llm-models"
 
 // Cap concurrent LLM calls so a 50-fan-out doesn't blow per-account RPM/TPM
 // quotas. Override with SSR_LLM_CONCURRENCY (min 1).
@@ -538,6 +539,11 @@ export interface GenerateOpts {
   /** Override the model for this call only. Falls back to `llm_model`
    *  setting, then the per-provider default. */
   customModel?: string | null
+  /** Override the master/system prompt for this call only. The string is
+   *  used verbatim (after blocklist placeholder substitution) instead of
+   *  reading `llm_master_prompt` from settings. Empty / null falls back
+   *  to the global master prompt. */
+  customMasterPrompt?: string | null
 }
 
 export async function generateSinglePage(
@@ -593,7 +599,20 @@ async function _generateSinglePageImpl(
   // Disclaimer — that the curated baseline requires).
   // Re-read on every generation so /settings edits take effect immediately
   // without a worker restart.
-  const systemMsg = getMasterPrompt(blocklist)
+  //
+  // Per-run override (`opts.customMasterPrompt`) wins when provided — used
+  // by the per-domain Regenerate dialog so the operator can tweak the
+  // system prompt for ONE call without changing the global setting. We
+  // still substitute blocklist placeholders so the operator can keep
+  // {{NICHE_BLOCKLIST}} in their custom prompt and have it filled in.
+  const customMaster = (opts.customMasterPrompt ?? "").trim()
+  const systemMsg = customMaster
+    ? substituteMasterPromptPlaceholders(customMaster, blocklist)
+    : getMasterPrompt(blocklist)
+  if (customMaster) {
+    logPipeline(domain, "generate_site_v2", "running",
+      `Using per-run master prompt override (${customMaster.length} chars)`)
+  }
   // When the operator provides a custom brief (force-rerun on step 9 with
   // textarea input), prepend it as an explicit "Operator brief" so the
   // model treats it as the niche/style intent. The system prompt's safety
@@ -618,7 +637,18 @@ async function _generateSinglePageImpl(
     const cliDefault = provider === "anthropic_cli"
       ? "claude-haiku-4-5-20251001"   // cheapest Pro-tier Claude that handles full HTML gen
       : "gpt-5.5"                      // codex CLI v0.125 default
-    const model = (overrideModel || getSetting("llm_model") || cliDefault).trim()
+    const resolved = resolveModelForCall({
+      provider, override: overrideModel,
+      globalSetting: getSetting("llm_model") || "",
+      branchDefault: cliDefault,
+    })
+    if (resolved.fallback) {
+      logPipeline(domain, "generate_site_v2", "warning",
+        `Model auto-substituted: ${resolved.reason}. ` +
+        `Was the per-call override / Settings → Default model left from a different provider? ` +
+        `Pick a ${cliProvider} model in /settings → LLM to silence this.`)
+    }
+    const model = resolved.model
     logPipeline(domain, "generate_site_v2", "running",
       `${cliProvider} CLI call: model=${model}`)
     const { text: cliText } = await runLlmCli(cliProvider, model, systemMsg, userMsg)
@@ -646,7 +676,16 @@ async function _generateSinglePageImpl(
         "X-Title": "SSR Site Generator",
       }
     }
-    const model = (overrideModel || getSetting("llm_model") || defaultModel).trim()
+    const resolved = resolveModelForCall({
+      provider, override: overrideModel,
+      globalSetting: getSetting("llm_model") || "",
+      branchDefault: defaultModel,
+    })
+    if (resolved.fallback) {
+      logPipeline(domain, "generate_site_v2", "warning",
+        `Model auto-substituted: ${resolved.reason}.`)
+    }
+    const model = resolved.model
     logPipeline(domain, "generate_site_v2", "running",
       `${provider} call: model=${model}, max_tokens=${maxTokens}`)
     const tokenField =
@@ -691,7 +730,16 @@ async function _generateSinglePageImpl(
     if (!accountId) {
       throw new Error("cloudflare_account_id is empty — set it in Settings → LLM")
     }
-    const model = (overrideModel || getSetting("llm_model") || "@cf/moonshotai/kimi-k2.6").trim()
+    const cfResolved = resolveModelForCall({
+      provider, override: overrideModel,
+      globalSetting: getSetting("llm_model") || "",
+      branchDefault: "@cf/moonshotai/kimi-k2.6",
+    })
+    if (cfResolved.fallback) {
+      logPipeline(domain, "generate_site_v2", "warning",
+        `Model auto-substituted: ${cfResolved.reason}.`)
+    }
+    const model = cfResolved.model
     logPipeline(domain, "generate_site_v2", "running",
       `cloudflare workers-ai call: model=${model}, max_tokens=${maxTokens}`)
     const out = await callCloudflareWorkersAi({
@@ -703,7 +751,16 @@ async function _generateSinglePageImpl(
     // Round-robin across cf_workers_ai_keys. Stacks the free 10k-neuron/day
     // quota across every CF account in the pool. On 429 / quota errors we
     // mark last_error on the row and retry with the next-LRU active row.
-    const model = (overrideModel || getSetting("llm_model") || "@cf/moonshotai/kimi-k2.6").trim()
+    const poolResolved = resolveModelForCall({
+      provider, override: overrideModel,
+      globalSetting: getSetting("llm_model") || "",
+      branchDefault: "@cf/moonshotai/kimi-k2.6",
+    })
+    if (poolResolved.fallback) {
+      logPipeline(domain, "generate_site_v2", "warning",
+        `Model auto-substituted: ${poolResolved.reason}.`)
+    }
+    const model = poolResolved.model
     const tried: number[] = []
     let lastErr: Error | null = null
     let attempt = 0
@@ -765,7 +822,16 @@ async function _generateSinglePageImpl(
       throw new AiPoolExhausted("cloudflare_pool: exited without a successful call")
     }
   } else if (provider === "gemini") {
-    const model = (overrideModel || getSetting("llm_model") || "gemini-2.5-flash").trim()
+    const gemResolved = resolveModelForCall({
+      provider, override: overrideModel,
+      globalSetting: getSetting("llm_model") || "",
+      branchDefault: "gemini-2.5-flash",
+    })
+    if (gemResolved.fallback) {
+      logPipeline(domain, "generate_site_v2", "warning",
+        `Model auto-substituted: ${gemResolved.reason}.`)
+    }
+    const model = gemResolved.model
     logPipeline(domain, "generate_site_v2", "running",
       `gemini call: model=${model}, max_tokens=${maxTokens}`)
     const body = {
@@ -800,7 +866,16 @@ async function _generateSinglePageImpl(
     usage = { input_tokens: um.promptTokenCount ?? null, output_tokens: um.candidatesTokenCount ?? null }
   } else {
     // Default / anthropic
-    const model = (overrideModel || getSetting("llm_model") || "claude-haiku-4-5-20251001").trim()
+    const aResolved = resolveModelForCall({
+      provider: "anthropic", override: overrideModel,
+      globalSetting: getSetting("llm_model") || "",
+      branchDefault: "claude-haiku-4-5-20251001",
+    })
+    if (aResolved.fallback) {
+      logPipeline(domain, "generate_site_v2", "warning",
+        `Model auto-substituted: ${aResolved.reason}.`)
+    }
+    const model = aResolved.model
     logPipeline(domain, "generate_site_v2", "running",
       `Anthropic call: model=${model}, max_tokens=${maxTokens}`)
     const res = await fetch("https://api.anthropic.com/v1/messages", {

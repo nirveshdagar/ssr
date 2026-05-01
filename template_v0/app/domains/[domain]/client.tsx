@@ -13,6 +13,9 @@ import {
   Copy,
   ExternalLink,
   Sparkles,
+  FileText,
+  ChevronDown,
+  ChevronRight,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { ButtonGroup } from "@/components/ui/button-group"
@@ -24,6 +27,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Checkbox } from "@/components/ui/checkbox"
 import { ModelPicker } from "@/components/ssr/model-picker"
+import { LLM_PROVIDER_OPTIONS } from "@/lib/llm-models"
 import { StatusBadge } from "@/components/ssr/status-badge"
 import { PipelineProgress } from "@/components/ssr/pipeline-progress"
 import { MonoCode } from "@/components/ssr/data-table"
@@ -160,19 +164,56 @@ export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, i
     provider: string
     model: string
     busy: boolean
-  }>({ open: false, prompt: "", provider: "", model: "", busy: false })
+    showMaster: boolean
+    masterDraft: string
+  }>({ open: false, prompt: "", provider: "", model: "", busy: false, showMaster: false, masterDraft: "" })
+  // Lazily-fetched master prompt for the in-dialog preview. Pulled the
+  // first time the operator opens the dialog so we don't burn an /api hit
+  // on every page load. Re-pulled on each open so /settings edits are
+  // reflected without a page refresh. `baseline` is the unmodified server
+  // value — `briefDialog.masterDraft` starts equal to it; we send an
+  // override only if the operator has actually changed it.
+  const [masterPrompt, setMasterPrompt] = React.useState<{
+    baseline: string; loading: boolean; error: string | null
+  }>({ baseline: "", loading: false, error: null })
+  async function loadMasterPrompt() {
+    setMasterPrompt({ baseline: "", loading: true, error: null })
+    try {
+      const r = await fetch("/api/settings/master-prompt", { credentials: "same-origin" })
+      const j = (await r.json()) as { content?: string; default_content?: string; is_default?: boolean; error?: string }
+      if (!r.ok) {
+        setMasterPrompt({ baseline: "", loading: false, error: j.error ?? `HTTP ${r.status}` })
+        return
+      }
+      const c = j.is_default ? (j.default_content ?? "") : (j.content ?? "")
+      setMasterPrompt({ baseline: c, loading: false, error: null })
+      // Seed the editable draft so the textarea isn't empty when expanded.
+      setBriefDialog((s) => ({ ...s, masterDraft: c }))
+    } catch (e) {
+      setMasterPrompt({ baseline: "", loading: false, error: (e as Error).message })
+    }
+  }
   function openBriefDialog() {
-    setBriefDialog({ open: true, prompt: "", provider: "", model: "", busy: false })
+    setBriefDialog({ open: true, prompt: "", provider: "", model: "", busy: false, showMaster: false, masterDraft: "" })
+    void loadMasterPrompt()
   }
   async function submitBriefDialog() {
     setBriefDialog((s) => ({ ...s, busy: true }))
+    // Only send the master prompt override when the operator actually
+    // changed it. Sending the unchanged baseline would (a) bloat every
+    // job payload by ~6KB and (b) shadow future /settings edits during
+    // pipeline retries.
+    const draft = briefDialog.masterDraft.trim()
+    const baseline = masterPrompt.baseline.trim()
+    const masterOverride = draft && draft !== baseline ? draft : null
     const r = await domainActions.runFromStep(domain, 9, {
       customPrompt: briefDialog.prompt.trim() || null,
       customProvider: briefDialog.provider.trim() || null,
       customModel: briefDialog.model.trim() || null,
+      customMasterPrompt: masterOverride,
     })
     show(r.ok ? "ok" : "err", r.message ?? r.error ?? "Regenerate requested")
-    setBriefDialog({ open: false, prompt: "", provider: "", model: "", busy: false })
+    setBriefDialog({ open: false, prompt: "", provider: "", model: "", busy: false, showMaster: false, masterDraft: "" })
   }
   // Per-step "Run from here" — same primitive as the watcher page's per-row
   // button. Re-enqueues pipeline.full with start_from=N; smart-resume short-
@@ -655,13 +696,9 @@ export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, i
                   <SelectTrigger className="h-8 text-small mt-1"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="__default__">(use default from Settings)</SelectItem>
-                    <SelectItem value="anthropic">Anthropic (Claude)</SelectItem>
-                    <SelectItem value="openai">OpenAI (GPT)</SelectItem>
-                    <SelectItem value="gemini">Google Gemini</SelectItem>
-                    <SelectItem value="openrouter">OpenRouter</SelectItem>
-                    <SelectItem value="moonshot">Moonshot Kimi</SelectItem>
-                    <SelectItem value="cloudflare">Cloudflare Workers AI (single)</SelectItem>
-                    <SelectItem value="cloudflare_pool">Cloudflare Workers AI POOL</SelectItem>
+                    {LLM_PROVIDER_OPTIONS.map((p) => (
+                      <SelectItem key={p.id} value={p.id}>{p.label}</SelectItem>
+                    ))}
                   </SelectContent>
                 </Select>
               </div>
@@ -728,14 +765,89 @@ export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, i
             </DialogDescription>
           </DialogHeader>
           <div className="min-h-0 flex-1 overflow-y-auto px-6 py-3 flex flex-col gap-3">
-            <Textarea
-              value={briefDialog.prompt}
-              onChange={(e) => setBriefDialog((s) => ({ ...s, prompt: e.target.value }))}
-              placeholder="e.g. Professional dental clinic landing page in a teal/white palette. Hero with appointment-CTA, services list (cleanings / fillings / cosmetic), team blurb, location map, contact form."
-              rows={6}
-              className="font-mono text-small"
-              autoFocus
-            />
+            {/* Master prompt preview — collapsible, read-only. The brief
+                below is ADDED on top of this; the master prompt itself
+                is global and lives in /settings → LLM. */}
+            <div className="rounded-md border border-border/60 bg-muted/20">
+              <button
+                type="button"
+                onClick={() => setBriefDialog((s) => ({ ...s, showMaster: !s.showMaster }))}
+                className="w-full flex items-center justify-between gap-2 px-3 py-2 text-micro text-muted-foreground hover:text-foreground"
+              >
+                <span className="inline-flex items-center gap-1.5">
+                  <FileText className="h-3 w-3" />
+                  <span className="font-medium">Master prompt</span>
+                  <span>(system instruction · editable for THIS run)</span>
+                  {briefDialog.masterDraft.trim() &&
+                   briefDialog.masterDraft.trim() !== masterPrompt.baseline.trim() && (
+                    <span className="rounded bg-status-waiting/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-status-waiting">
+                      modified
+                    </span>
+                  )}
+                </span>
+                <span className="inline-flex items-center gap-2">
+                  {briefDialog.masterDraft && (
+                    <span className="font-mono tabular-nums">
+                      {briefDialog.masterDraft.length.toLocaleString()} chars
+                    </span>
+                  )}
+                  {briefDialog.showMaster
+                    ? <ChevronDown className="h-3 w-3" />
+                    : <ChevronRight className="h-3 w-3" />}
+                </span>
+              </button>
+              {briefDialog.showMaster && (
+                <div className="border-t border-border/60 px-3 py-2 flex flex-col gap-1.5">
+                  {masterPrompt.loading ? (
+                    <div className="text-micro text-muted-foreground">Loading…</div>
+                  ) : masterPrompt.error ? (
+                    <div className="text-micro text-status-terminal">
+                      {masterPrompt.error}
+                    </div>
+                  ) : (
+                    <Textarea
+                      value={briefDialog.masterDraft}
+                      onChange={(e) => setBriefDialog((s) => ({ ...s, masterDraft: e.target.value }))}
+                      rows={10}
+                      className="font-mono text-[11.5px] leading-snug max-h-[260px] resize-y overflow-y-auto bg-card"
+                      placeholder="Master prompt — what the LLM is told before generating each site."
+                    />
+                  )}
+                  <div className="flex items-center justify-between gap-2 text-micro text-muted-foreground">
+                    <span>
+                      Edits override the global master prompt for THIS run only.
+                      Saved settings are unchanged.
+                      {" "}<a href="/settings#llm" className="text-status-running hover:underline">
+                        Edit globally →
+                      </a>
+                    </span>
+                    {briefDialog.masterDraft.trim() !== masterPrompt.baseline.trim() && !masterPrompt.loading && (
+                      <button
+                        type="button"
+                        onClick={() => setBriefDialog((s) => ({ ...s, masterDraft: masterPrompt.baseline }))}
+                        className="text-status-running hover:underline shrink-0"
+                        title="Discard your in-dialog edits and reset to the saved master prompt"
+                      >
+                        Reset to baseline
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+            <div>
+              <label className="text-micro font-medium">
+                Brief <span className="text-muted-foreground">(this run only — added to the master prompt above)</span>
+              </label>
+              <Textarea
+                value={briefDialog.prompt}
+                onChange={(e) => setBriefDialog((s) => ({ ...s, prompt: e.target.value }))}
+                placeholder="e.g. Professional dental clinic landing page in a teal/white palette. Hero with appointment-CTA, services list (cleanings / fillings / cosmetic), team blurb, location map, contact form."
+                rows={6}
+                className="font-mono text-small mt-1"
+                autoFocus
+              />
+            </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <label className="text-micro font-medium">
@@ -750,13 +862,9 @@ export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, i
                   <SelectTrigger className="h-8 text-small mt-1"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="__default__">(use global setting)</SelectItem>
-                    <SelectItem value="anthropic">Anthropic (Claude)</SelectItem>
-                    <SelectItem value="openai">OpenAI (GPT)</SelectItem>
-                    <SelectItem value="gemini">Google Gemini</SelectItem>
-                    <SelectItem value="openrouter">OpenRouter</SelectItem>
-                    <SelectItem value="moonshot">Moonshot Kimi</SelectItem>
-                    <SelectItem value="cloudflare">Cloudflare Workers AI (single)</SelectItem>
-                    <SelectItem value="cloudflare_pool">Cloudflare Workers AI POOL</SelectItem>
+                    {LLM_PROVIDER_OPTIONS.map((p) => (
+                      <SelectItem key={p.id} value={p.id}>{p.label}</SelectItem>
+                    ))}
                   </SelectContent>
                 </Select>
               </div>
@@ -785,7 +893,7 @@ export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, i
           <DialogFooter className="shrink-0 border-t border-border bg-background/95 px-6 py-3">
             <Button
               variant="ghost" size="sm"
-              onClick={() => setBriefDialog({ open: false, prompt: "", provider: "", model: "", busy: false })}
+              onClick={() => setBriefDialog({ open: false, prompt: "", provider: "", model: "", busy: false, showMaster: false, masterDraft: "" })}
               disabled={briefDialog.busy}
             >
               Cancel

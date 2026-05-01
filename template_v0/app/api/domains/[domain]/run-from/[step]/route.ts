@@ -40,6 +40,7 @@ export async function POST(
   let customPrompt: string | null = null
   let customProvider: string | null = null
   let customModel: string | null = null
+  let customMasterPrompt: string | null = null
   let forceRegen = false
   const trimOrNull = (v: unknown): string | null => {
     if (typeof v !== "string") return null
@@ -52,6 +53,7 @@ export async function POST(
     customPrompt = trimOrNull(body.custom_prompt)
     customProvider = trimOrNull(body.custom_provider)
     customModel = trimOrNull(body.custom_model)
+    customMasterPrompt = trimOrNull(body.custom_master_prompt)
     forceRegen = body.force_regen === true || body.force_regen === "on"
   } else {
     const form = await req.formData().catch(() => null)
@@ -59,7 +61,17 @@ export async function POST(
     customPrompt = trimOrNull(form?.get("custom_prompt"))
     customProvider = trimOrNull(form?.get("custom_provider"))
     customModel = trimOrNull(form?.get("custom_model"))
+    customMasterPrompt = trimOrNull(form?.get("custom_master_prompt"))
     forceRegen = ((form?.get("force_regen") as string | null) || "") === "on"
+  }
+  // Hard cap on the override size — large enough for any reasonable prompt
+  // (DEFAULT_MASTER_PROMPT is ~6 KB) but tight enough that a buggy / hostile
+  // client can't queue a 10 MB job payload that bloats every retry.
+  if (customMasterPrompt && customMasterPrompt.length > 32_000) {
+    return NextResponse.json(
+      { ok: false, error: "custom_master_prompt too large (max 32000 chars)" },
+      { status: 413 },
+    )
   }
   // Operator explicitly wants to re-run from step N → clear the lock for
   // step N AND every step after, so the per-step idempotency wrapper
@@ -77,13 +89,15 @@ export async function POST(
   const jobId = runFullPipeline(domain, {
     skipPurchase, startFrom: stepNum,
     customPrompt, customProvider, customModel, forceRegen,
+    customMasterPrompt,
   })
   const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null
   appendAudit(
     "pipeline_run_from", domain,
     `job=${jobId ?? "skipped"} step=${stepNum} skip_purchase=${skipPurchase} ` +
     `provider=${customProvider ?? ""} model=${customModel ?? ""} ` +
-    `force_regen=${forceRegen}`,
+    `force_regen=${forceRegen} ` +
+    `master_prompt_override=${customMasterPrompt ? `${customMasterPrompt.length}_chars` : "no"}`,
     ip,
   )
   if (jobId == null) {

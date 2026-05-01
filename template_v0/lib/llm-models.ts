@@ -130,6 +130,121 @@ export const KNOWN_MODELS_BY_PROVIDER: Record<string, ModelOption[]> = {
   cloudflare_pool: CF_WORKERS_AI_MODELS,
 }
 
+// CLI providers serve the same model catalog as their HTTP counterparts
+// (Claude CLI takes the same `claude-*` model ids as the Anthropic API,
+// codex CLI takes the same `gpt-*` ids as OpenAI). Without these aliases
+// the ModelPicker would render an empty dropdown for `*_cli` providers,
+// hiding the validation hooks below — operators would carry a stale
+// model id from a previous provider into the CLI run and Claude / codex
+// would reject it with a nested binary error.
+KNOWN_MODELS_BY_PROVIDER.anthropic_cli = KNOWN_MODELS_BY_PROVIDER.anthropic
+KNOWN_MODELS_BY_PROVIDER.openai_cli = KNOWN_MODELS_BY_PROVIDER.openai
+
+/**
+ * Whether `model` is recognized for `provider`. An empty model is always
+ * valid — it means "use the provider default", which is resolved later
+ * inside the generator. Used by ModelPicker + Settings to decide whether
+ * a model id needs to be auto-cleared on provider switch, and by step 9
+ * to short-circuit a guaranteed-fail call before spending a CLI process.
+ */
+export function isModelKnownForProvider(provider: string, model: string): boolean {
+  if (!model) return true
+  const list = KNOWN_MODELS_BY_PROVIDER[provider] ?? []
+  return list.some((m) => m.id === model)
+}
+
+/**
+ * Single source of truth for the LLM provider dropdown across every
+ * dialog that lets the operator pick a per-run provider override.
+ * Must include every provider key in KNOWN_MODELS_BY_PROVIDER plus
+ * the cli aliases. Drift between this list and any hardcoded copy
+ * is the bug class that hid Claude CLI from the per-domain Regenerate
+ * dialog after the v9 LLM stack rewrite.
+ */
+export interface ProviderOption {
+  id: string
+  /** Short human label shown in the dropdown. */
+  label: string
+}
+
+export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
+  { id: "anthropic", label: "Anthropic (Claude — API key)" },
+  { id: "anthropic_cli", label: "Claude Code CLI (free w/ Pro/Max)" },
+  { id: "openai", label: "OpenAI (GPT — API key)" },
+  { id: "openai_cli", label: "Codex CLI (OpenAI)" },
+  { id: "gemini", label: "Google Gemini / Gemma" },
+  { id: "openrouter", label: "OpenRouter" },
+  { id: "moonshot", label: "Moonshot Kimi" },
+  { id: "cloudflare", label: "Cloudflare Workers AI (single)" },
+  { id: "cloudflare_pool", label: "Cloudflare Workers AI POOL (free, stacked)" },
+]
+
+/** Find which provider's catalog contains `model`, or null. Used by
+ *  resolveModelForCall to detect cross-provider leaks (the case that
+ *  caused the gemma-4-31b-it / anthropic_cli incident). */
+export function findProviderForModel(model: string): string | null {
+  if (!model) return null
+  for (const [prov, list] of Object.entries(KNOWN_MODELS_BY_PROVIDER)) {
+    if (list.some((m) => m.id === model)) return prov
+  }
+  return null
+}
+
+export interface ModelResolution {
+  /** The model id to actually pass to the LLM call. */
+  model: string
+  /** True when we substituted the branch default for an incompatible candidate. */
+  fallback: boolean
+  /** Human-readable explanation when fallback=true; empty otherwise. */
+  reason: string
+  /** The candidate the caller asked for, before any substitution. */
+  requested: string
+}
+
+/**
+ * Defensive last-mile model resolver — called by every provider branch in
+ * step 9 right before the network call. Catches the "stale model id leaked
+ * across a provider switch" class of bug at the API boundary, which the
+ * UI-level ModelPicker auto-clear should have prevented but cannot if the
+ * operator sets `llm_model` via API / DB write / very old setting.
+ *
+ * Rules:
+ *   1. `override` (per-call) wins if it's compatible with the provider OR
+ *      not in any other provider's catalog (likely a custom model id).
+ *   2. If `override` is in ANOTHER provider's catalog (cross-provider leak)
+ *      → fall back to `branchDefault` and emit fallback=true.
+ *   3. If `override` empty, repeat 1-2 against the global `llm_model`
+ *      setting value (passed by the caller).
+ *   4. Empty everywhere → branchDefault.
+ */
+export function resolveModelForCall(opts: {
+  provider: string
+  override: string | null
+  globalSetting: string
+  branchDefault: string
+}): ModelResolution {
+  const { provider, override, globalSetting, branchDefault } = opts
+  const requested = (override || globalSetting || "").trim()
+  if (!requested) {
+    return { model: branchDefault, fallback: false, reason: "", requested: "" }
+  }
+  if (isModelKnownForProvider(provider, requested)) {
+    return { model: requested, fallback: false, reason: "", requested }
+  }
+  // Unknown for this provider — is it known elsewhere?
+  const owner = findProviderForModel(requested)
+  if (owner && owner !== provider) {
+    return {
+      model: branchDefault,
+      fallback: true,
+      reason: `model "${requested}" belongs to provider "${owner}", not "${provider}" — using "${branchDefault}" instead`,
+      requested,
+    }
+  }
+  // Unknown across all providers → operator-typed custom; pass it through.
+  return { model: requested, fallback: false, reason: "", requested }
+}
+
 export function getDefaultModelFor(provider: string): string {
   const list = KNOWN_MODELS_BY_PROVIDER[provider] ?? []
   return list.find((m) => m.default)?.id ?? list[0]?.id ?? ""

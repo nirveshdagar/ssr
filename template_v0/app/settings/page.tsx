@@ -39,6 +39,7 @@ import { useSettings, saveSettings, type SettingsValues } from "@/hooks/use-sett
 import { domainActions } from "@/lib/api-actions"
 import { CfAiPoolCard } from "@/components/ssr/cf-ai-pool-card"
 import { ModelPicker } from "@/components/ssr/model-picker"
+import { LLM_PROVIDER_OPTIONS } from "@/lib/llm-models"
 import { MasterPromptCard } from "@/components/ssr/master-prompt-card"
 
 // Section icon tints — pulled straight from the per-page-accent CSS vars so
@@ -499,14 +500,9 @@ export default function SettingsPage() {
                   <Select value={get("llm_provider") || "anthropic"} onValueChange={(v) => set("llm_provider", v)}>
                     <SelectTrigger className="h-8 text-small"><SelectValue /></SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="anthropic">Anthropic (Claude — API key)</SelectItem>
-                      <SelectItem value="anthropic_cli">Claude Code CLI (free w/ Pro/Max)</SelectItem>
-                      <SelectItem value="openai">OpenAI (GPT)</SelectItem>
-                      <SelectItem value="gemini">Google Gemini</SelectItem>
-                      <SelectItem value="openrouter">OpenRouter</SelectItem>
-                      <SelectItem value="moonshot">Moonshot Kimi</SelectItem>
-                      <SelectItem value="cloudflare">Cloudflare Workers AI (free, single)</SelectItem>
-                      <SelectItem value="cloudflare_pool">Cloudflare Workers AI POOL (free, stacked)</SelectItem>
+                      {LLM_PROVIDER_OPTIONS.map((p) => (
+                        <SelectItem key={p.id} value={p.id}>{p.label}</SelectItem>
+                      ))}
                     </SelectContent>
                   </Select>
                   <FieldDescription>

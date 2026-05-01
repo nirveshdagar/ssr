@@ -188,6 +188,11 @@ export interface PipelineFullPayload {
    *  site" flow so the operator gets fresh content without having to
    *  type a custom brief just to bypass the cache. */
   force_regen?: boolean
+  /** Per-run override of the master/system prompt — wins over the
+   *  llm_master_prompt setting for THIS pipeline run only. Used by the
+   *  per-domain Regenerate dialog when the operator edits the prompt
+   *  preview before submitting. */
+  custom_master_prompt?: string | null
 }
 
 export interface PipelineBulkPayload {
@@ -214,6 +219,8 @@ export function runFullPipeline(
      *  /ai-generator so the operator gets fresh content even when no
      *  custom brief / provider / model override is supplied. */
     forceRegen?: boolean
+    /** Per-run master prompt override — see PipelineFullPayload.custom_master_prompt. */
+    customMasterPrompt?: string | null
   } = {},
 ): number | null {
   if (!tryAcquireSlot(domain)) {
@@ -231,6 +238,7 @@ export function runFullPipeline(
     custom_provider: opts.customProvider ?? null,
     custom_model: opts.customModel ?? null,
     force_regen: opts.forceRegen ?? false,
+    custom_master_prompt: opts.customMasterPrompt ?? null,
   }, 3)
 }
 
@@ -367,6 +375,7 @@ async function pipelineFullHandler(payload: Record<string, unknown>): Promise<vo
     p.custom_provider ?? null,
     p.custom_model ?? null,
     p.force_regen ?? false,
+    p.custom_master_prompt ?? null,
   )
 }
 
@@ -413,6 +422,7 @@ async function pipelineWorker(
   customProvider: string | null = null,
   customModel: string | null = null,
   forceRegen: boolean = false,
+  customMasterPrompt: string | null = null,
 ): Promise<void> {
   const runId = startPipelineRun(domain, {
     skip_purchase: skipPurchase,
@@ -424,6 +434,7 @@ async function pipelineWorker(
     await pipelineWorkerImpl(
       domain, skipPurchase, serverId, startFrom, forceNewServer,
       customPrompt, customProvider, customModel, forceRegen,
+      customMasterPrompt,
     )
   } finally {
     ticker.stop()
@@ -456,6 +467,7 @@ async function pipelineWorkerImpl(
   forceNewServer: boolean, customPrompt: string | null = null,
   customProvider: string | null = null, customModel: string | null = null,
   forceRegen: boolean = false,
+  customMasterPrompt: string | null = null,
 ): Promise<void> {
   try {
     // Refuse to redo work on a domain that's already at a success status
@@ -575,7 +587,7 @@ async function pipelineWorkerImpl(
     let files: GeneratedFile[] | undefined
     if (startFrom == null || startFrom <= 9) {
       if (shouldRun(9)) {
-        const r = await step9GenerateContent(domain, customPrompt, customProvider, customModel, forceRegen)
+        const r = await step9GenerateContent(domain, customPrompt, customProvider, customModel, forceRegen, customMasterPrompt)
         if (r == null) return
         php = r.php
         files = r.files
@@ -594,7 +606,7 @@ async function pipelineWorkerImpl(
           logPipeline(domain, "pipeline", "warning",
             `Prior step 9 produced ${last9!.files!.length} files but only the index ` +
             `is cached — re-running step 9 to restore the full tree`)
-          const r = await step9GenerateContent(domain, customPrompt, customProvider, customModel, forceRegen)
+          const r = await step9GenerateContent(domain, customPrompt, customProvider, customModel, forceRegen, customMasterPrompt)
           if (r == null) return
           php = r.php
           files = r.files
@@ -1157,6 +1169,7 @@ async function step9GenerateContent(
   domain: string, customPrompt: string | null = null,
   customProvider: string | null = null, customModel: string | null = null,
   forceRegen: boolean = false,
+  customMasterPrompt: string | null = null,
 ): Promise<{ php: string; files?: GeneratedFile[] } | null> {
   const d = getDomain(domain)
   // When the operator supplied a custom brief OR explicitly chose a different
@@ -1166,7 +1179,7 @@ async function step9GenerateContent(
   // "Regenerate existing site" flow — same intent (fresh content) but
   // without requiring the operator to type a custom brief just to bypass
   // the cache.
-  const hasOverrides = Boolean(customPrompt || customProvider || customModel || forceRegen)
+  const hasOverrides = Boolean(customPrompt || customProvider || customModel || forceRegen || customMasterPrompt)
   if (!hasOverrides && d?.site_html && d.site_html.length > 100) {
     updateStep(domain, 9, "skipped", "Content already generated")
     // Note: no `files` here — multi-file siblings aren't cached on the
@@ -1183,7 +1196,7 @@ async function step9GenerateContent(
   updateStep(domain, 9, "running", `Generating single-page site${note}...`)
   try {
     const result = await generateSinglePage(domain, {
-      customPrompt, customProvider, customModel,
+      customPrompt, customProvider, customModel, customMasterPrompt,
     })
     const php = result.php
     const niche = result.inferredNiche

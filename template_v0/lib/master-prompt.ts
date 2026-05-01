@@ -138,6 +138,22 @@ Respond with the JSON object and nothing else. Do NOT include a "blocked" field.
 // ---------------------------------------------------------------------------
 
 /**
+ * Apply blocklist placeholder substitution to an arbitrary master-prompt
+ * template. Extracted so per-run override code paths (the per-domain
+ * Regenerate dialog's editable master prompt) get the same substitution
+ * without going through the global getter.
+ */
+export function substituteMasterPromptPlaceholders(template: string, blocklist: string[] = []): string {
+  const blocklistInline = blocklist.length ? ` (e.g. ${blocklist.join(", ")})` : ""
+  const blocklistRule = blocklist.length
+    ? `\n - Also avoid generating content about: ${blocklist.join(", ")}.\n`
+    : ""
+  return template
+    .replaceAll("{{NICHE_BLOCKLIST}}", blocklistInline)
+    .replaceAll("{{NICHE_BLOCKLIST_RULE}}", blocklistRule)
+}
+
+/**
  * Resolve the prompt the LLM should use for a generation. Substitutes the
  * blocklist placeholders. Call this from `_generateSinglePageImpl` on every
  * generation so prompt edits in /settings take effect immediately (no
@@ -147,13 +163,7 @@ export function getMasterPrompt(blocklist: string[] = []): string {
   ensureSchema()
   const stored = (getSetting("llm_master_prompt") ?? "").trim()
   const template = stored || DEFAULT_MASTER_PROMPT
-  const blocklistInline = blocklist.length ? ` (e.g. ${blocklist.join(", ")})` : ""
-  const blocklistRule = blocklist.length
-    ? `\n - Also avoid generating content about: ${blocklist.join(", ")}.\n`
-    : ""
-  return template
-    .replaceAll("{{NICHE_BLOCKLIST}}", blocklistInline)
-    .replaceAll("{{NICHE_BLOCKLIST_RULE}}", blocklistRule)
+  return substituteMasterPromptPlaceholders(template, blocklist)
 }
 
 export interface PromptHistoryRow {

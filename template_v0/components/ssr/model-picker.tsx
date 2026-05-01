@@ -4,6 +4,7 @@ import * as React from "react"
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { KNOWN_MODELS_BY_PROVIDER, type ModelOption } from "@/lib/llm-models"
+export { isModelKnownForProvider } from "@/lib/llm-models"
 
 const CUSTOM_SENTINEL = "__custom__"
 const DEFAULT_SENTINEL = "__default__"
@@ -48,10 +49,30 @@ export function ModelPicker({
   // default. Reset to dropdown if provider changes (different model list).
   const [customMode, setCustomMode] = React.useState(() => Boolean(value) && !isKnown)
   const lastProvider = React.useRef(provider)
+  // Capture latest `value` + `onChange` in refs so the provider-change
+  // effect can read them without listing them in deps — keeps the deps
+  // array length stable across renders (React's rule-of-hooks invariant)
+  // and avoids the effect re-firing every keystroke.
+  const valueRef = React.useRef(value)
+  const onChangeRef = React.useRef(onChange)
+  React.useEffect(() => { valueRef.current = value })
+  React.useEffect(() => { onChangeRef.current = onChange })
   React.useEffect(() => {
-    if (lastProvider.current !== provider) {
-      lastProvider.current = provider
-      setCustomMode(false)
+    if (lastProvider.current === provider) return
+    const prev = lastProvider.current
+    lastProvider.current = provider
+    setCustomMode(false)
+    // Provider changed — if the carried-over model id doesn't belong to
+    // the NEW provider's known list, clear it so the provider's default
+    // kicks in. Without this the operator silently gets e.g. a Gemma id
+    // sent to the Claude CLI, which exits 1 on launch with a nested
+    // binary error and burns a pipeline retry on every regen.
+    const v = valueRef.current
+    const list = KNOWN_MODELS_BY_PROVIDER[provider]
+    if (v && list && !list.some((m) => m.id === v)) {
+      // eslint-disable-next-line no-console
+      console.info(`[ModelPicker] cleared "${v}" — does not belong to ${provider} (was ${prev})`)
+      queueMicrotask(() => onChangeRef.current(""))
     }
   }, [provider])
 

@@ -63,6 +63,7 @@ import {
 import { OperatorDialog } from "@/components/ssr/operator-dialog"
 import { FileBrowserDialog } from "@/components/ssr/file-browser-dialog"
 import { ModelPicker } from "@/components/ssr/model-picker"
+import { LLM_PROVIDER_OPTIONS } from "@/lib/llm-models"
 import { Field, FieldLabel, FieldDescription } from "@/components/ui/field"
 import { Textarea } from "@/components/ui/textarea"
 import { PIPELINE_STEPS } from "@/lib/status-taxonomy"
@@ -1307,13 +1308,9 @@ function DomainsPageInner() {
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="__default__">LLM: default (from Settings)</SelectItem>
-                <SelectItem value="anthropic">LLM: Anthropic (Claude)</SelectItem>
-                <SelectItem value="openai">LLM: OpenAI (GPT)</SelectItem>
-                <SelectItem value="gemini">LLM: Google Gemini</SelectItem>
-                <SelectItem value="openrouter">LLM: OpenRouter</SelectItem>
-                <SelectItem value="moonshot">LLM: Moonshot Kimi</SelectItem>
-                <SelectItem value="cloudflare">LLM: Cloudflare Workers AI</SelectItem>
-                <SelectItem value="cloudflare_pool">LLM: Cloudflare Workers AI POOL</SelectItem>
+                {LLM_PROVIDER_OPTIONS.map((p) => (
+                  <SelectItem key={p.id} value={p.id}>LLM: {p.label}</SelectItem>
+                ))}
               </SelectContent>
             </Select>
             <div className="w-[220px]" title="Override the model id for step 9 across this batch. Empty = provider default.">
@@ -1469,13 +1466,9 @@ function DomainsPageInner() {
               <SelectTrigger size="sm" className="h-8 text-small"><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="__default__">(use default from Settings)</SelectItem>
-                <SelectItem value="anthropic">Anthropic (Claude)</SelectItem>
-                <SelectItem value="openai">OpenAI (GPT)</SelectItem>
-                <SelectItem value="gemini">Google Gemini</SelectItem>
-                <SelectItem value="openrouter">OpenRouter</SelectItem>
-                <SelectItem value="moonshot">Moonshot Kimi</SelectItem>
-                <SelectItem value="cloudflare">Cloudflare Workers AI (single)</SelectItem>
-                <SelectItem value="cloudflare_pool">Cloudflare Workers AI POOL</SelectItem>
+                {LLM_PROVIDER_OPTIONS.map((p) => (
+                  <SelectItem key={p.id} value={p.id}>{p.label}</SelectItem>
+                ))}
               </SelectContent>
             </Select>
             <ModelPicker
