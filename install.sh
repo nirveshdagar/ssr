@@ -125,6 +125,13 @@ mkdir -p "$INSTALL_DIR"
 # Step 4 — clone or update repo
 # ---------------------------------------------------------------------------
 log "clone / update repo at $INSTALL_DIR"
+# Git CVE-2022-24765 ownership check refuses to operate on a repo owned by a
+# different UID than the current user. The installer always runs as root but
+# the working dir gets chowned to the 'ssr' operator user later in step 7,
+# so the SECOND `sudo bash install.sh` (e.g. an upgrade run) hits "dubious
+# ownership". Preemptively whitelisting INSTALL_DIR keeps re-runs idempotent
+# without weakening security elsewhere — only this specific path is trusted.
+git config --global --add safe.directory "$INSTALL_DIR" 2>/dev/null || true
 if [[ -d "$INSTALL_DIR/.git" ]]; then
   cd "$INSTALL_DIR"
   git fetch --all --quiet
