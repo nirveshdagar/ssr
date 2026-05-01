@@ -13,6 +13,7 @@ import { Checkbox } from "@/components/ui/checkbox"
 import { ModelPicker } from "@/components/ssr/model-picker"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { MasterPromptCard } from "@/components/ssr/master-prompt-card"
+import { LLM_PROVIDER_OPTIONS } from "@/lib/llm-models"
 import { cn } from "@/lib/utils"
 
 interface QueueRow {
@@ -75,6 +76,17 @@ export default function AiGeneratorPage() {
   }
   // Selected hosted domains for the "Regenerate existing site" flow.
   const [regenSelected, setRegenSelected] = React.useState<Set<string>>(new Set())
+  // Filter chip for the regen list. When a regen fails the pipeline flips
+  // domains.status from live/hosted → retryable_error / terminal_error /
+  // warning. The list MUST include those statuses so the operator can
+  // retry — otherwise the row vanishes after one bad LLM run with no way
+  // to surface it back. "Failed only" hides the healthy rows for fast
+  // triage when many regens went sideways.
+  const [regenFilter, setRegenFilter] = React.useState<"all" | "failed">("all")
+  const REGEN_ELIGIBLE_STATUSES = new Set([
+    "live", "hosted", "retryable_error", "terminal_error", "warning",
+  ])
+  const FAILED_STATUSES = new Set(["retryable_error", "terminal_error", "warning", "failed"])
 
   function show(kind: "ok" | "err", text: string): void {
     setFlash({ kind, text })
@@ -371,14 +383,9 @@ export default function AiGeneratorPage() {
                   <SelectTrigger size="sm" className="h-8 text-small mt-1"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="__default__">(use Settings default)</SelectItem>
-                    <SelectItem value="anthropic">Anthropic (Claude — API key)</SelectItem>
-                    <SelectItem value="anthropic_cli">Claude Code CLI (free w/ Pro/Max)</SelectItem>
-                    <SelectItem value="openai">OpenAI (GPT)</SelectItem>
-                    <SelectItem value="gemini">Google Gemini / Gemma</SelectItem>
-                    <SelectItem value="openrouter">OpenRouter</SelectItem>
-                    <SelectItem value="moonshot">Moonshot Kimi</SelectItem>
-                    <SelectItem value="cloudflare">Cloudflare Workers AI</SelectItem>
-                    <SelectItem value="cloudflare_pool">Cloudflare Workers AI POOL</SelectItem>
+                    {LLM_PROVIDER_OPTIONS.map((p) => (
+                      <SelectItem key={p.id} value={p.id}>{p.label}</SelectItem>
+                    ))}
                   </SelectContent>
                 </Select>
                 {provider && (
@@ -456,63 +463,133 @@ export default function AiGeneratorPage() {
 
           <div className="p-5">
             {(() => {
-              const hosted = (domainsResp?.domains ?? [])
-                .filter((r) => r.status === "live" || r.status === "hosted")
-                .sort((a, b) => a.domain.localeCompare(b.domain))
-              if (hosted.length === 0) {
+              // Eligible = anything that's been past the early DNS/SSL steps and
+              // could meaningfully have step 9–10 re-run. Includes failed
+              // statuses so a botched regen stays visible and re-triable.
+              const eligible = (domainsResp?.domains ?? [])
+                .filter((r) => REGEN_ELIGIBLE_STATUSES.has(r.status))
+                .sort((a, b) => {
+                  // Failed rows float to the top so a 500-domain operator sees
+                  // their broken regens immediately without scrolling.
+                  const af = FAILED_STATUSES.has(a.status) ? 0 : 1
+                  const bf = FAILED_STATUSES.has(b.status) ? 0 : 1
+                  if (af !== bf) return af - bf
+                  return a.domain.localeCompare(b.domain)
+                })
+              const failedCount = eligible.filter((r) => FAILED_STATUSES.has(r.status)).length
+              const visible = regenFilter === "failed"
+                ? eligible.filter((r) => FAILED_STATUSES.has(r.status))
+                : eligible
+              if (eligible.length === 0) {
                 return (
                   <div className="text-small text-muted-foreground py-6 text-center">
-                    No hosted/live domains yet. Generate one above first.
+                    No domains eligible for regeneration yet. Generate one above first.
                   </div>
                 )
               }
-              const allChecked = hosted.every((r) => regenSelected.has(r.domain))
-              const someChecked = hosted.some((r) => regenSelected.has(r.domain)) && !allChecked
+              const allChecked = visible.length > 0 && visible.every((r) => regenSelected.has(r.domain))
+              const someChecked = visible.some((r) => regenSelected.has(r.domain)) && !allChecked
               return (
                 <div className="flex flex-col gap-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {/* Filter chips */}
+                    <button
+                      type="button"
+                      onClick={() => setRegenFilter("all")}
+                      className={cn(
+                        "rounded-full border px-2.5 py-0.5 text-micro transition-colors",
+                        regenFilter === "all"
+                          ? "border-status-running/60 bg-status-running/15 text-status-running font-medium"
+                          : "border-border bg-card text-muted-foreground hover:bg-muted",
+                      )}
+                    >
+                      All <span className="font-mono tabular-nums">{eligible.length}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setRegenFilter("failed")}
+                      disabled={failedCount === 0}
+                      className={cn(
+                        "rounded-full border px-2.5 py-0.5 text-micro transition-colors",
+                        regenFilter === "failed"
+                          ? "border-status-terminal/60 bg-status-terminal/15 text-status-terminal font-medium"
+                          : "border-border bg-card text-muted-foreground hover:bg-muted",
+                        failedCount === 0 && "opacity-50 cursor-not-allowed",
+                      )}
+                      title={failedCount === 0 ? "No failed regens" : "Show only previously-failed regens for fast retry"}
+                    >
+                      Failed only <span className="font-mono tabular-nums">{failedCount}</span>
+                    </button>
+                    <span className="ml-auto text-micro text-muted-foreground tabular-nums">
+                      {regenSelected.size} selected
+                    </span>
+                  </div>
                   <div className="flex items-center justify-between gap-2">
                     <label className="flex items-center gap-2 text-small">
                       <Checkbox
                         checked={allChecked ? true : someChecked ? "indeterminate" : false}
                         onCheckedChange={(v) => {
-                          setRegenSelected(v ? new Set(hosted.map((r) => r.domain)) : new Set())
+                          setRegenSelected((prev) => {
+                            const n = new Set(prev)
+                            if (v) for (const r of visible) n.add(r.domain)
+                            else for (const r of visible) n.delete(r.domain)
+                            return n
+                          })
                         }}
                       />
                       <span>
-                        Select all <span className="text-muted-foreground">({hosted.length} hosted/live)</span>
+                        Select all visible{" "}
+                        <span className="text-muted-foreground">({visible.length})</span>
                       </span>
                     </label>
-                    <span className="text-micro text-muted-foreground tabular-nums">
-                      {regenSelected.size} selected
-                    </span>
+                    {failedCount > 0 && regenFilter === "all" && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const failedDoms = eligible.filter((r) => FAILED_STATUSES.has(r.status))
+                          setRegenSelected(new Set(failedDoms.map((r) => r.domain)))
+                        }}
+                        className="text-micro text-status-terminal hover:underline"
+                        title="One-click select every previously-failed regen so you can retry them all"
+                      >
+                        Select {failedCount} failed
+                      </button>
+                    )}
                   </div>
                   <div className="rounded-md border border-border max-h-[260px] overflow-y-auto divide-y divide-border">
-                    {hosted.map((r) => (
-                      <label
-                        key={r.domain}
-                        className="flex items-center gap-2 px-3 py-2 text-small hover:bg-muted/40 cursor-pointer"
-                      >
-                        <Checkbox
-                          checked={regenSelected.has(r.domain)}
-                          onCheckedChange={(v) => {
-                            setRegenSelected((s) => {
-                              const n = new Set(s)
-                              if (v) n.add(r.domain); else n.delete(r.domain)
-                              return n
-                            })
-                          }}
-                        />
-                        <span className="font-mono">{r.domain}</span>
-                        <span className="ml-auto rounded bg-muted px-1.5 py-0.5 text-micro font-medium text-muted-foreground">
-                          {r.status}
-                        </span>
-                      </label>
-                    ))}
+                    {visible.map((r) => {
+                      const isFailed = FAILED_STATUSES.has(r.status)
+                      return (
+                        <label
+                          key={r.domain}
+                          className={cn(
+                            "flex items-center gap-2 px-3 py-2 text-small hover:bg-muted/40 cursor-pointer",
+                            isFailed && "bg-status-terminal/[0.03]",
+                          )}
+                        >
+                          <Checkbox
+                            checked={regenSelected.has(r.domain)}
+                            onCheckedChange={(v) => {
+                              setRegenSelected((s) => {
+                                const n = new Set(s)
+                                if (v) n.add(r.domain); else n.delete(r.domain)
+                                return n
+                              })
+                            }}
+                          />
+                          <span className="font-mono">{r.domain}</span>
+                          <span className="ml-auto">
+                            <StatusPill status={r.status} />
+                          </span>
+                        </label>
+                      )
+                    })}
                   </div>
                   <div className="flex items-center justify-between gap-2">
                     <p className="text-micro text-muted-foreground">
                       Uses the same Provider / Model / Brief settings above.
                       Brief blank? LLM falls back to the master prompt + domain name.
+                      Failed rows can be re-selected and re-run from here.
                     </p>
                     <Button
                       size="sm" className="gap-1.5 shrink-0"

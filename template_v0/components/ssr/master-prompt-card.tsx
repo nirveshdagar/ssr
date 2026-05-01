@@ -198,9 +198,9 @@ export function MasterPromptCard() {
         <Textarea
           value={effective}
           onChange={(e) => setDraft(e.target.value)}
-          rows={20}
+          rows={8}
           spellCheck={false}
-          className="w-full font-mono text-[12.5px] leading-relaxed"
+          className="w-full font-mono text-[12.5px] leading-relaxed max-h-[240px] resize-y overflow-y-auto"
           placeholder="Master prompt — leave empty to use the curated default."
         />
         <p className="mt-2 text-micro text-muted-foreground">
