@@ -183,6 +183,11 @@ export interface PipelineFullPayload {
   /** Per-call model override (e.g. "claude-haiku-4-5-20251001"). Falls back
    *  to the llm_model setting and then per-provider defaults. */
   custom_model?: string | null
+  /** When true, step 9 ignores the cached `domain.site_html` and always
+   *  re-runs the LLM. Used by the AI Generator's "Regenerate existing
+   *  site" flow so the operator gets fresh content without having to
+   *  type a custom brief just to bypass the cache. */
+  force_regen?: boolean
 }
 
 export interface PipelineBulkPayload {
@@ -204,6 +209,11 @@ export function runFullPipeline(
     customPrompt?: string | null
     customProvider?: string | null
     customModel?: string | null
+    /** When true, step 9 ignores the cached `site_html` and always re-runs
+     *  the LLM. Used by the "Regenerate existing site" flow on
+     *  /ai-generator so the operator gets fresh content even when no
+     *  custom brief / provider / model override is supplied. */
+    forceRegen?: boolean
   } = {},
 ): number | null {
   if (!tryAcquireSlot(domain)) {
@@ -220,6 +230,7 @@ export function runFullPipeline(
     custom_prompt: opts.customPrompt ?? null,
     custom_provider: opts.customProvider ?? null,
     custom_model: opts.customModel ?? null,
+    force_regen: opts.forceRegen ?? false,
   }, 3)
 }
 
@@ -355,6 +366,7 @@ async function pipelineFullHandler(payload: Record<string, unknown>): Promise<vo
     p.custom_prompt ?? null,
     p.custom_provider ?? null,
     p.custom_model ?? null,
+    p.force_regen ?? false,
   )
 }
 
@@ -400,6 +412,7 @@ async function pipelineWorker(
   customPrompt: string | null = null,
   customProvider: string | null = null,
   customModel: string | null = null,
+  forceRegen: boolean = false,
 ): Promise<void> {
   const runId = startPipelineRun(domain, {
     skip_purchase: skipPurchase,
@@ -410,7 +423,7 @@ async function pipelineWorker(
   try {
     await pipelineWorkerImpl(
       domain, skipPurchase, serverId, startFrom, forceNewServer,
-      customPrompt, customProvider, customModel,
+      customPrompt, customProvider, customModel, forceRegen,
     )
   } finally {
     ticker.stop()
@@ -442,6 +455,7 @@ async function pipelineWorkerImpl(
   domain: string, skipPurchase: boolean, serverId: number | null, startFrom: number | null,
   forceNewServer: boolean, customPrompt: string | null = null,
   customProvider: string | null = null, customModel: string | null = null,
+  forceRegen: boolean = false,
 ): Promise<void> {
   try {
     // Refuse to redo work on a domain that's already at a success status
@@ -561,7 +575,7 @@ async function pipelineWorkerImpl(
     let files: GeneratedFile[] | undefined
     if (startFrom == null || startFrom <= 9) {
       if (shouldRun(9)) {
-        const r = await step9GenerateContent(domain, customPrompt, customProvider, customModel)
+        const r = await step9GenerateContent(domain, customPrompt, customProvider, customModel, forceRegen)
         if (r == null) return
         php = r.php
         files = r.files
@@ -580,7 +594,7 @@ async function pipelineWorkerImpl(
           logPipeline(domain, "pipeline", "warning",
             `Prior step 9 produced ${last9!.files!.length} files but only the index ` +
             `is cached — re-running step 9 to restore the full tree`)
-          const r = await step9GenerateContent(domain, customPrompt, customProvider, customModel)
+          const r = await step9GenerateContent(domain, customPrompt, customProvider, customModel, forceRegen)
           if (r == null) return
           php = r.php
           files = r.files
@@ -1142,13 +1156,17 @@ async function step8IssueAndInstallSsl(domain: string, server: ServerRow): Promi
 async function step9GenerateContent(
   domain: string, customPrompt: string | null = null,
   customProvider: string | null = null, customModel: string | null = null,
+  forceRegen: boolean = false,
 ): Promise<{ php: string; files?: GeneratedFile[] } | null> {
   const d = getDomain(domain)
   // When the operator supplied a custom brief OR explicitly chose a different
   // provider/model (force-rerun via the brief dialog), ALWAYS run the LLM —
   // the cached site_html was generated under different params, so the
-  // operator clearly wants a redo.
-  const hasOverrides = Boolean(customPrompt || customProvider || customModel)
+  // operator clearly wants a redo. `forceRegen` is the AI Generator's
+  // "Regenerate existing site" flow — same intent (fresh content) but
+  // without requiring the operator to type a custom brief just to bypass
+  // the cache.
+  const hasOverrides = Boolean(customPrompt || customProvider || customModel || forceRegen)
   if (!hasOverrides && d?.site_html && d.site_html.length > 100) {
     updateStep(domain, 9, "skipped", "Content already generated")
     // Note: no `files` here — multi-file siblings aren't cached on the

@@ -51,10 +51,12 @@ export default function AiGeneratorPage() {
   const [provider, setProvider] = React.useState("")
   const [model, setModel] = React.useState("")
   const [brief, setBrief] = React.useState("")
-  const [busy, setBusy] = React.useState<"single" | "bulk" | null>(null)
+  const [busy, setBusy] = React.useState<"single" | "bulk" | "regen" | null>(null)
   const [flash, setFlash] = React.useState<{ kind: "ok" | "err"; text: string } | null>(null)
   const [showPrompt, setShowPrompt] = React.useState(false)
   const [recent, setRecent] = React.useState<string[]>([])
+  // Selected hosted domains for the "Regenerate existing site" flow.
+  const [regenSelected, setRegenSelected] = React.useState<Set<string>>(new Set())
 
   function show(kind: "ok" | "err", text: string): void {
     setFlash({ kind, text })
@@ -155,6 +157,58 @@ export default function AiGeneratorPage() {
     try {
       await submit(domains)
       setBulk("")
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  /**
+   * Regenerate flow: hosted/live domains the operator picks via checkbox
+   * get re-run from step 9 with force_regen=true so the LLM produces
+   * fresh content even when no custom brief / provider override is set.
+   * Step 10 then re-uploads, replacing the live index. Skips DNS, SSL,
+   * server provisioning — pure content rewrite.
+   */
+  async function submitRegen(): Promise<void> {
+    const list = [...regenSelected]
+    if (list.length === 0) { show("err", "Pick at least one domain to regenerate"); return }
+    if (!confirm(
+      `Regenerate content for ${list.length} domain(s)?\n\n` +
+      `Each runs steps 9–10 (LLM content + upload). The current live ` +
+      `index.php will be REPLACED with the new content.\n\n` +
+      (brief
+        ? `Brief: "${brief.slice(0, 120)}${brief.length > 120 ? "…" : ""}"\n\n`
+        : `No brief — LLM uses the master prompt + domain name.\n\n`) +
+      `Continue?`,
+    )) return
+    setBusy("regen")
+    try {
+      const ok: string[] = []
+      const failed: { domain: string; reason: string }[] = []
+      for (const d of list) {
+        const r = await fetch(`/api/domains/${encodeURIComponent(d)}/run-from/9`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({
+            skip_purchase: "on",
+            force_regen: "on",
+            custom_prompt: brief || undefined,
+            custom_provider: provider || undefined,
+            custom_model: model || undefined,
+          }),
+        })
+        const j = (await r.json().catch(() => ({}))) as Record<string, unknown>
+        if (j.ok === true) ok.push(d)
+        else failed.push({ domain: d, reason: String(j.error ?? j.message ?? `HTTP ${r.status}`) })
+      }
+      const msg = ok.length === list.length
+        ? `Regeneration enqueued for all ${ok.length} domain(s)`
+        : `Regeneration enqueued for ${ok.length}/${list.length}; ${failed.length} skipped (${failed.slice(0, 3).map((f) => f.domain).join(", ")}${failed.length > 3 ? "…" : ""})`
+      show(failed.length === 0 ? "ok" : "err", msg)
+      setRecent((prev) => [...new Set([...ok, ...prev])].slice(0, 100))
+      setRegenSelected(new Set())
+      await mutateWatcher()
     } finally {
       setBusy(null)
     }
@@ -327,6 +381,98 @@ export default function AiGeneratorPage() {
                 use the Regenerate dialog on each /domains/[domain] page.
               </p>
             </div>
+          </div>
+        </section>
+
+        {/* ===== Regenerate existing ===== */}
+        <section className="rounded-md border border-border bg-card">
+          <header className="border-b border-border px-5 py-3">
+            <div className="flex items-center gap-2 text-[13px] font-semibold">
+              <RotateCw className="h-3.5 w-3.5 text-status-running" />
+              Regenerate existing site
+            </div>
+            <p className="mt-0.5 text-micro text-muted-foreground">
+              Pick one or more hosted/live domains to re-generate content for.
+              Re-runs steps 9–10 only (LLM gen + upload) — DNS, SSL, server
+              provisioning are skipped. The current <code className="text-[11px] px-1 rounded bg-muted">/public_html/index.php</code> is REPLACED
+              with the new content.
+            </p>
+          </header>
+
+          <div className="p-5">
+            {(() => {
+              const hosted = (domains?.rows ?? [])
+                .filter((r) => r.status === "live" || r.status === "hosted")
+                .sort((a, b) => a.domain.localeCompare(b.domain))
+              if (hosted.length === 0) {
+                return (
+                  <div className="text-small text-muted-foreground py-6 text-center">
+                    No hosted/live domains yet. Generate one above first.
+                  </div>
+                )
+              }
+              const allChecked = hosted.every((r) => regenSelected.has(r.domain))
+              const someChecked = hosted.some((r) => regenSelected.has(r.domain)) && !allChecked
+              return (
+                <div className="flex flex-col gap-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="flex items-center gap-2 text-small">
+                      <Checkbox
+                        checked={allChecked ? true : someChecked ? "indeterminate" : false}
+                        onCheckedChange={(v) => {
+                          setRegenSelected(v ? new Set(hosted.map((r) => r.domain)) : new Set())
+                        }}
+                      />
+                      <span>
+                        Select all <span className="text-muted-foreground">({hosted.length} hosted/live)</span>
+                      </span>
+                    </label>
+                    <span className="text-micro text-muted-foreground tabular-nums">
+                      {regenSelected.size} selected
+                    </span>
+                  </div>
+                  <div className="rounded-md border border-border max-h-[260px] overflow-y-auto divide-y divide-border">
+                    {hosted.map((r) => (
+                      <label
+                        key={r.domain}
+                        className="flex items-center gap-2 px-3 py-2 text-small hover:bg-muted/40 cursor-pointer"
+                      >
+                        <Checkbox
+                          checked={regenSelected.has(r.domain)}
+                          onCheckedChange={(v) => {
+                            setRegenSelected((s) => {
+                              const n = new Set(s)
+                              if (v) n.add(r.domain); else n.delete(r.domain)
+                              return n
+                            })
+                          }}
+                        />
+                        <span className="font-mono">{r.domain}</span>
+                        <span className="ml-auto rounded bg-muted px-1.5 py-0.5 text-micro font-medium text-muted-foreground">
+                          {r.status}
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-micro text-muted-foreground">
+                      Uses the same Provider / Model / Brief settings above.
+                      Brief blank? LLM falls back to the master prompt + domain name.
+                    </p>
+                    <Button
+                      size="sm" className="gap-1.5 shrink-0"
+                      onClick={submitRegen}
+                      disabled={busy !== null || regenSelected.size === 0}
+                    >
+                      {busy === "regen"
+                        ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        : <RotateCw className="h-3.5 w-3.5" />}
+                      Regenerate {regenSelected.size > 0 ? `(${regenSelected.size})` : ""}
+                    </Button>
+                  </div>
+                </div>
+              )
+            })()}
           </div>
         </section>
 

@@ -127,6 +127,9 @@ export const domainActions = {
       customPrompt?: string | null
       customProvider?: string | null
       customModel?: string | null
+      /** When true, step 9 ignores the cached site_html and re-runs the
+       *  LLM. Used by the AI Generator's Regenerate flow. */
+      forceRegen?: boolean
     } = {},
   ): Promise<ActionResult> => {
     try {
@@ -139,6 +142,7 @@ export const domainActions = {
           custom_prompt: opts.customPrompt ?? undefined,
           custom_provider: opts.customProvider ?? undefined,
           custom_model: opts.customModel ?? undefined,
+          force_regen: opts.forceRegen ? "on" : undefined,
         }),
       })
       const j = (await r.json().catch(() => ({}))) as Record<string, unknown>

@@ -40,6 +40,7 @@ export async function POST(
   let customPrompt: string | null = null
   let customProvider: string | null = null
   let customModel: string | null = null
+  let forceRegen = false
   const trimOrNull = (v: unknown): string | null => {
     if (typeof v !== "string") return null
     const t = v.trim()
@@ -51,12 +52,14 @@ export async function POST(
     customPrompt = trimOrNull(body.custom_prompt)
     customProvider = trimOrNull(body.custom_provider)
     customModel = trimOrNull(body.custom_model)
+    forceRegen = body.force_regen === true || body.force_regen === "on"
   } else {
     const form = await req.formData().catch(() => null)
     skipPurchase = ((form?.get("skip_purchase") as string | null) || "") === "on"
     customPrompt = trimOrNull(form?.get("custom_prompt"))
     customProvider = trimOrNull(form?.get("custom_provider"))
     customModel = trimOrNull(form?.get("custom_model"))
+    forceRegen = ((form?.get("force_regen") as string | null) || "") === "on"
   }
   // Operator explicitly wants to re-run from step N → clear the lock for
   // step N AND every step after, so the per-step idempotency wrapper
@@ -73,13 +76,14 @@ export async function POST(
   resetStepsFrom(domain, stepNum)
   const jobId = runFullPipeline(domain, {
     skipPurchase, startFrom: stepNum,
-    customPrompt, customProvider, customModel,
+    customPrompt, customProvider, customModel, forceRegen,
   })
   const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null
   appendAudit(
     "pipeline_run_from", domain,
     `job=${jobId ?? "skipped"} step=${stepNum} skip_purchase=${skipPurchase} ` +
-    `provider=${customProvider ?? ""} model=${customModel ?? ""}`,
+    `provider=${customProvider ?? ""} model=${customModel ?? ""} ` +
+    `force_regen=${forceRegen}`,
     ip,
   )
   if (jobId == null) {
