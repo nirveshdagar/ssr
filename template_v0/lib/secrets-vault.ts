@@ -33,6 +33,11 @@ export const SECRET_KEYS_EXACT = new Set<string>([
   "dashboard_password",
   "server_root_password",
   "cloudflare_workers_ai_token",
+  // Claude Code CLI long-lived OAuth token. When set, runLlmCli passes it
+  // to the `claude` binary via CLAUDE_CODE_OAUTH_TOKEN env, bypassing the
+  // ~/.claude/.credentials.json flow. Useful on headless servers where
+  // the browser-based `claude setup-token` round-trip isn't practical.
+  "claude_code_oauth_token",
 ])
 
 export const SECRET_KEYS_PREFIX = ["llm_api_key_"] as const

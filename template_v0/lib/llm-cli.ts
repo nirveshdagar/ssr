@@ -149,6 +149,21 @@ export async function runLlmCli(
   // With an explicit .cmd path, Node's spawn handles the shim natively.
   const resolvedBin = findBinary(provider) ?? bin
 
+  // Per-provider env injection. anthropic_cli reads
+  // CLAUDE_CODE_OAUTH_TOKEN from the settings vault and passes it through
+  // so the `claude` binary auths without needing ~/.claude/.credentials.json
+  // — the headless-server path. Empty means "fall back to whatever the
+  // binary finds on disk", which is correct for desktops where
+  // `claude setup-token` already wrote the creds file.
+  const childEnv: NodeJS.ProcessEnv = { ...process.env }
+  if (provider === "anthropic_cli") {
+    try {
+      const { getSetting } = require("./repos/settings") as typeof import("./repos/settings")
+      const tok = (getSetting("claude_code_oauth_token") || "").trim()
+      if (tok) childEnv.CLAUDE_CODE_OAUTH_TOKEN = tok
+    } catch { /* settings unreachable — fall back to binary's own creds */ }
+  }
+
   return new Promise((resolve, reject) => {
     let child
     try {
@@ -156,6 +171,7 @@ export async function runLlmCli(
         shell: false,
         windowsHide: true,
         stdio: ["pipe", "pipe", "pipe"],
+        env: childEnv,
       })
     } catch (e) {
       reject(new Error(`${provider} CLI '${bin}' failed to start: ${(e as Error).message}`))
@@ -322,7 +338,19 @@ export function isInstalled(provider: CliProvider): boolean {
 }
 
 export function isLoggedIn(provider: CliProvider): boolean {
-  return existsSync(META[provider].credsPath)
+  if (existsSync(META[provider].credsPath)) return true
+  // anthropic_cli also accepts a long-lived OAuth token pasted into
+  // /settings → LLM → Claude Code CLI. Without this fallback the panel
+  // would show "Signed in: no" on a headless server even though calls
+  // would actually work via the env-var.
+  if (provider === "anthropic_cli") {
+    try {
+      const { getSetting } = require("./repos/settings") as typeof import("./repos/settings")
+      const tok = (getSetting("claude_code_oauth_token") || "").trim()
+      if (tok) return true
+    } catch { /* settings unavailable on first boot */ }
+  }
+  return false
 }
 
 /**
@@ -333,7 +361,19 @@ export function isLoggedIn(provider: CliProvider): boolean {
  */
 export function inferAccount(provider: CliProvider): string | null {
   const { credsPath } = META[provider]
-  if (!existsSync(credsPath)) return null
+  if (!existsSync(credsPath)) {
+    // Token-only path — no creds file to parse, just say which fallback
+    // is active so the panel doesn't render an empty "Signed in" chip.
+    if (provider === "anthropic_cli") {
+      try {
+        const { getSetting } = require("./repos/settings") as typeof import("./repos/settings")
+        if ((getSetting("claude_code_oauth_token") || "").trim()) {
+          return "(via OAuth token)"
+        }
+      } catch { /* ignore */ }
+    }
+    return null
+  }
   try {
     const raw = readFileSync(credsPath, "utf8")
     const json = JSON.parse(raw) as Record<string, unknown>

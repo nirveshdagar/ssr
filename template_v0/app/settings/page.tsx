@@ -590,13 +590,34 @@ export default function SettingsPage() {
                   onToggle={() => { /* anthropic_cli is CLI-only — no toggle */ }}
                   hideEnableToggle={true}
                 />
+                {/* Token fallback for headless servers — `claude setup-token`
+                    needs a browser round-trip, which doesn't work over SSH.
+                    Generate the token on a desktop and paste it here. The
+                    spawn passes it via CLAUDE_CODE_OAUTH_TOKEN so the binary
+                    auths without the creds file. */}
+                <div className="mt-2">
+                  <FieldLabel className="text-micro">
+                    OAuth token <span className="text-muted-foreground">(optional — headless-server fallback)</span>
+                  </FieldLabel>
+                  <SecretInput
+                    value={(get("claude_code_oauth_token") as string) ?? ""}
+                    onChange={(v) => set("claude_code_oauth_token", v as never)}
+                    placeholder="sk-ant-oat01-… (from `claude setup-token` on a desktop)"
+                  />
+                  <FieldDescription className="mt-1">
+                    Skip <code className="font-mono">claude setup-token</code> on the server entirely:
+                    run it on a desktop browser to generate the token, then paste it here.
+                    Stored encrypted (Fernet) and passed to <code className="font-mono">claude</code>{" "}
+                    via <code className="font-mono">CLAUDE_CODE_OAUTH_TOKEN</code> env on every spawn.
+                  </FieldDescription>
+                </div>
                 <FieldDescription>
                   Set the provider dropdown above to <strong>Claude Code CLI</strong> to
                   route every step-9 LLM call through the local <code className="font-mono">claude</code> binary.
                   No API key, no per-call billing — runs against your Claude
                   Pro/Max subscription. On the production server, after Install +
-                  Sign in, every new domain pipeline AND Regenerate flow will use
-                  this CLI for content generation.
+                  Sign in (or token paste above), every new domain pipeline AND
+                  Regenerate flow will use this CLI for content generation.
                 </FieldDescription>
               </Field>
 

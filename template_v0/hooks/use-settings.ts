@@ -34,6 +34,13 @@ export interface SettingsValues {
   llm_max_output_tokens: string
   cloudflare_account_id: string
   cloudflare_workers_ai_token: string
+  /** Long-lived OAuth token for the local `claude` CLI. When set, the
+   *  spawn passes it via CLAUDE_CODE_OAUTH_TOKEN env so the binary
+   *  authenticates without needing ~/.claude/.credentials.json — useful
+   *  on headless servers where the browser-based `claude setup-token`
+   *  round-trip isn't practical. Generate one on a desktop with
+   *  `claude setup-token` and paste here. */
+  claude_code_oauth_token: string
   // CLI-auth toggles — when on, ignore the per-provider API key above and
   // shell out to the local `gemini` / `codex` binary that's already
   // OAuth-logged-in on this machine. Only OpenAI and Gemini support this.
