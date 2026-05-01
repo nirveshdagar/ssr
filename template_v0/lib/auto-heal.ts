@@ -1066,7 +1066,12 @@ export interface DeadServerRetryResult {
   skipped: { server_id: number; reason: string }[]
 }
 
-const DEFAULT_DEAD_RETRY_COOLDOWN_MS = 15 * 60 * 1000
+// 30 min default — SA agent install on a fresh droplet takes 5-15 min, and
+// the original 15-min cooldown raced against the install upper bound: the
+// retry's "is migration in flight?" check could fire while SA install was
+// still running, double-provisioning droplets. 30 min gives the prior
+// migration time to either complete OR fail loudly before the next retry.
+const DEFAULT_DEAD_RETRY_COOLDOWN_MS = 30 * 60 * 1000
 const DEFAULT_DEAD_RETRY_MAX_PER_DAY = 6
 
 export async function autoRetryDeadServers(): Promise<DeadServerRetryResult> {
@@ -1105,17 +1110,48 @@ export async function autoRetryDeadServers(): Promise<DeadServerRetryResult> {
       continue
     }
 
-    // Cross-process check: any pipeline.full / domain.bulk_migrate job in
-    // flight that targets this server? If so, defer.
-    const inflight = (one<{ n: number }>(
+    // In-flight detection — must catch BOTH the manual job-queue path AND
+    // the auto-migrate inline path (migrateServer is called directly, never
+    // enqueued as a job). Two-pronged check:
+    //   (a) jobs table — covers manual /api/domains/bulk-migrate triggers
+    //   (b) pipeline_log — covers migrateServer's inline "running" entry
+    //       with no subsequent terminal status (completed/failed/warning).
+    //       This is the path that the previous version missed, causing
+    //       double-fire when SA install was still running past the 15-min
+    //       cooldown.
+    const inflightJob = (one<{ n: number }>(
       `SELECT COUNT(*) AS n FROM jobs
         WHERE status IN ('queued','running')
           AND (kind = 'pipeline.full' OR kind = 'domain.bulk_migrate')
           AND payload_json LIKE ?`,
       `%"server_id":${s.id}%`,
     )?.n ?? 0)
-    if (inflight > 0) {
-      skipped.push({ server_id: s.id, reason: "migration already in flight" })
+    if (inflightJob > 0) {
+      skipped.push({ server_id: s.id, reason: "migration already in flight (job queue)" })
+      continue
+    }
+    // Find the most recent auto_migrate / sa_install entry for this server
+    // (could be domain='server-X' for auto_migrate OR domain=<new-droplet-name>
+    // for sa_install — but new droplet name isn't known here, so we check
+    // server-X for auto_migrate AND the most recent sa_install across ALL
+    // domains within the cooldown window). If we find a recent "running"
+    // entry without a subsequent terminal status from the same migration,
+    // defer — migration is in flight.
+    const lastAutoMigrateTerminal = (one<{ id: number }>(
+      `SELECT COALESCE(MAX(id), 0) AS id FROM pipeline_log
+        WHERE domain = ? AND step = 'auto_migrate'
+          AND status IN ('completed','failed')`,
+      `server-${s.id}`,
+    )?.id ?? 0)
+    const inflightInline = (one<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM pipeline_log
+        WHERE domain = ? AND step = 'auto_migrate'
+          AND status = 'running'
+          AND id > ?`,
+      `server-${s.id}`, lastAutoMigrateTerminal,
+    )?.n ?? 0)
+    if (inflightInline > 0) {
+      skipped.push({ server_id: s.id, reason: "migration already in flight (auto_migrate/running with no terminal status yet)" })
       continue
     }
 
