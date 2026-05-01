@@ -273,9 +273,7 @@ export function FileBrowserDialog({ open, onOpenChange, domain, serverIp, snapsh
     }
   }
 
-  function handleFilePicked(ev: React.ChangeEvent<HTMLInputElement>) {
-    const f = ev.target.files?.[0]
-    if (!f) return
+  function handlePickedFile(f: File) {
     // The upload-file API only accepts text bodies (FileReader.readAsText
     // would return garbage for binaries → server-side write would write
     // garbled data). Detect common binary types early and tell the user.
@@ -300,6 +298,23 @@ export function FileBrowserDialog({ open, onOpenChange, domain, serverIp, snapsh
       setErrMsg(`could not read ${f.name} as text`)
     }
     reader.readAsText(f)
+  }
+
+  function handleFilePicked(ev: React.ChangeEvent<HTMLInputElement>) {
+    const f = ev.target.files?.[0]
+    if (!f) return
+    handlePickedFile(f)
+  }
+
+  // Drag-and-drop state — the drop zone visually highlights while a file
+  // is being dragged over it.
+  const [dragOver, setDragOver] = React.useState(false)
+  function handleDrop(ev: React.DragEvent<HTMLDivElement>) {
+    ev.preventDefault()
+    setDragOver(false)
+    const f = ev.dataTransfer.files?.[0]
+    if (!f) return
+    handlePickedFile(f)
   }
 
   async function doUpload() {
@@ -520,54 +535,91 @@ export function FileBrowserDialog({ open, onOpenChange, domain, serverIp, snapsh
               <div className="border-b border-border bg-muted/40 px-3 py-2 text-small font-medium">
                 Upload file
               </div>
-              <div className="flex flex-col gap-2 px-3 py-3">
-                <div className="flex items-center gap-2">
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    onChange={handleFilePicked}
-                    disabled={uploadBusy}
-                    className="text-small"
-                  />
-                  {uploadBusy
-                    ? <span className="inline-flex items-center gap-1 text-micro text-muted-foreground">
-                        <Loader2 className="h-3 w-3 animate-spin" /> uploading…
+              <div className="flex flex-col gap-3 px-3 py-3">
+                {/* Primary path — direct upload from the operator's computer
+                    via click OR drag-and-drop. Auto-uploads as soon as a
+                    file is picked; no second button click required. */}
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  onChange={handleFilePicked}
+                  disabled={uploadBusy}
+                  className="hidden"
+                />
+                <div
+                  onClick={() => !uploadBusy && fileInputRef.current?.click()}
+                  onDragOver={(e) => { e.preventDefault(); if (!uploadBusy) setDragOver(true) }}
+                  onDragLeave={() => setDragOver(false)}
+                  onDrop={handleDrop}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    if ((e.key === "Enter" || e.key === " ") && !uploadBusy) {
+                      e.preventDefault()
+                      fileInputRef.current?.click()
+                    }
+                  }}
+                  className={
+                    "flex flex-col items-center justify-center gap-1.5 rounded-md border-2 border-dashed px-4 py-6 text-center transition-colors " +
+                    (uploadBusy
+                      ? "border-border bg-muted/30 cursor-not-allowed opacity-60"
+                      : dragOver
+                      ? "border-primary bg-primary/5 cursor-copy"
+                      : "border-border hover:border-primary/60 hover:bg-muted/30 cursor-pointer")
+                  }
+                >
+                  {uploadBusy ? (
+                    <>
+                      <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+                      <span className="text-small text-muted-foreground">Uploading {uploadName}…</span>
+                    </>
+                  ) : (
+                    <>
+                      <UploadIcon className="h-5 w-5 text-muted-foreground" />
+                      <span className="text-small font-medium">
+                        Click to choose a file from your computer
                       </span>
-                    : <span className="text-micro text-muted-foreground">picks auto-upload, or paste below</span>}
+                      <span className="text-micro text-muted-foreground">
+                        or drop a file here · text files only (html, php, css, js, txt…)
+                      </span>
+                    </>
+                  )}
                 </div>
-                <Input
-                  placeholder="filename (e.g. about.html) — letters, digits, . _ - only"
-                  value={uploadName}
-                  onChange={(e) => setUploadName(e.target.value)}
-                  disabled={uploadBusy}
-                  className="font-mono"
-                />
-                <Textarea
-                  placeholder="file contents…"
-                  value={uploadBody}
-                  onChange={(e) => setUploadBody(e.target.value)}
-                  disabled={uploadBusy}
-                  className="min-h-[100px] max-h-[200px] font-mono text-micro"
-                />
-                {(!uploadName.trim() || !uploadBody) && !uploadBusy && (
-                  <div className="text-micro text-muted-foreground">
-                    {!uploadName.trim() && !uploadBody
-                      ? "Pick a file above OR enter filename + paste contents below to enable Upload."
-                      : !uploadName.trim()
-                      ? "Filename required."
-                      : "File contents required (paste into the box, or pick a file above)."}
+
+                {/* Secondary path — paste body inline (useful when typing a
+                    small index.php variant or testing). Collapsed under a
+                    summary so it doesn't compete visually with the picker. */}
+                <details className="group">
+                  <summary className="cursor-pointer text-small text-muted-foreground hover:text-foreground select-none">
+                    …or paste contents manually
+                  </summary>
+                  <div className="flex flex-col gap-2 mt-2">
+                    <Input
+                      placeholder="filename (e.g. about.html) — letters, digits, . _ - only"
+                      value={uploadName}
+                      onChange={(e) => setUploadName(e.target.value)}
+                      disabled={uploadBusy}
+                      className="font-mono"
+                    />
+                    <Textarea
+                      placeholder="file contents…"
+                      value={uploadBody}
+                      onChange={(e) => setUploadBody(e.target.value)}
+                      disabled={uploadBusy}
+                      className="min-h-[100px] max-h-[200px] font-mono text-micro"
+                    />
+                    <div className="flex justify-end">
+                      <Button
+                        onClick={doUpload}
+                        disabled={uploadBusy || !uploadName.trim() || !uploadBody}
+                        className="gap-1.5"
+                      >
+                        {uploadBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <UploadIcon className="h-3.5 w-3.5" />}
+                        Upload
+                      </Button>
+                    </div>
                   </div>
-                )}
-                <div className="flex justify-end">
-                  <Button
-                    onClick={doUpload}
-                    disabled={uploadBusy || !uploadName.trim() || !uploadBody}
-                    className="gap-1.5"
-                  >
-                    {uploadBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <UploadIcon className="h-3.5 w-3.5" />}
-                    Upload
-                  </Button>
-                </div>
+                </details>
               </div>
             </div>
           </div>
