@@ -54,6 +54,28 @@ export async function POST(req: NextRequest): Promise<Response> {
     }
   }
 
+  // Pre-flight DO availability check. Without this, an invalid region+size
+  // combo would silently enqueue a doomed background job — operator gets a
+  // green "Droplet creation enqueued" toast, the modal closes, and the job
+  // fails 5-15s later in pipeline_log with no UI surface. Operator stares
+  // at /servers expecting a new row and sees nothing. Surfacing here as a
+  // 422 with the regions where the size IS available means the operator
+  // can fix the dropdown selection on the spot.
+  try {
+    const { validateRegionSize } = await import("@/lib/digitalocean")
+    const v = await validateRegionSize(region, size)
+    if (!v.ok) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: v.error ?? "region/size combo invalid",
+          available_regions: v.available_regions,
+        },
+        { status: 422 },
+      )
+    }
+  } catch { /* validator threw — let createDroplet surface the underlying error */ }
+
   const jobId = enqueueJob("server.create", { name, region, size })
   appendAudit("server_create_enqueue", name, `region=${region} size=${size} job=${jobId}`, ip)
   return NextResponse.json({

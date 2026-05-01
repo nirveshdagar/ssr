@@ -371,11 +371,58 @@ export async function listRegions(): Promise<{ slug: string; name: string; avail
   return data.regions.filter((r) => r.available !== false)
 }
 
-export async function listSizes(): Promise<{ slug: string; available?: boolean }[]> {
+export async function listSizes(): Promise<{ slug: string; available?: boolean; regions?: string[] }[]> {
   const res = await doRequest("GET", "/sizes", { timeoutMs: 30_000 })
   if (!res.ok) throw new Error(`DO list_sizes HTTP ${res.status}`)
-  const data = (await res.json()) as { sizes: { slug: string; available?: boolean }[] }
+  const data = (await res.json()) as { sizes: { slug: string; available?: boolean; regions?: string[] }[] }
   return data.sizes.filter((s) => s.available !== false)
+}
+
+/**
+ * Pre-flight check for `createDroplet` calls — verifies that the chosen
+ * size is actually available in the chosen region BEFORE we burn an API
+ * round-trip + (worse) silently enqueue a doomed background job. DO's
+ * /v2/sizes returns a `regions: string[]` per size listing the slugs
+ * where each size is currently provisionable. Premium Intel / AMD tiers
+ * (e.g. s-2vcpu-8gb-160gb-intel) are restricted to a subset; out-of-stock
+ * conditions also remove regions from the list temporarily.
+ *
+ * Returns:
+ *   - { ok: true } when the size+region combo is valid
+ *   - { ok: false, error, available_regions } when the size doesn't ship in
+ *     that region (with the regions where it IS available, so the caller
+ *     can surface a helpful "try one of these instead" suggestion)
+ *   - { ok: false, error } when the size doesn't exist at all OR DO API fails
+ *     (in those cases we can't safely degrade — return the error verbatim)
+ */
+export async function validateRegionSize(region: string, size: string): Promise<{
+  ok: boolean
+  error?: string
+  available_regions?: string[]
+}> {
+  let sizes: { slug: string; regions?: string[] }[]
+  try {
+    sizes = await listSizes()
+  } catch (e) {
+    // DO API down — can't validate; pass through and let createDroplet's
+    // own error handling surface the actual failure. Better than blocking
+    // a legitimate request on a transient DO outage.
+    return { ok: true }
+  }
+  const matched = sizes.find((s) => s.slug === size)
+  if (!matched) {
+    return { ok: false, error: `Size '${size}' not recognized by DO (deprecated or typo'd?)` }
+  }
+  const regions = matched.regions ?? []
+  if (!regions.includes(region)) {
+    return {
+      ok: false,
+      error: `Size '${size}' is not available in region '${region}'. ` +
+        `It IS available in: ${regions.join(", ") || "(no regions currently — fully out of stock)"}`,
+      available_regions: regions,
+    }
+  }
+  return { ok: true }
 }
 
 // ---------------------------------------------------------------------------
