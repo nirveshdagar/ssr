@@ -628,21 +628,28 @@ export interface StuckCreatingResult {
 }
 
 /**
- * Detect servers stuck in `status='creating'` for more than `staleMinutes`
- * (default 30) with no currently-running or queued `server.reinstall_sa`
- * job, and re-enqueue one. Covers the case where:
- *   - Migration enqueued reinstall_sa
- *   - Process restarted before the reinstall job claimed the row
- *   - The reinstall_sa was orphan-recovered to 'queued' but then somehow
- *     never got picked up (worker pool stuck, etc.)
- * This is a true insurance net — the migration's enqueue is the primary
- * mechanism; this just catches drops.
+ * Detect servers stuck in `status='creating'` OR `status='error'` for more
+ * than `staleMinutes` (default 15 — was 30, reduced because operators
+ * complained the wait was too long; safety preserved by the recent-activity
+ * check below) with no currently-running or queued `server.reinstall_sa`
+ * job, and re-enqueue one. Covers:
+ *   - Migration enqueued reinstall_sa but process restarted before claim
+ *   - reinstall_sa was orphan-recovered to 'queued' but never picked up
+ *   - reinstall_sa hard-failed → status='error' → no further retries until
+ *     this sweep brings them back into the loop (Layer 4 destroys after N
+ *     failures — see autoDestroyDeadDroplets)
+ *
+ * Recent-activity guard: if there's been a `sa_install` or `reinstall_sa`
+ * pipeline_log entry within the last 5 min, the original install primitive
+ * (which has its own 15-min internal poll) is still working — skip this
+ * sweep so we don't enqueue a parallel reinstall_sa that races the
+ * inline install for the same droplet.
  */
-export async function recoverStuckCreating(staleMinutes = 30): Promise<StuckCreatingResult> {
+export async function recoverStuckCreating(staleMinutes = 15): Promise<StuckCreatingResult> {
   const cutoff = `datetime('now', '-${staleMinutes} minutes')`
-  const stuckRows = all<{ id: number; name: string | null; ip: string | null }>(
-    `SELECT id, name, ip FROM servers
-      WHERE status = 'creating' AND created_at < ${cutoff}`,
+  const stuckRows = all<{ id: number; name: string | null; ip: string | null; status: string }>(
+    `SELECT id, name, ip, status FROM servers
+      WHERE status IN ('creating','error') AND created_at < ${cutoff}`,
   )
   const result: StuckCreatingResult = { stuck: [], reEnqueued: [] }
   if (stuckRows.length === 0) return result
@@ -659,13 +666,174 @@ export async function recoverStuckCreating(staleMinutes = 30): Promise<StuckCrea
       `%"server_id":${s.id}%`,
     )
     if (existing.length > 0) continue
+    // Recent-install-activity guard — covers the inline install path
+    // (migrateServer / serverCreateHandler) that doesn't go through the
+    // jobs table. Without this, reducing staleMinutes from 30 → 15 would
+    // false-fire while the original install is still legitimately
+    // polling (15-min internal max per attempt).
+    const recentActivity = (one<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM pipeline_log
+        WHERE step IN ('sa_install','reinstall_sa','do_create')
+          AND (domain = ? OR domain = ?)
+          AND created_at >= datetime('now','-5 minutes')`,
+      s.name ?? "", `server-${s.id}`,
+    )?.n ?? 0)
+    if (recentActivity > 0) continue
     const jobId = enqueueJob("server.reinstall_sa", { server_id: s.id }, 1)
     result.reEnqueued.push({ server_id: s.id, job_id: jobId })
     logPipeline(`server-${s.id}`, "reinstall_sa", "running",
-      `Stuck-creating insurance: server has been in 'creating' for >${staleMinutes} min ` +
+      `Stuck-${s.status} insurance: server has been ${s.status} for >${staleMinutes} min ` +
       `with no in-flight reinstall job — auto-enqueueing reinstall_sa (job ${jobId}).`)
   }
   return result
+}
+
+// ---------------------------------------------------------------------------
+// Layer 4 — give-up-and-destroy: nuke droplets that have failed SA install
+// N times so we stop paying for a permanently broken VM.
+// ---------------------------------------------------------------------------
+//
+// Layer 1 (installAgentOnDroplet retry) + Layer 2 (reinstall_sa job) +
+// Layer 3 (recoverStuckCreating sweep re-enqueueing Layer 2) gives us
+// effectively unlimited retries — which is wrong when the failure is
+// permanent (kernel issue, network blocked at firewall, broken image).
+// The droplet sits at ~$24/mo forever costing the operator money.
+//
+// Layer 4 destroys + drops the row when N reinstall_sa job attempts have
+// failed within Y hours. Conservative defaults — N=3, Y=24h — give plenty
+// of chances for transient issues to clear before nuking.
+
+export interface DestroyDeadDropletsResult {
+  destroyed: { server_id: number; name: string | null; ip: string | null; reason: string }[]
+  skipped: { server_id: number; reason: string }[]
+}
+
+const DEFAULT_GIVE_UP_AFTER_FAILURES = 3
+const DEFAULT_GIVE_UP_WINDOW_HOURS = 24
+
+export async function autoDestroyDeadDroplets(): Promise<DestroyDeadDropletsResult> {
+  const destroyed: DestroyDeadDropletsResult["destroyed"] = []
+  const skipped: DestroyDeadDropletsResult["skipped"] = []
+
+  const giveUpAfter = Math.max(1,
+    Number.parseInt(process.env.SSR_SA_GIVE_UP_AFTER_FAILURES ?? "", 10)
+    || DEFAULT_GIVE_UP_AFTER_FAILURES,
+  )
+  const windowHours = Math.max(1,
+    Number.parseInt(process.env.SSR_SA_GIVE_UP_WINDOW_HOURS ?? "", 10)
+    || DEFAULT_GIVE_UP_WINDOW_HOURS,
+  )
+
+  const candidates = all<{ id: number; name: string | null; ip: string | null; do_droplet_id: string | null; sa_server_id: string | null }>(
+    `SELECT id, name, ip, do_droplet_id, sa_server_id FROM servers
+      WHERE status = 'error' AND do_droplet_id IS NOT NULL`,
+  )
+  if (candidates.length === 0) return destroyed.length === 0 && skipped.length === 0
+    ? { destroyed, skipped }
+    : { destroyed, skipped }
+
+  for (const s of candidates) {
+    // Count reinstall_sa failures for this server in the last N hours.
+    // Both 'failed' and 'warning' status entries from reinstall_sa count
+    // (warning is the "Attempt N timed out" log; failed is the hard
+    // give-up after retries exhausted).
+    const failureCount = (one<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM pipeline_log
+        WHERE domain = ?
+          AND step = 'reinstall_sa'
+          AND status IN ('failed','warning')
+          AND created_at >= datetime('now','-${windowHours} hours')`,
+      `server-${s.id}`,
+    )?.n ?? 0)
+    if (failureCount < giveUpAfter) {
+      skipped.push({
+        server_id: s.id,
+        reason: `${failureCount}/${giveUpAfter} reinstall failures in ${windowHours}h — still has retries`,
+      })
+      continue
+    }
+    // Skip if any in-flight reinstall_sa job — let it finish first.
+    const inflight = (one<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM jobs
+        WHERE kind = 'server.reinstall_sa'
+          AND status IN ('queued','running')
+          AND payload_json LIKE ?`,
+      `%"server_id":${s.id}%`,
+    )?.n ?? 0)
+    if (inflight > 0) {
+      skipped.push({ server_id: s.id, reason: "reinstall job still in flight" })
+      continue
+    }
+    // Skip if any domain still references this server — destroying would
+    // strand them. The dead-server retry sweep should be moving them off
+    // already; if they're still here, something's wrong, surface it.
+    const stillReferencing = (one<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM domains
+        WHERE server_id = ? AND status NOT IN ('soft_deleted','deleted','canceled','terminal_error')`,
+      s.id,
+    )?.n ?? 0)
+    if (stillReferencing > 0) {
+      skipped.push({
+        server_id: s.id,
+        reason: `${stillReferencing} domain(s) still reference this server — refusing to destroy`,
+      })
+      continue
+    }
+
+    const reason = `Layer 4 give-up: ${failureCount} reinstall_sa failures in ${windowHours}h, no domains referencing this server`
+    logPipeline(`server-${s.id}`, "auto_destroy", "running", reason)
+    try {
+      // Destroy DO droplet first (the costly part), then SA stub, then DB row.
+      const { deleteDroplet } = await import("./digitalocean")
+      const { deleteSaServer } = await import("./serveravatar")
+      const { run: dbRun } = await import("./db")
+
+      const doOk = await deleteDroplet(s.do_droplet_id!).catch((e) => {
+        logPipeline(`server-${s.id}`, "auto_destroy", "warning",
+          `DO destroy failed (droplet ${s.do_droplet_id}): ${(e as Error).message.slice(0, 200)} — continuing with SA + DB cleanup anyway`)
+        return false
+      })
+      if (s.sa_server_id) {
+        const r = await deleteSaServer(s.sa_server_id).catch((e) => ({ ok: false, reason: (e as Error).message }))
+        logPipeline(`server-${s.id}`, "auto_destroy",
+          r.ok ? "running" : "warning",
+          r.ok ? `Deleted SA stub ${s.sa_server_id}` : `SA stub delete failed: ${r.reason}`)
+      }
+      dbRun("DELETE FROM servers WHERE id = ?", s.id)
+      logPipeline(`server-${s.id}`, "auto_destroy", "completed",
+        `Server #${s.id} destroyed: DO droplet ${s.do_droplet_id} ${doOk ? "deleted" : "destroy-failed"}, ` +
+        `SA stub cleared, DB row dropped. Stop billing for this droplet.`)
+      appendAudit("server_auto_destroyed", `server-${s.id}`,
+        `failures=${failureCount}/${giveUpAfter} window=${windowHours}h ip=${s.ip} ` +
+        `do_droplet=${s.do_droplet_id} do_destroy_ok=${doOk}`,
+        null)
+
+      try {
+        const { notify } = await import("./notify")
+        await notify(
+          `Server #${s.id} auto-destroyed (${giveUpAfter}+ SA install failures)`,
+          `Layer 4 gave up on server #${s.id} (${s.name ?? "unnamed"} / ${s.ip}) ` +
+          `after ${failureCount} reinstall_sa failures in ${windowHours}h.\n\n` +
+          `DO droplet ${s.do_droplet_id} destroyed (no longer billing).\n` +
+          `SA stub ${s.sa_server_id ?? "(none)"} cleaned up.\n` +
+          `DB row deleted.\n\n` +
+          `If you have domains that still need a host, provision a fresh server ` +
+          `or trigger bulk-migrate. The auto-flow will pick the next available ` +
+          `target on the next dead-detect tick.`,
+          { severity: "error", dedupeKey: `server_auto_destroyed:${s.id}` },
+        )
+      } catch { /* notify is best-effort */ }
+      destroyed.push({
+        server_id: s.id, name: s.name, ip: s.ip,
+        reason: `${failureCount} failures in ${windowHours}h`,
+      })
+    } catch (e) {
+      logPipeline(`server-${s.id}`, "auto_destroy", "failed",
+        `Unexpected destroy error: ${(e as Error).message.slice(0, 300)}`)
+      skipped.push({ server_id: s.id, reason: `destroy threw: ${(e as Error).message.slice(0, 100)}` })
+    }
+  }
+  return { destroyed, skipped }
 }
 
 /**
@@ -894,6 +1062,7 @@ export interface AutoHealTickResult {
   sslSweep: SslSweepResult | { error: string }
   downAutoFix: DownAutoFixResult | { error: string }
   deadRetry: DeadServerRetryResult | { error: string }
+  destroyDead: DestroyDeadDropletsResult | { error: string }
   ranAt: string
 }
 
@@ -920,6 +1089,7 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
         sslSweep: { error: "paused" },
         downAutoFix: { error: "paused" },
         deadRetry: { error: "paused" },
+        destroyDead: { error: "paused" },
       }
     }
   } catch { /* if settings read fails, just proceed normally */ }
@@ -1002,6 +1172,17 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
     deadRetry = { error: (e as Error).message }
   }
 
+  // Layer 4 — give-up-and-destroy. After Layer 1/2/3 have exhausted SA
+  // install attempts, nuke the droplet so we stop billing. Fires only
+  // when N+ reinstall_sa failures within Y hours AND no domains still
+  // reference this server (Layer 4 won't strand domains).
+  let destroyDead: DestroyDeadDropletsResult | { error: string }
+  try {
+    destroyDead = await autoDestroyDeadDroplets()
+  } catch (e) {
+    destroyDead = { error: (e as Error).message }
+  }
+
   // Daily Claude-Code OAuth sentinel — confirms the operator's
   // CLAUDE_CODE_OAUTH_TOKEN still works before the operator gets surprised
   // by a step-9 failure mid-batch. Self-rate-limits to one ping per 24h
@@ -1025,18 +1206,20 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
   const sslMismatchedN = "mismatched" in sslSweep ? sslSweep.mismatched.length : 0
   const downRepairsN = "fired" in downAutoFix ? downAutoFix.fired.length : 0
   const deadRetryN = "retried" in deadRetry ? deadRetry.retried.length : 0
-  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN + stuckN + sslMismatchedN + downRepairsN + deadRetryN > 0) {
+  const destroyedN = "destroyed" in destroyDead ? destroyDead.destroyed.length : 0
+  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN + stuckN + sslMismatchedN + downRepairsN + deadRetryN + destroyedN > 0) {
     appendAudit(
       "auto_heal_tick", "",
       `claimed=${claimedN} resumed=${resumedN} ns_resumed=${nsResumedN} ` +
       `retried=${retriedN} ssl_reissued=${sslReissuedN} sa_degraded=${degradedN} ` +
       `stuck_recovered=${stuckN} ssl_mismatched=${sslMismatchedN} ` +
-      `down_repairs=${downRepairsN} dead_retried=${deadRetryN}`,
+      `down_repairs=${downRepairsN} dead_retried=${deadRetryN} ` +
+      `dead_droplets_destroyed=${destroyedN}`,
       null,
     )
   }
 
-  return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, sslSweep, downAutoFix, deadRetry, ranAt }
+  return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, sslSweep, downAutoFix, deadRetry, destroyDead, ranAt }
 }
 
 // ---------------------------------------------------------------------------
