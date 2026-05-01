@@ -371,7 +371,8 @@ export default function AiGeneratorPage() {
                   <SelectTrigger size="sm" className="h-8 text-small mt-1"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="__default__">(use Settings default)</SelectItem>
-                    <SelectItem value="anthropic">Anthropic (Claude)</SelectItem>
+                    <SelectItem value="anthropic">Anthropic (Claude — API key)</SelectItem>
+                    <SelectItem value="anthropic_cli">Claude Code CLI (free w/ Pro/Max)</SelectItem>
                     <SelectItem value="openai">OpenAI (GPT)</SelectItem>
                     <SelectItem value="gemini">Google Gemini / Gemma</SelectItem>
                     <SelectItem value="openrouter">OpenRouter</SelectItem>
@@ -380,6 +381,19 @@ export default function AiGeneratorPage() {
                     <SelectItem value="cloudflare_pool">Cloudflare Workers AI POOL</SelectItem>
                   </SelectContent>
                 </Select>
+                {provider && (
+                  <p className="mt-1 text-micro text-status-warning">
+                    Overriding the Settings default for this page only. Set to{" "}
+                    <button
+                      type="button"
+                      onClick={() => { setProvider(""); setModel("") }}
+                      className="underline hover:text-status-running"
+                    >
+                      (use Settings default)
+                    </button>{" "}
+                    to follow /settings → LLM.
+                  </p>
+                )}
               </div>
               <div>
                 <label className="text-micro font-medium">Model <span className="text-muted-foreground">(optional)</span></label>
