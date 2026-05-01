@@ -629,10 +629,11 @@ export interface StuckCreatingResult {
 
 /**
  * Detect servers stuck in `status='creating'` OR `status='error'` for more
- * than `staleMinutes` (default 15 — was 30, reduced because operators
- * complained the wait was too long; safety preserved by the recent-activity
- * check below) with no currently-running or queued `server.reinstall_sa`
- * job, and re-enqueue one. Covers:
+ * than `staleMinutes` (default 5 — was 30→15→5, reduced again 2026-05-01
+ * because operator wanted aggressive cadence; safety preserved by the
+ * recent-activity check below which skips while the original install is
+ * still actively polling) with no currently-running or queued
+ * `server.reinstall_sa` job, and re-enqueue one. Covers:
  *   - Migration enqueued reinstall_sa but process restarted before claim
  *   - reinstall_sa was orphan-recovered to 'queued' but never picked up
  *   - reinstall_sa hard-failed → status='error' → no further retries until
@@ -645,7 +646,7 @@ export interface StuckCreatingResult {
  * sweep so we don't enqueue a parallel reinstall_sa that races the
  * inline install for the same droplet.
  */
-export async function recoverStuckCreating(staleMinutes = 15): Promise<StuckCreatingResult> {
+export async function recoverStuckCreating(staleMinutes = 5): Promise<StuckCreatingResult> {
   const cutoff = `datetime('now', '-${staleMinutes} minutes')`
   const stuckRows = all<{ id: number; name: string | null; ip: string | null; status: string }>(
     `SELECT id, name, ip, status FROM servers
@@ -708,7 +709,13 @@ export interface DestroyDeadDropletsResult {
   skipped: { server_id: number; reason: string }[]
 }
 
-const DEFAULT_GIVE_UP_AFTER_FAILURES = 3
+// Layer 4 (give-up-and-destroy) targets EXISTING droplets where SA died
+// after running fine — the fresh-provision destroy in migration.ts +
+// server-create.ts handles brand-new droplets directly. So this layer only
+// fires for "previously-working server's SA agent has been failing repeatedly"
+// scenarios. 2 failures (was 3) is enough — each represents Layer 1's 2-attempt
+// internal retry, so we've already had 4 install attempts before this fires.
+const DEFAULT_GIVE_UP_AFTER_FAILURES = 2
 const DEFAULT_GIVE_UP_WINDOW_HOURS = 24
 
 export async function autoDestroyDeadDroplets(): Promise<DestroyDeadDropletsResult> {
@@ -1303,13 +1310,21 @@ export interface DeadServerRetryResult {
   skipped: { server_id: number; reason: string }[]
 }
 
-// 30 min default — SA agent install on a fresh droplet takes 5-15 min, and
-// the original 15-min cooldown raced against the install upper bound: the
-// retry's "is migration in flight?" check could fire while SA install was
-// still running, double-provisioning droplets. 30 min gives the prior
-// migration time to either complete OR fail loudly before the next retry.
-const DEFAULT_DEAD_RETRY_COOLDOWN_MS = 30 * 60 * 1000
-const DEFAULT_DEAD_RETRY_MAX_PER_DAY = 6
+// 10 min cooldown between dead-server retry attempts — DO provision (~10
+// min) + SA install (2×15 min Layer 1 retry = 30 min worst case) + my new
+// fresh-provision destroy when install fails means each retry cycle is
+// already ~40 min minimum. Adding a 10-min gap between cycles gives the
+// in-flight check time to settle without dragging total time out further.
+// (Was 30 min; operator policy 2026-05-01: too slow for the typical
+// "DO image is broken in this region" case.)
+const DEFAULT_DEAD_RETRY_COOLDOWN_MS = 10 * 60 * 1000
+
+// 2 provisions max before giving up for the day (was 6). With Layer 1's
+// internal 2-attempt retry per provision, 2 provisions = 4 install attempts
+// total. If 4 attempts can't get SA installed, the issue is permanent (DO
+// region image broken, kernel mismatch, account quota issue) — operator
+// needs to investigate. Notify fires + sweep stops trying for 24h.
+const DEFAULT_DEAD_RETRY_MAX_PER_DAY = 2
 
 export async function autoRetryDeadServers(): Promise<DeadServerRetryResult> {
   const retried: DeadServerRetryResult["retried"] = []
