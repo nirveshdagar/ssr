@@ -267,6 +267,65 @@ export class SshSession {
     })
   }
 
+  /**
+   * Streaming variant of exec — calls onLine for every newline-terminated
+   * chunk from stdout+stderr (combined). Caller can return false from
+   * onLine to abort the command. Resolves when the remote process exits
+   * OR when onLine returns false (channel killed first).
+   *
+   * Used by the install streaming classifier in installAgentOnDroplet:
+   * tails the install.log, fires a callback per line, terminates as soon
+   * as success / fast-fail patterns are detected — saves up to 6 min vs
+   * the 30s SA poll loop.
+   */
+  execStream(
+    cmd: string,
+    onLine: (line: string) => boolean | void,
+    opts: { timeoutMs?: number } = {},
+  ): Promise<{ code: number }> {
+    const timeoutMs = opts.timeoutMs ?? 15 * 60_000
+    return new Promise((resolve, reject) => {
+      this.conn.exec(cmd, (err, stream: ClientChannel) => {
+        if (err) return reject(err)
+        let buffer = ""
+        let code = 0
+        let aborted = false
+        const timer = setTimeout(() => {
+          aborted = true
+          try { stream.close() } catch { /* ignore */ }
+          reject(new Error(`execStream timed out after ${timeoutMs}ms: ${cmd.slice(0, 100)}`))
+        }, timeoutMs)
+        const handleChunk = (chunk: Buffer): void => {
+          buffer += chunk.toString("utf8")
+          const lines = buffer.split("\n")
+          buffer = lines.pop() ?? ""
+          for (const line of lines) {
+            if (aborted) return
+            const keepGoing = onLine(line)
+            if (keepGoing === false) {
+              aborted = true
+              clearTimeout(timer)
+              try { stream.close() } catch { /* ignore */ }
+              resolve({ code: 0 })
+              return
+            }
+          }
+        }
+        stream.on("data", handleChunk)
+        stream.stderr.on("data", handleChunk)
+        stream.on("exit", (c: number | null) => { code = c ?? 0 })
+        stream.on("close", () => {
+          clearTimeout(timer)
+          if (!aborted) {
+            // Flush any trailing partial line on close.
+            if (buffer.length > 0) onLine(buffer)
+            resolve({ code })
+          }
+        })
+      })
+    })
+  }
+
   sftp(): Promise<SFTPWrapper> {
     return new Promise((resolve, reject) => {
       this.conn.sftp((err, sftp) => {
@@ -854,59 +913,173 @@ async function installAgentOnDropletAttempt(opts: {
         `polling SA for agent appearance anyway`)
     }
 
-    // Poll SA-side for the server to appear as connected
+    // Two parallel detection paths racing — first verdict wins:
+    //
+    //   (a) STREAM CLASSIFIER — opens a 2nd SSH session, tails
+    //       install.log, classifies each line. Catches success markers
+    //       (`Report sent!`, the SA dashboard URL with embedded
+    //       sa_server_id) ~6 min faster than the SA poll loop. Catches
+    //       fast-fail patterns (`Conflict detected ... clean ubuntu
+    //       server`) within ~30s instead of waiting the full 15-min
+    //       timeout. See classifyInstallLine for the patterns.
+    //
+    //   (b) SA POLL LOOP — original 30s polling against SA's API for
+    //       the agent to appear with status='connected'. Kept as the
+    //       safety net: if SA's install script changes wording or the
+    //       SSH stream drops mid-install, the poll still detects the
+    //       eventual registration.
+    //
+    // Promise.race on success, but for failure the streamer can reject
+    // the whole thing immediately (skipping the poll's wait-for-deadline).
     const start = Date.now()
     const deadline = start + timeoutInstallMs
     const totalMin = Math.round(timeoutInstallMs / 60_000)
     let saServerId: string | null = null
     let lastSaStatus = "(none)"
+
+    // Build the stream classifier promise (resolves with sa_server_id on
+    // success, rejects on fast-fail). Wrapped in a self-isolating session
+    // so SSH drops on the streamer don't tear down the main install ssh.
+    const streamerPromise = (async (): Promise<string> => {
+      let streamerSsh: SshSession | null = null
+      try {
+        streamerSsh = await SshSession.connect({
+          host: dropletIp, port: 22, username: "root", password: rootPassword,
+          readyTimeout: 30_000, tryKeyboard: false,
+        })
+      } catch (e) {
+        // Couldn't open the streaming session — yield to poll loop only
+        throw new Error(`streamer ssh connect failed: ${(e as Error).message}`)
+      }
+      try {
+        let detectedSaId = ""
+        let detectedFail: string | null = null
+        // tail -F reads from EOF by default; -n +1 starts from line 1
+        // so we don't miss markers that landed before we connected.
+        await streamerSsh.execStream(
+          "tail -n +1 -F /root/sa_install/install.log 2>/dev/null",
+          (line) => {
+            const verdict = classifyInstallLine(line)
+            if (verdict.kind === "success") {
+              if (verdict.saServerId) detectedSaId = verdict.saServerId
+              logPipeline(serverName, "sa_install", "running",
+                `STREAM detected SUCCESS: ${verdict.matched} ${detectedSaId ? `(sa_id=${detectedSaId})` : ""}`)
+              return false  // tells execStream to terminate
+            }
+            if (verdict.kind === "fail") {
+              detectedFail = verdict.reason ?? "unknown fast-fail pattern"
+              logPipeline(serverName, "sa_install", "warning",
+                `STREAM detected FAIL pattern: ${verdict.reason ?? "(no reason)"}`)
+              return false
+            }
+            return true
+          },
+          { timeoutMs: timeoutInstallMs },
+        )
+        if (detectedFail) throw new Error(`stream classifier: ${detectedFail}`)
+        if (!detectedSaId) {
+          // Stream ended without a verdict (file rotation, connection drop)
+          // — fall back to the poll path
+          throw new Error("stream classifier ended without verdict")
+        }
+        return detectedSaId
+      } finally {
+        try { streamerSsh.close() } catch { /* ignore */ }
+      }
+    })()
+
     onProgress(
       `Installing SA agent on ${dropletIp} — 0m elapsed / ${totalMin}m max · ` +
-      `polling SA every 30s (attempt ${attempt})`,
+      `streaming install.log + polling SA every 30s (attempt ${attempt})`,
     )
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 30_000))
-      let candidates: SaServer[]
-      try {
-        candidates = await listServers()
-      } catch (e) {
-        onProgress(
-          `SA list-servers failed (${(e as Error).message.slice(0, 80)}); ` +
-          `retrying in 30s`,
-        )
-        continue
-      }
-      for (const s of candidates) {
-        const sIp = String(s.server_ip ?? s.ip ?? "")
-        if (sIp !== dropletIp) continue
-        const status = String(s.agent_status ?? s.status ?? "")
-        saServerId = String(s.id ?? "")
-        lastSaStatus = status || "(unknown)"
-        if (status === "connected" || status === "active" || status === "1") {
-          logPipeline(serverName, "sa_install", "completed",
-            `SA agent active; sa_server_id=${saServerId} (attempt ${attempt})`)
-          return saServerId
-        }
-      }
-      if (saServerId) {
+    // SA poll loop wrapped in a promise so we can race it against the
+    // streamer. Same logic as before — on success returns sa_server_id,
+    // on timeout throws an error with reachedDeadline=true.
+    const pollPromise = (async (): Promise<string> => {
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 30_000))
+        let candidates: SaServer[]
         try {
-          const info = await getServerInfo(saServerId)
-          const status = String(info.agent_status ?? info.status ?? "")
-          lastSaStatus = status || lastSaStatus
+          candidates = await listServers()
+        } catch (e) {
+          onProgress(
+            `SA list-servers failed (${(e as Error).message.slice(0, 80)}); ` +
+            `retrying in 30s`,
+          )
+          continue
+        }
+        for (const s of candidates) {
+          const sIp = String(s.server_ip ?? s.ip ?? "")
+          if (sIp !== dropletIp) continue
+          const status = String(s.agent_status ?? s.status ?? "")
+          saServerId = String(s.id ?? "")
+          lastSaStatus = status || "(unknown)"
           if (status === "connected" || status === "active" || status === "1") {
             logPipeline(serverName, "sa_install", "completed",
-              `SA agent active; sa_server_id=${saServerId} (attempt ${attempt})`)
+              `SA agent active; sa_server_id=${saServerId} (attempt ${attempt}, source=poll)`)
             return saServerId
           }
-        } catch { /* keep polling */ }
+        }
+        if (saServerId) {
+          try {
+            const info = await getServerInfo(saServerId)
+            const status = String(info.agent_status ?? info.status ?? "")
+            lastSaStatus = status || lastSaStatus
+            if (status === "connected" || status === "active" || status === "1") {
+              logPipeline(serverName, "sa_install", "completed",
+                `SA agent active; sa_server_id=${saServerId} (attempt ${attempt}, source=poll)`)
+              return saServerId
+            }
+          } catch { /* keep polling */ }
+        }
+        const elapsedMin = Math.round((Date.now() - start) / 60_000)
+        onProgress(
+          `Installing SA agent on ${dropletIp} — ${elapsedMin}m / ${totalMin}m · ` +
+          `SA status: ${lastSaStatus}` +
+          (saServerId ? ` (sa_id=${saServerId})` : " (not yet visible to SA)") +
+          ` (attempt ${attempt})`,
+        )
       }
-      const elapsedMin = Math.round((Date.now() - start) / 60_000)
-      onProgress(
-        `Installing SA agent on ${dropletIp} — ${elapsedMin}m / ${totalMin}m · ` +
-        `SA status: ${lastSaStatus}` +
-        (saServerId ? ` (sa_id=${saServerId})` : " (not yet visible to SA)") +
-        ` (attempt ${attempt})`,
-      )
+      throw new Error("poll loop exhausted")  // caught below
+    })()
+
+    // Race streamer vs poll — first to resolve wins. If streamer resolves
+    // (success), great. If streamer rejects (fast-fail or stream ended
+    // without verdict), we let it propagate ONLY if it's a fast-fail; for
+    // "ended without verdict" we fall through to the poll. We use a tagged
+    // wrapper around streamerPromise so the racer can distinguish.
+    let raceWinnerId: string | null = null
+    let streamerFailedFast: string | null = null
+    try {
+      raceWinnerId = await Promise.race([
+        pollPromise.then((id) => ({ id, source: "poll" as const })).then((r) => r.id),
+        streamerPromise.then(
+          (id) => ({ id, source: "stream" as const }),
+          (e) => {
+            const msg = (e as Error).message
+            // Fast-fail: stream classifier matched a bad pattern
+            if (msg.startsWith("stream classifier:")) {
+              streamerFailedFast = msg.replace(/^stream classifier:\s*/, "")
+              throw e
+            }
+            // "ended without verdict" / "ssh connect failed" → swallow,
+            // fall back to poll result
+            return new Promise<{ id: string; source: "stream" }>(() => { /* never resolves; poll will */ })
+          },
+        ).then((r) => r.id),
+      ])
+      if (raceWinnerId) {
+        logPipeline(serverName, "sa_install", "completed",
+          `Detected via race: sa_server_id=${raceWinnerId} (attempt ${attempt})`)
+        return raceWinnerId
+      }
+    } catch (e) {
+      if (streamerFailedFast) {
+        // Fast-fail propagates as a hard error so the outer destroy logic
+        // (in migration.ts / handlers/server-create.ts) can nuke the droplet.
+        throw new Error(`SA install fast-fail: ${streamerFailedFast}`)
+      }
+      // Poll loop exhausted — fall through to the timeout-with-tail block
     }
 
     // Timeout — read install.log tail for diagnosis. Attach the partial
@@ -927,6 +1100,59 @@ async function installAgentOnDropletAttempt(opts: {
   } finally {
     ssh.close()
   }
+}
+
+/**
+ * Classify a single line of SA install script output as success / fast-fail
+ * / no-verdict. Used by the streaming tail to detect the install outcome
+ * faster than the SA poll loop's 30s cadence (catches success ~6 min earlier
+ * AND fast-fails like "Conflict detected" within ~30s vs 15-min timeout).
+ *
+ * Patterns are derived from a captured install log (basket-01-05-2026,
+ * 2026-05-01) — extend as we observe new SA wording. All regexes case-
+ * insensitive; success patterns are loose, fail patterns are strict
+ * (anchored on multi-keyword phrases) to minimize false-positive risk.
+ */
+export function classifyInstallLine(line: string): {
+  kind: "success" | "fail" | null
+  matched?: string
+  reason?: string
+  saServerId?: string
+} {
+  // Try to extract the sa_server_id from the post-install URL
+  // (`https://app.serveravatar.com/organizations/<org>/servers/<id>/installation`)
+  const urlMatch = line.match(/\/servers\/(\d+)\/installation/)
+
+  // Success markers — any of these means install reached the registration
+  // phase. Order doesn't matter; first match wins.
+  if (/Now you can see this server into ServerAvatar Dashboard/i.test(line)) {
+    return { kind: "success", matched: "dashboard-marker", saServerId: urlMatch?.[1] }
+  }
+  if (/Report sent!/i.test(line)) {
+    return { kind: "success", matched: "report-sent" }
+  }
+  if (urlMatch) {
+    return { kind: "success", matched: "install-url", saServerId: urlMatch[1] }
+  }
+
+  // Fast-fail markers — strict, anchor on TWO keywords to avoid matching
+  // log lines that happen to contain one keyword in benign context.
+  if (/Conflict detected/i.test(line) && /clean ubuntu server/i.test(line)) {
+    return {
+      kind: "fail",
+      reason: "SA refused dirty droplet (pre-installed apache/nginx/php/mysql) — needs fresh OS",
+    }
+  }
+  if (/already installed/i.test(line) && /(apache|nginx|openlitespeed|php|mysql|mariadb)/i.test(line)) {
+    return {
+      kind: "fail",
+      reason: `SA detected pre-existing service in install path: ${line.slice(0, 200)}`,
+    }
+  }
+  if (/error.*kernel/i.test(line) && /unsupported|incompatible/i.test(line)) {
+    return { kind: "fail", reason: `unsupported kernel: ${line.slice(0, 200)}` }
+  }
+  return { kind: null }
 }
 
 // ---------------------------------------------------------------------------
