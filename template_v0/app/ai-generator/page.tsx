@@ -17,9 +17,18 @@ import { cn } from "@/lib/utils"
 
 interface QueueRow {
   domain: string
+  /** "new" = freshly-submitted via Generate; "regen" = re-running steps 9–10
+   *  on an existing hosted domain via Regenerate. Surfaces as a badge in
+   *  the Queue table so the operator can tell them apart. */
+  kind: "new" | "regen"
   status: string
   step: number | null
   step_message?: string | null
+}
+
+interface RecentEntry {
+  domain: string
+  kind: "new" | "regen"
 }
 
 interface StepTrackerRow {
@@ -54,7 +63,16 @@ export default function AiGeneratorPage() {
   const [busy, setBusy] = React.useState<"single" | "bulk" | "regen" | null>(null)
   const [flash, setFlash] = React.useState<{ kind: "ok" | "err"; text: string } | null>(null)
   const [showPrompt, setShowPrompt] = React.useState(false)
-  const [recent, setRecent] = React.useState<string[]>([])
+  const [recent, setRecent] = React.useState<RecentEntry[]>([])
+
+  // Dedup by domain (later wins, kept at the front so newly-submitted
+  // domains float to the top of the Queue table).
+  function addRecent(items: RecentEntry[]): void {
+    setRecent((prev) => {
+      const seen = new Set(items.map((i) => i.domain))
+      return [...items, ...prev.filter((p) => !seen.has(p.domain))].slice(0, 100)
+    })
+  }
   // Selected hosted domains for the "Regenerate existing site" flow.
   const [regenSelected, setRegenSelected] = React.useState<Set<string>>(new Set())
 
@@ -83,7 +101,8 @@ export default function AiGeneratorPage() {
     const dmap = new Map((domainsResp?.domains ?? []).map((d) => [d.domain, d.status]))
     const wmap = watcher?.watchers ?? {}
     const out: QueueRow[] = []
-    for (const d of recent) {
+    for (const entry of recent) {
+      const d = entry.domain
       const steps = wmap[d] ?? []
       // Pick the highest step that's running; else the last failed/warning;
       // else the last completed; else nothing.
@@ -91,9 +110,26 @@ export default function AiGeneratorPage() {
       const failed = [...steps].reverse().find((s) => s.status === "failed" || s.status === "warning")
       const lastDone = [...steps].reverse().find((s) => s.status === "completed" || s.status === "skipped")
       const cur = running ?? failed ?? lastDone
-      const status = dmap.get(d) ?? (cur?.status ?? "queued")
+      // Status priority for the Queue badge:
+      //   1. running step       → "running" (overrides static domain status —
+      //                           critical for regen, where the domain stays
+      //                           "live" the whole time and would otherwise
+      //                           never show progress)
+      //   2. failed/warning step → surface the failure status
+      //   3. domain.status      → final-state truth (live / hosted / etc)
+      //   4. last step status   → fallback when DB hasn't caught up yet
+      //   5. "queued"           → never-seen domain
+      let status: string
+      if (running) {
+        status = "running"
+      } else if (failed && (failed === cur)) {
+        status = failed.status === "warning" ? "retryable_error" : "terminal_error"
+      } else {
+        status = dmap.get(d) ?? cur?.status ?? "queued"
+      }
       out.push({
         domain: d,
+        kind: entry.kind,
         status,
         step: cur?.step_num ?? null,
         step_message: cur?.message ?? null,
@@ -137,7 +173,7 @@ export default function AiGeneratorPage() {
       return
     }
     show("ok", j.message + (j.warning ? ` · ${j.warning}` : ""))
-    setRecent((prev) => [...new Set([...(j.enqueued ?? []), ...prev])].slice(0, 100))
+    addRecent((j.enqueued ?? []).map((d) => ({ domain: d, kind: "new" as const })))
     await mutateWatcher()
   }
 
@@ -211,7 +247,7 @@ export default function AiGeneratorPage() {
         ? `Regeneration enqueued for all ${ok.length} domain(s)`
         : `Regeneration enqueued for ${ok.length}/${list.length}; ${failed.length} skipped (${failed.slice(0, 3).map((f) => f.domain).join(", ")}${failed.length > 3 ? "…" : ""})`
       show(failed.length === 0 ? "ok" : "err", msg)
-      setRecent((prev) => [...new Set([...ok, ...prev])].slice(0, 100))
+      addRecent(ok.map((d) => ({ domain: d, kind: "regen" as const })))
       setRegenSelected(new Set())
       await mutateWatcher()
     } finally {
@@ -529,7 +565,19 @@ export default function AiGeneratorPage() {
                 <tbody>
                   {queueRows.map((r) => (
                     <tr key={r.domain} className="border-b border-border/40 last:border-0 hover:bg-muted/30">
-                      <td className="px-4 py-2 font-mono">{r.domain}</td>
+                      <td className="px-4 py-2 font-mono">
+                        <span className="inline-flex items-center gap-1.5">
+                          {r.domain}
+                          {r.kind === "regen" && (
+                            <span
+                              className="rounded bg-status-running/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-status-running"
+                              title="Regenerated: re-ran steps 9–10 (LLM content + upload), DNS / SSL / server provisioning skipped"
+                            >
+                              regen
+                            </span>
+                          )}
+                        </span>
+                      </td>
                       <td className="px-4 py-2">
                         <StatusPill status={r.status} />
                       </td>
