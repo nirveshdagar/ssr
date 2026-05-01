@@ -20,6 +20,7 @@ import { listDomains } from "../repos/domains"
 import { listServers, updateServer } from "../repos/servers"
 import { logPipeline } from "../repos/logs"
 import { migrateDomain, type ServerLike } from "../migration"
+import { getSetting } from "../repos/settings"
 
 interface BulkMigratePayload {
   domains: string[]
@@ -120,20 +121,43 @@ export async function bulkMigrateHandler(
       return
     }
     const target = r.target
+    // Concurrent per-domain migration. Same pattern as migrateServer in
+    // lib/migration.ts (auto-flow when a server is detected dead) — bounded
+    // fan-out via Promise.all + manual chunking. Default 5-at-a-time.
+    // Tunable via `migrate_concurrency` setting (1 = sequential, 10 = max).
+    // Why bounded at 5: SA app-create serializes server-side, SSH MaxSessions
+    // on the target droplet caps simultaneous sessions, Patchright SSL UI
+    // fallback is heavy. 5 is the sweet spot between throughput and the
+    // resource ceiling. Earlier the manual bulk-migrate handler was
+    // hardcoded sequential (1-at-a-time) — meant a 50-domain bulk-migrate
+    // took ~25min vs ~5min for the auto-flow doing identical work, which
+    // surprised the operator. Now both paths use the same concurrency.
+    const concRaw = parseInt(getSetting("migrate_concurrency") ?? "5", 10)
+    const concurrency = Number.isFinite(concRaw) && concRaw >= 1 && concRaw <= 10 ? concRaw : 5
     logPipeline(anchor, "bulk_migrate", "running",
-      `Target server #${target.id} (${target.ip}) selected — migrating ${domains.length} domain(s)`)
+      `Target server #${target.id} (${target.ip}) selected — migrating ${domains.length} domain(s) with concurrency=${concurrency}`)
 
     const ok: string[] = []
     const failed: { domain: string; msg: string }[] = []
-    for (const d of domains) {
-      try {
-        const result = await migrateDomain(d, target)
-        if (result.ok) ok.push(d)
-        else failed.push({ domain: d, msg: result.message })
-      } catch (e) {
-        failed.push({ domain: d, msg: `unhandled: ${(e as Error).message}` })
+    let cursor = 0
+    const runOne = async (): Promise<void> => {
+      while (true) {
+        const i = cursor++
+        if (i >= domains.length) return
+        const d = domains[i]
+        try {
+          const result = await migrateDomain(d, target)
+          if (result.ok) ok.push(d)
+          else failed.push({ domain: d, msg: result.message })
+        } catch (e) {
+          failed.push({ domain: d, msg: `unhandled: ${(e as Error).message}` })
+        }
       }
     }
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, domains.length) }, runOne),
+    )
+
     logPipeline(anchor, "bulk_migrate", failed.length === 0 ? "completed" : "warning",
       `Migrated ${ok.length}/${domains.length} domain(s) to server #${target.id} (${target.ip})` +
       (failed.length > 0 ? ` · failures: ${failed.map((f) => `${f.domain} (${f.msg.slice(0, 80)})`).join("; ")}` : ""))
