@@ -781,37 +781,17 @@ export async function autoDestroyDeadDroplets(): Promise<DestroyDeadDropletsResu
     }
 
     const reason = `Layer 4 give-up: ${failureCount} reinstall_sa failures in ${windowHours}h, no domains referencing this server`
-    logPipeline(`server-${s.id}`, "auto_destroy", "running", reason)
     try {
-      // Destroy DO droplet first (the costly part), then SA stub, then DB row.
-      const { deleteDroplet } = await import("./digitalocean")
-      const { deleteSaServer } = await import("./serveravatar")
-      const { run: dbRun } = await import("./db")
-
-      const doOk = await deleteDroplet(s.do_droplet_id!).catch((e) => {
-        logPipeline(`server-${s.id}`, "auto_destroy", "warning",
-          `DO destroy failed (droplet ${s.do_droplet_id}): ${(e as Error).message.slice(0, 200)} — continuing with SA + DB cleanup anyway`)
-        return false
-      })
-      if (s.sa_server_id) {
-        const r = await deleteSaServer(s.sa_server_id).catch((e) => ({ ok: false, reason: (e as Error).message }))
-        logPipeline(`server-${s.id}`, "auto_destroy",
-          r.ok ? "running" : "warning",
-          r.ok ? `Deleted SA stub ${s.sa_server_id}` : `SA stub delete failed: ${r.reason}`)
-      }
-      dbRun("DELETE FROM servers WHERE id = ?", s.id)
-      logPipeline(`server-${s.id}`, "auto_destroy", "completed",
-        `Server #${s.id} destroyed: DO droplet ${s.do_droplet_id} ${doOk ? "deleted" : "destroy-failed"}, ` +
-        `SA stub cleared, DB row dropped. Stop billing for this droplet.`)
-      appendAudit("server_auto_destroyed", `server-${s.id}`,
-        `failures=${failureCount}/${giveUpAfter} window=${windowHours}h ip=${s.ip} ` +
-        `do_droplet=${s.do_droplet_id} do_destroy_ok=${doOk}`,
-        null)
-
-      try {
-        const { notify } = await import("./notify")
-        await notify(
-          `Server #${s.id} auto-destroyed (${giveUpAfter}+ SA install failures)`,
+      await destroyServerNow({
+        serverId: s.id,
+        name: s.name,
+        ip: s.ip,
+        doDropletId: s.do_droplet_id,
+        saServerId: s.sa_server_id,
+        reason,
+        auditDetail: `failures=${failureCount}/${giveUpAfter} window=${windowHours}h ip=${s.ip} do_droplet=${s.do_droplet_id}`,
+        notifyTitle: `Server #${s.id} auto-destroyed (${giveUpAfter}+ SA install failures)`,
+        notifyBody:
           `Layer 4 gave up on server #${s.id} (${s.name ?? "unnamed"} / ${s.ip}) ` +
           `after ${failureCount} reinstall_sa failures in ${windowHours}h.\n\n` +
           `DO droplet ${s.do_droplet_id} destroyed (no longer billing).\n` +
@@ -820,9 +800,7 @@ export async function autoDestroyDeadDroplets(): Promise<DestroyDeadDropletsResu
           `If you have domains that still need a host, provision a fresh server ` +
           `or trigger bulk-migrate. The auto-flow will pick the next available ` +
           `target on the next dead-detect tick.`,
-          { severity: "error", dedupeKey: `server_auto_destroyed:${s.id}` },
-        )
-      } catch { /* notify is best-effort */ }
+      })
       destroyed.push({
         server_id: s.id, name: s.name, ip: s.ip,
         reason: `${failureCount} failures in ${windowHours}h`,
@@ -834,6 +812,82 @@ export async function autoDestroyDeadDroplets(): Promise<DestroyDeadDropletsResu
     }
   }
   return { destroyed, skipped }
+}
+
+/**
+ * Reusable destroy helper — nukes DO droplet + SA stub + DB row + notifies.
+ * Called by Layer 4 (autoDestroyDeadDroplets) AND the fast-fail path in
+ * lib/handlers/reinstall-sa.ts when SA refuses a "dirty" droplet.
+ *
+ * Order matters: DO first (the costly part — stop billing immediately even
+ * if the SA cleanup or DB delete then fails). DO failures continue to the
+ * SA + DB cleanup so a partial-failure state doesn't strand resources.
+ */
+export async function destroyServerNow(opts: {
+  serverId: number
+  name: string | null
+  ip: string | null
+  doDropletId: string | null
+  saServerId: string | null
+  reason: string
+  auditDetail: string
+  notifyTitle: string
+  notifyBody: string
+}): Promise<void> {
+  logPipeline(`server-${opts.serverId}`, "auto_destroy", "running", opts.reason)
+  const { deleteDroplet } = await import("./digitalocean")
+  const { deleteSaServer } = await import("./serveravatar")
+  const { run: dbRun } = await import("./db")
+
+  let doOk = false
+  if (opts.doDropletId) {
+    doOk = await deleteDroplet(opts.doDropletId).catch((e) => {
+      logPipeline(`server-${opts.serverId}`, "auto_destroy", "warning",
+        `DO destroy failed (droplet ${opts.doDropletId}): ${(e as Error).message.slice(0, 200)} — continuing with SA + DB cleanup anyway`)
+      return false
+    })
+  }
+  if (opts.saServerId) {
+    const r = await deleteSaServer(opts.saServerId).catch((e) => ({ ok: false, reason: (e as Error).message }))
+    logPipeline(`server-${opts.serverId}`, "auto_destroy",
+      r.ok ? "running" : "warning",
+      r.ok ? `Deleted SA stub ${opts.saServerId}` : `SA stub delete failed: ${r.reason}`)
+  }
+  dbRun("DELETE FROM servers WHERE id = ?", opts.serverId)
+  logPipeline(`server-${opts.serverId}`, "auto_destroy", "completed",
+    `Server #${opts.serverId} destroyed: DO droplet ${opts.doDropletId ?? "(none)"} ${doOk ? "deleted" : "destroy-failed"}, ` +
+    `SA stub cleared, DB row dropped. Stop billing for this droplet.`)
+  appendAudit("server_auto_destroyed", `server-${opts.serverId}`,
+    `${opts.auditDetail} do_destroy_ok=${doOk}`, null)
+  try {
+    const { notify } = await import("./notify")
+    await notify(opts.notifyTitle, opts.notifyBody,
+      { severity: "error", dedupeKey: `server_auto_destroyed:${opts.serverId}` })
+  } catch { /* notify is best-effort */ }
+}
+
+/**
+ * Detect SA install error messages that mean "this droplet will NEVER
+ * accept a SA install — don't bother retrying, destroy now". Returns the
+ * matched fast-fail reason or null.
+ *
+ * Patterns:
+ *   - "Conflict detected ... clean ubuntu server" — SA refuses droplets
+ *     with pre-installed apache/nginx/openlitespeed/php/mysql. No retry
+ *     can fix this; only destroying + provisioning a fresh droplet helps.
+ *
+ * If we ever see another permanent-failure pattern from SA, add it here.
+ * Be conservative — match BOTH halves of the pattern (anchor + signature)
+ * to avoid false-positive on transient errors that happen to mention
+ * one of the keywords.
+ */
+export function isSaFastFailError(msg: string): string | null {
+  if (!msg) return null
+  const lower = msg.toLowerCase()
+  if (lower.includes("conflict detected") && lower.includes("clean ubuntu server")) {
+    return "SA refused dirty droplet (pre-installed apache/nginx/php/mysql) — can't recover, only destruction + fresh provision works"
+  }
+  return null
 }
 
 /**

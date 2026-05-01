@@ -47,11 +47,40 @@ export async function serverCreateHandler(payload: Record<string, unknown>): Pro
     try {
       saServerId = await installAgentOnDroplet({ dropletIp: ip, serverName: name })
     } catch (e) {
-      // Match Flask: warn-and-mark-ready on agent install timeout so the
-      // dashboard still shows the server (operator can wire SA manually).
-      updateServer(serverId, { status: "ready" })
+      // Operator policy (set 2026-05-01): on a freshly-provisioned droplet,
+      // if Layer 1's 2-attempt SA install fails, destroy the droplet
+      // instantly instead of leaving it half-broken. The Flask-era behavior
+      // ("mark ready anyway, operator can wire SA manually") wasted money
+      // on a useless droplet that the operator usually never went back to
+      // wire up. Destroy + clear DB row so the operator sees a clean
+      // failure and can re-trigger provision (auto or manual).
+      const saReason = (e as Error).message.slice(0, 200)
+      const { isSaFastFailError, destroyServerNow } = await import("../auto-heal")
+      const fastFailReason = isSaFastFailError(saReason)
       logPipeline(name, "server_create", "warning",
-        `SA agent install timeout — marked ready anyway: ${(e as Error).message}`)
+        `SA agent install ${fastFailReason ? "fast-failed" : "failed after 2 attempts"} on fresh droplet ` +
+        `${dropletId} (${ip}) — destroying droplet to stop billing. Reason: ${saReason}`)
+      await destroyServerNow({
+        serverId,
+        name,
+        ip,
+        doDropletId: String(dropletId),
+        saServerId: null,
+        reason: fastFailReason
+          ? `SA fast-fail (server-create): ${fastFailReason}`
+          : `Layer 1 exhausted (2 attempts) on fresh droplet via server.create`,
+        auditDetail: `trigger=server_create_sa_fail droplet=${dropletId} ip=${ip} sa_reason=${saReason.slice(0, 80)}`,
+        notifyTitle: `Fresh-build server #${serverId} auto-destroyed (SA install failed)`,
+        notifyBody:
+          `Operator-initiated server.create for ${name}: provisioned droplet at ${ip} but SA agent ` +
+          `install ${fastFailReason ? "fast-failed" : "failed after 2 attempts"}. Per fresh-provision ` +
+          `policy, droplet was DESTROYED to stop billing instead of left half-broken. ` +
+          `Re-trigger provision from /servers if you need a new server.\n\nFailure detail: ${saReason}`,
+      }).catch((destroyErr) => {
+        logPipeline(name, "server_create", "failed",
+          `Auto-destroy of fresh droplet ${dropletId} threw: ${(destroyErr as Error).message.slice(0, 200)}. ` +
+          `MANUAL CLEANUP NEEDED: destroy droplet ${dropletId} (${ip}) from DO console.`)
+      })
       return
     }
     updateServer(serverId, { sa_server_id: saServerId, status: "ready" })

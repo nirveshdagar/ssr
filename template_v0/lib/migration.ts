@@ -653,39 +653,63 @@ export async function migrateServer(
           )
         } catch { /* notify is best-effort */ }
       } catch (saErr) {
-        // SA install timed out after the 2 internal retries-with-cleanup.
-        // Leave the droplet alive (status stays 'creating') and enqueue a
-        // server.reinstall_sa job that'll keep retrying. The follow-up
-        // payload tells reinstall-sa to resume THIS migration (move the
-        // OLD server's domains here) once SA is finally alive.
-        const { enqueueJob } = await import("./jobs")
-        const reinstallJobId = enqueueJob("server.reinstall_sa", {
-          server_id: serverId,
-          follow_up_migrate_from: oldServerId,
-        }, 1)
+        // SA install failed after Layer 1's 2-attempt internal retry on a
+        // FRESHLY-PROVISIONED droplet. Operator policy (set 2026-05-01):
+        // don't enqueue reinstall_sa to keep retrying on the broken
+        // droplet — destroy it instantly so we stop billing AND so the
+        // dead-server-retry sweep can pick a fresh droplet on its next
+        // tick. Two install failures on a fresh provision is a strong
+        // signal the droplet is in a permanent bad state (DO infra glitch,
+        // image corruption, kernel issue) — Layer 1 already retried; more
+        // retries on the same droplet won't help.
+        //
+        // Fast-fail patterns (e.g. SA's "Conflict detected ... clean
+        // ubuntu server" — pre-installed apache/nginx/mysql) get the
+        // SAME destroy treatment but with a more specific notify body.
         const saReason = (saErr as Error).message.slice(0, 200)
+        const { isSaFastFailError, destroyServerNow } = await import("./auto-heal")
+        const fastFailReason = isSaFastFailError(saReason)
+        const triggerLabel = fastFailReason
+          ? `SA fast-fail: ${fastFailReason}`
+          : `Layer 1 exhausted (2 attempts) on fresh droplet`
         logPipeline(anchorName, "migrate", "warning",
-          `SA install timed out on droplet ${dropletId} (${newIp}) after 2 attempts. ` +
-          `Droplet kept alive; reinstall enqueued (job ${reinstallJobId}). ` +
-          `Domain migration will auto-resume once SA agent registers. Reason: ${saReason}`)
-        try {
-          const { notify } = await import("./notify")
-          await notify(
-            `SA install pending on new server #${serverId}`,
+          `SA install ${fastFailReason ? "fast-failed" : "failed after 2 attempts"} on fresh droplet ` +
+          `${dropletId} (${newIp}) — destroying droplet now to stop billing. ` +
+          `Dead-server retry sweep will pick a fresh droplet next tick. Reason: ${saReason}`)
+        await destroyServerNow({
+          serverId,
+          name: newName,
+          ip: newIp,
+          doDropletId: String(dropletId),
+          saServerId: null, // No SA stub yet — install never completed registration
+          reason: triggerLabel,
+          auditDetail: `trigger=fresh_provision_sa_fail droplet=${dropletId} ip=${newIp} sa_reason=${saReason.slice(0, 80)}`,
+          notifyTitle: `Fresh-build server #${serverId} auto-destroyed (SA install failed)`,
+          notifyBody:
             `Auto-migrate off #${oldServerId}: provisioned ${newName} (${newIp}) but SA agent ` +
-            `failed to register after 2 attempts. Reinstall queued (job ${reinstallJobId}); ` +
-            `domain migration will resume automatically once the agent is alive (typical ` +
-            `30-60 min). No action needed.\n\nFailure detail: ${saReason}`,
-            { severity: "warning", dedupeKey: `auto_provision_sa_pending:${oldServerId}` },
-          )
-        } catch { /* notify is best-effort */ }
+            `install ${fastFailReason ? "fast-failed" : "failed after 2 attempts"} on this fresh droplet. ` +
+            `Per fresh-provision policy, droplet was DESTROYED to stop billing instead of ` +
+            `keeping it alive for retries (Layer 1 already exhausted). The dead-server retry ` +
+            `sweep will pick a fresh droplet on its next tick (~5-15 min).\n\n` +
+            `Failure detail: ${saReason}`,
+        }).catch((destroyErr) => {
+          logPipeline(anchorName, "migrate", "failed",
+            `Auto-destroy of fresh droplet ${dropletId} threw: ${(destroyErr as Error).message.slice(0, 200)}. ` +
+            `MANUAL CLEANUP NEEDED: destroy droplet ${dropletId} (${newIp}) from DO console.`)
+        })
+        // Migration as a whole failed — surface to caller so the dead-
+        // server-retry sweep counts this attempt against its per-day cap
+        // and the operator sees the right counts in the dashboard.
         return {
           ok: [],
-          failed: [],
-          deferred: oldRows.map((r) => r.domain),
-          new_server_id: serverId,
-          msg: `SA install deferred on new droplet ${dropletId}. Reinstall queued (${reinstallJobId}); ` +
-               `${oldRows.length} domain(s) will migrate once agent registers.`,
+          failed: oldRows.map((r) => ({
+            domain: r.domain,
+            reason: `Fresh-provision SA install ${fastFailReason ? "fast-failed" : "failed"} — droplet destroyed; will retry on next sweep tick`,
+          })),
+          deferred: [],
+          new_server_id: null,
+          msg: `Fresh droplet ${dropletId} destroyed after SA install ${fastFailReason ? "fast-fail" : "exhausted retries"}. ` +
+               `${oldRows.length} domain(s) deferred to next dead-server-retry tick.`,
         }
       }
     } catch (e) {
