@@ -4,7 +4,7 @@ import { appendAudit } from "@/lib/repos/audit"
 
 export const runtime = "nodejs"
 
-const VALID = new Set<string>(["openai"])
+const VALID = new Set<string>(["openai", "anthropic_cli"])
 
 function parseProvider(body: { provider?: string }): CliProvider | null {
   const p = (body.provider || "").toLowerCase()
@@ -18,7 +18,7 @@ export async function POST(req: NextRequest): Promise<Response> {
   const body = (await req.json().catch(() => ({}))) as { provider?: string }
   const provider = parseProvider(body)
   if (!provider) {
-    return NextResponse.json({ ok: false, error: "provider must be 'openai'" }, { status: 400 })
+    return NextResponse.json({ ok: false, error: "provider must be 'openai' or 'anthropic_cli'" }, { status: 400 })
   }
   const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null
   const result = startLogin(provider)
@@ -31,7 +31,7 @@ export async function DELETE(req: NextRequest): Promise<Response> {
   const url = new URL(req.url)
   const provider = parseProvider({ provider: url.searchParams.get("provider") || undefined })
   if (!provider) {
-    return NextResponse.json({ ok: false, error: "provider must be 'openai'" }, { status: 400 })
+    return NextResponse.json({ ok: false, error: "provider must be 'openai' or 'anthropic_cli'" }, { status: 400 })
   }
   const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null
   const result = cancelLogin(provider)

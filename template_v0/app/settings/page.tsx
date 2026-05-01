@@ -429,7 +429,8 @@ export default function SettingsPage() {
                   <Select value={get("llm_provider") || "anthropic"} onValueChange={(v) => set("llm_provider", v)}>
                     <SelectTrigger className="h-8 text-small"><SelectValue /></SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="anthropic">Anthropic (Claude)</SelectItem>
+                      <SelectItem value="anthropic">Anthropic (Claude — API key)</SelectItem>
+                      <SelectItem value="anthropic_cli">Claude Code CLI (free w/ Pro/Max)</SelectItem>
                       <SelectItem value="openai">OpenAI (GPT)</SelectItem>
                       <SelectItem value="gemini">Google Gemini</SelectItem>
                       <SelectItem value="openrouter">OpenRouter</SelectItem>
@@ -520,7 +521,7 @@ export default function SettingsPage() {
 
                       {p.cli && cliKey && (
                         <CliAuthPanel
-                          provider={p.id as "openai" | "gemini"}
+                          provider={p.id as "openai" | "anthropic_cli"}
                           cliBin={p.cli.bin}
                           loginLabel={p.cli.loginLabel ?? `Sign in with ${p.cli.bin}`}
                           enabled={cliEnabled}
@@ -554,6 +555,50 @@ export default function SettingsPage() {
                   )
                 })}
               </div>
+
+              {/* Claude Code CLI — separate shape, no API key. Active when the
+                  provider above is "anthropic_cli". Routes step 9 through the
+                  locally-installed `claude` binary using the operator's
+                  Claude Pro/Max subscription. Headless install path:
+                    1. npm install -g @anthropic-ai/claude-code
+                    2. `claude setup-token` (or set CLAUDE_CODE_OAUTH_TOKEN)
+                  Both are driven by the Install / Sign-in buttons below. */}
+              <Field>
+                <FieldLabel>
+                  <span className="inline-flex items-center justify-between gap-2 w-full">
+                    <span className="inline-flex items-center gap-1.5">
+                      Claude Code CLI
+                      <span className="rounded bg-status-completed/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-status-completed">
+                        free w/ Pro/Max
+                      </span>
+                    </span>
+                    <a
+                      href="https://docs.claude.com/en/docs/claude-code/quickstart"
+                      target="_blank" rel="noopener noreferrer"
+                      className="text-micro text-status-running hover:underline inline-flex items-center gap-1"
+                      title="Open the Claude Code install + auth docs in a new tab"
+                    >
+                      <ExternalLink className="h-3 w-3" /> Claude Code docs
+                    </a>
+                  </span>
+                </FieldLabel>
+                <CliAuthPanel
+                  provider="anthropic_cli"
+                  cliBin="claude"
+                  loginLabel="Sign in with Claude"
+                  enabled={true}
+                  onToggle={() => { /* anthropic_cli is CLI-only — no toggle */ }}
+                  hideEnableToggle={true}
+                />
+                <FieldDescription>
+                  Set the provider dropdown above to <strong>Claude Code CLI</strong> to
+                  route every step-9 LLM call through the local <code className="font-mono">claude</code> binary.
+                  No API key, no per-call billing — runs against your Claude
+                  Pro/Max subscription. On the production server, after Install +
+                  Sign in, every new domain pipeline AND Regenerate flow will use
+                  this CLI for content generation.
+                </FieldDescription>
+              </Field>
 
               {/* Cloudflare Workers AI — separate shape (account ID + token), runs
                   Kimi K2.6 on CF's free 10k-neurons/day tier. Selected by setting
@@ -1328,13 +1373,21 @@ interface CliStatusResp {
  * "Signed in", and the parent toggle becomes flippable.
  */
 function CliAuthPanel({
-  provider, cliBin, loginLabel, enabled, onToggle,
+  provider, cliBin, loginLabel, enabled, onToggle, hideEnableToggle = false,
 }: {
-  provider: "gemini" | "openai"
+  provider: "openai" | "anthropic_cli"
   cliBin: string
   loginLabel: string
+  /** Whether the CLI mode is currently active. For *_cli providers
+   *  this is always true (selecting the provider IS the toggle), so the
+   *  card hides the on/off switch — pass `enabled=true onToggle={()=>{}}`
+   *  AND `hideEnableToggle={true}`. */
   enabled: boolean
   onToggle: (v: boolean) => void
+  /** When true, the "use this CLI" toggle is hidden from the signed-in
+   *  state (only Sign-out remains). For providers where selection is
+   *  driven by the provider dropdown, not a per-row toggle. */
+  hideEnableToggle?: boolean
 }) {
   const [status, setStatus] = React.useState<CliStatusResp | null>(null)
   const [busy, setBusy] = React.useState<"install" | "login" | "signout" | "cancel" | null>(null)
@@ -1513,12 +1566,14 @@ function CliAuthPanel({
     )
     action = (
       <div className="flex items-center gap-2">
-        <Switch
-          checked={enabled}
-          onCheckedChange={onToggle}
-          aria-label={`Use ${cliBin} CLI auth`}
-          title={`Toggle CLI auth via ${cliBin}`}
-        />
+        {!hideEnableToggle && (
+          <Switch
+            checked={enabled}
+            onCheckedChange={onToggle}
+            aria-label={`Use ${cliBin} CLI auth`}
+            title={`Toggle CLI auth via ${cliBin}`}
+          />
+        )}
         <Button
           size="sm" variant="ghost" onClick={onSignOut} disabled={busy !== null}
           className="gap-1.5 text-muted-foreground hover:text-status-terminal"

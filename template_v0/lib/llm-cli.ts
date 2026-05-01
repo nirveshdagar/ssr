@@ -1,15 +1,18 @@
 /**
  * Shell-out path for LLM providers whose vendor CLI does an OAuth login of
- * its own. Currently ONLY OpenAI Codex CLI (tied to a ChatGPT sub).
+ * its own. Two providers wired today:
+ *   - openai → `codex` CLI (tied to a ChatGPT Plus sub)
+ *   - anthropic_cli → `claude` CLI (Claude Code, tied to Pro/Max sub)
  *
  * Gemini was removed — gemini-cli ≥ 0.38 hard-rejects non-interactive OAuth
  * and the dashboard-handled OAuth fallback was fragile across CLI version
  * bumps. Operators use the API-key path for Gemini instead (paste an AI
  * Studio key in Settings → llm_api_key_gemini).
  *
- * Why CLI shell-out for codex: piggybacks on the auth the user already
- * configured with the CLI on disk — no API key in Settings, no separate
- * API billing. Paid for under the user's existing ChatGPT Plus tier.
+ * Why CLI shell-out: piggybacks on the auth the user already configured
+ * with the CLI on disk — no API key in Settings, no separate API billing.
+ * Paid for under the user's existing ChatGPT Plus / Claude Pro / Claude Max
+ * subscription.
  *
  * This module also drives the dashboard's install/login flow:
  *   - findBinary()   — `where`/`which` lookup so the UI can show "Install" vs "Sign in"
@@ -24,7 +27,7 @@ import { existsSync, readFileSync, rmSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 
-export type CliProvider = "openai"
+export type CliProvider = "openai" | "anthropic_cli"
 
 interface CliMeta {
   /** Binary name the CLI ships as. */
@@ -43,6 +46,17 @@ const META: Record<CliProvider, CliMeta> = {
     pkg: "@openai/codex",
     credsPath: path.join(homedir(), ".codex", "auth.json"),
     loginLabel: "Sign in with ChatGPT",
+  },
+  anthropic_cli: {
+    bin: "claude",
+    pkg: "@anthropic-ai/claude-code",
+    // Claude Code stores OAuth tokens at ~/.claude/.credentials.json (note
+    // the leading dot on the file). Some platform builds also use macOS
+    // Keychain — for those isLoggedIn() returns false even when logged-in;
+    // the operator can set CLAUDE_CODE_OAUTH_TOKEN as a fallback (see
+    // /settings → LLM → Claude Code CLI panel for the workflow).
+    credsPath: path.join(homedir(), ".claude", ".credentials.json"),
+    loginLabel: "Sign in with Claude",
   },
 }
 
@@ -85,10 +99,19 @@ export function assertSafeModel(model: string): void {
  *   flag is recognized, then write the real prompt via stdin (final prompt
  *   to the model = our prompt + " ").
  */
-function buildInvocation(_provider: CliProvider, model: string): CliInvocation {
+function buildInvocation(provider: CliProvider, model: string): CliInvocation {
   // Defense in depth — caller (runLlmCli) also validates, but if a future
   // direct caller forgets, this still catches it.
   assertSafeModel(model)
+  if (provider === "anthropic_cli") {
+    // Claude Code's `--print` mode outputs the response and exits.
+    // Prompt comes via stdin (same reason as codex — bypasses Windows
+    // cmd.exe arg-splitting on .cmd shims).
+    return {
+      bin: "claude",
+      args: ["--print", "--model", model],
+    }
+  }
   return {
     bin: "codex",
     args: ["exec", "--skip-git-repo-check", "--model", model, "-"],
@@ -218,19 +241,25 @@ export async function runLlmCli(
  * embeds verbatim.
  */
 function classifyCliFailure(provider: CliProvider, combined: string): string | null {
-  // Codex hits the ChatGPT Plus / Codex monthly quota — exit code is
-  // unreliable (0 or 1 depending on what stage it hit the cap), but the
-  // error string is stable. Pull out the reset date if present so the
-  // operator knows when to come back.
-  if (/hit your usage limit|usage limit reached|quota.*exceeded/i.test(combined)) {
-    const m = combined.match(/try again at ([^.\n]+)/i)
-    const resetNote = m ? ` — quota resets ${m[1].trim()}` : ""
-    return `OpenAI Codex usage limit hit${resetNote}. ` +
+  // Quota / usage-limit detection — pattern is similar across both CLIs;
+  // the error string varies but the root cause (operator hit their plan
+  // cap) is the same. Pull out the reset date if present.
+  if (/hit your usage limit|usage limit reached|quota.*exceeded|message limit/i.test(combined)) {
+    const m = combined.match(/try again at ([^.\n]+)|reset(?:s|ed at)? ([^.\n]+)/i)
+    const resetNote = m ? ` — quota resets ${(m[1] ?? m[2] ?? "").trim()}` : ""
+    const cliName = provider === "anthropic_cli" ? "Claude Code" : "OpenAI Codex"
+    return `${cliName} usage limit hit${resetNote}. ` +
       `Switch provider in the Regenerate dialog (Cloudflare Workers AI POOL is free and stacked) ` +
       `or change the default in /settings → LLM.`
   }
-  if (/please.*log.in|run.*codex.*login|not.*authenticated|unauthenticated/i.test(combined) && provider === "openai") {
+  if (provider === "openai" &&
+      /please.*log.in|run.*codex.*login|not.*authenticated|unauthenticated/i.test(combined)) {
     return `Codex CLI not signed in. Click "Sign in with ChatGPT" in /settings → LLM, then retry.`
+  }
+  if (provider === "anthropic_cli" &&
+      /please.*log.in|claude.*login|not.*authenticated|unauthenticated|invalid.*api.*key|invalid.*token/i.test(combined)) {
+    return `Claude Code CLI not signed in. Click "Sign in with Claude" in /settings → LLM, ` +
+      `or set CLAUDE_CODE_OAUTH_TOKEN env var on the server, then retry.`
   }
   return null
 }
@@ -428,8 +457,11 @@ export function startLogin(provider: CliProvider): { ok: boolean; error?: string
     return { ok: false, error: "Login already in progress — finish it in the browser or click Cancel" }
   }
 
-  const bin = "codex"
-  const args = ["login"]
+  const bin = META[provider].bin
+  // codex: `codex login`; claude: `claude /login` is REPL-only, the headless
+  // CLI flag is `claude setup-token` (writes ~/.claude/.credentials.json
+  // directly after browser OAuth — same shape as codex login).
+  const args = provider === "anthropic_cli" ? ["setup-token"] : ["login"]
 
   let child: ChildProcess
   try {

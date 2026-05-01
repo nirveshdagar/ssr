@@ -60,11 +60,13 @@ interface LlmConfig {
   cliMode: boolean
 }
 
-// Only OpenAI's codex CLI gets the spawn-based login flow now. Gemini was
-// removed because gemini-cli ≥ 0.38 hard-rejects non-interactive OAuth and
-// the dashboard-handled OAuth fallback was fragile across version bumps.
-// Gemini still works via API-key path (settings → llm_api_key_gemini).
-const CLI_CAPABLE_PROVIDERS: ReadonlySet<string> = new Set(["openai"])
+// Two providers route through the spawn-based CLI path:
+//   "openai"        → `codex` CLI (ChatGPT Plus sub)
+//   "anthropic_cli" → `claude` CLI (Claude Pro/Max sub, Claude Code)
+// Gemini was removed because gemini-cli ≥ 0.38 hard-rejects non-interactive
+// OAuth and the dashboard-handled OAuth fallback was fragile across version
+// bumps. Gemini still works via API-key path (settings → llm_api_key_gemini).
+const CLI_CAPABLE_PROVIDERS: ReadonlySet<string> = new Set(["openai", "anthropic_cli"])
 
 /**
  * Read the response body as text first, then JSON.parse. On parse failure,
@@ -91,6 +93,10 @@ async function safeLlmJson<T>(provider: string, res: Response): Promise<T> {
 
 function isCliEnabled(provider: string): boolean {
   if (!CLI_CAPABLE_PROVIDERS.has(provider)) return false
+  // *_cli providers (anthropic_cli) are CLI by construction — selecting
+  // them in the dropdown IS the operator opting into CLI mode, so the
+  // separate `llm_cli_enabled_*` setting toggle doesn't apply.
+  if (provider.endsWith("_cli")) return true
   return (getSetting(`llm_cli_enabled_${provider}`) || "0") === "1"
 }
 
@@ -305,10 +311,13 @@ export async function generateWebsite(
   try {
     let html: string
     if (cliMode) {
-      // CLI mode is openai-only now (gemini was removed). codex CLI v0.125+
-      // defaults to "gpt-5.5"; let `llm_model` setting override.
+      // CLI mode for openai (codex) or anthropic_cli (claude). Per-provider
+      // defaults if the operator hasn't set llm_model.
       const cliProvider = provider as CliProvider
-      const model = getSetting("llm_model") || "gpt-5.5"
+      const cliDefault = provider === "anthropic_cli"
+        ? "claude-haiku-4-5-20251001"
+        : "gpt-5.5"
+      const model = getSetting("llm_model") || cliDefault
       const { text } = await runLlmCli(cliProvider, model, "", prompt)
       html = text
     } else if (provider === "openai") {
@@ -599,15 +608,17 @@ async function _generateSinglePageImpl(
   let usage: UsageInfo = {}
 
   if (cliMode) {
-    // CLI shells out to the user's authenticated `gemini` or `codex` binary.
+    // CLI shells out to the user's authenticated `codex` or `claude` binary.
     // Token usage is not reported (CLIs don't print usageMetadata), so we
     // leave `usage` empty — the row in pipeline_runs just records null.
     const cliProvider = provider as CliProvider
-    // CLI mode is openai-only now. codex CLI v0.125 default is "gpt-5.5".
-    // Use `||` not `??` — `??` only falls through on null/undefined, but the
-    // settings store returns "" for unset model and the override is "" when
-    // the dialog field is left blank. We want either of those to fall back.
-    const model = (overrideModel || getSetting("llm_model") || "gpt-5.5").trim()
+    // Per-provider default models. Use `||` not `??` — settings store
+    // returns "" for unset model and the override is "" when the dialog
+    // field is left blank; we want either of those to fall back.
+    const cliDefault = provider === "anthropic_cli"
+      ? "claude-haiku-4-5-20251001"   // cheapest Pro-tier Claude that handles full HTML gen
+      : "gpt-5.5"                      // codex CLI v0.125 default
+    const model = (overrideModel || getSetting("llm_model") || cliDefault).trim()
     logPipeline(domain, "generate_site_v2", "running",
       `${cliProvider} CLI call: model=${model}`)
     const { text: cliText } = await runLlmCli(cliProvider, model, systemMsg, userMsg)
