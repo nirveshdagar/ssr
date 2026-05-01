@@ -11,7 +11,7 @@ import {
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
-import { Loader2, RefreshCw, Trash2, Eye, Upload as UploadIcon, FileText, X, AlertTriangle, CheckCircle2 } from "lucide-react"
+import { Loader2, RefreshCw, Trash2, Eye, Upload as UploadIcon, FileText, X, AlertTriangle, CheckCircle2, Save } from "lucide-react"
 import { MonoCode } from "@/components/ssr/data-table"
 import { domainActions } from "@/lib/api-actions"
 
@@ -84,7 +84,15 @@ export function FileBrowserDialog({ open, onOpenChange, domain, serverIp, snapsh
   const [loading, setLoading] = React.useState(false)
   const [errMsg, setErrMsg] = React.useState<string | null>(null)
   const [okMsg, setOkMsg] = React.useState<string | null>(null)
-  const [viewing, setViewing] = React.useState<{ name: string; content: string; bytes: number } | null>(null)
+  const [viewing, setViewing] = React.useState<{
+    name: string
+    /** content as last saved (the read body OR the last successful write) */
+    original: string
+    /** content as currently in the textarea — may diverge from `original` */
+    edited: string
+    bytes: number
+  } | null>(null)
+  const [savingFile, setSavingFile] = React.useState(false)
   const [uploadName, setUploadName] = React.useState("")
   const [uploadBody, setUploadBody] = React.useState("")
   const [uploadBusy, setUploadBusy] = React.useState(false)
@@ -171,9 +179,50 @@ export function FileBrowserDialog({ open, onOpenChange, domain, serverIp, snapsh
       )
       const j = await r.json() as ReadResponse
       if (!j.ok) throw new Error(j.error ?? `read failed (${r.status})`)
-      setViewing({ name, content: j.content ?? "", bytes: j.bytes ?? 0 })
+      const content = j.content ?? ""
+      setViewing({ name, original: content, edited: content, bytes: j.bytes ?? 0 })
     } catch (e) {
       setErrMsg((e as Error).message)
+    }
+  }
+
+  async function saveViewedFile() {
+    if (!viewing || savingFile) return
+    setSavingFile(true); setErrMsg(null); setOkMsg(null)
+    try {
+      // Special-case index.php: route through /api/sa/index-file so the
+      // editor's .bak side effect runs (write creates index.php.bak first).
+      // Other files go through the regular upload-file endpoint.
+      if (viewing.name.toLowerCase() === "index.php") {
+        const fd = new FormData()
+        fd.set("domain", domain)
+        fd.set("server_ip", serverIp)
+        fd.set("body", viewing.edited)
+        const r = await fetch("/api/sa/index-file", { method: "POST", body: fd })
+        const j = await r.json() as SimpleResponse
+        if (!j.ok) throw new Error(j.error ?? `save failed (${r.status})`)
+        setOkMsg(j.message ?? `Saved ${viewing.name}`)
+      } else {
+        const r = await fetch("/api/sa/upload-file", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            domain, server_ip: serverIp,
+            filename: viewing.name, body: viewing.edited,
+          }),
+        })
+        const j = await r.json() as SimpleResponse
+        if (!j.ok) throw new Error(j.error ?? `save failed (${r.status})`)
+        setOkMsg(j.message ?? `Saved ${viewing.name}`)
+      }
+      // Pin the new content as the "original" so subsequent edits show
+      // dirty state correctly.
+      setViewing((v) => v ? { ...v, original: v.edited, bytes: v.edited.length } : v)
+      await refresh()
+    } catch (e) {
+      setErrMsg((e as Error).message)
+    } finally {
+      setSavingFile(false)
     }
   }
 
@@ -196,24 +245,11 @@ export function FileBrowserDialog({ open, onOpenChange, domain, serverIp, snapsh
     }
   }
 
-  function handleFilePicked(ev: React.ChangeEvent<HTMLInputElement>) {
-    const f = ev.target.files?.[0]
-    if (!f) return
-    setUploadName(f.name)
-    const reader = new FileReader()
-    reader.onload = () => {
-      const v = typeof reader.result === "string" ? reader.result : ""
-      setUploadBody(v)
-    }
-    reader.onerror = () => {
-      setErrMsg(`could not read ${f.name} as text`)
-    }
-    reader.readAsText(f)
-  }
-
-  async function doUpload() {
-    if (!uploadName.trim()) { setErrMsg("filename required"); return }
-    if (!uploadBody) { setErrMsg("file is empty"); return }
+  // Reusable upload helper. Used by both the file picker (auto-uploads on
+  // selection) and the manual "paste body + click Upload" path.
+  async function uploadFile(filename: string, body: string): Promise<void> {
+    if (!filename.trim()) { setErrMsg("filename required"); return }
+    if (!body) { setErrMsg("file is empty"); return }
     setUploadBusy(true); setErrMsg(null); setOkMsg(null)
     try {
       const r = await fetch("/api/sa/upload-file", {
@@ -221,12 +257,12 @@ export function FileBrowserDialog({ open, onOpenChange, domain, serverIp, snapsh
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           domain, server_ip: serverIp,
-          filename: uploadName.trim(), body: uploadBody,
+          filename: filename.trim(), body,
         }),
       })
       const j = await r.json() as SimpleResponse
       if (!j.ok) throw new Error(j.error ?? `upload failed (${r.status})`)
-      setOkMsg(j.message ?? `Uploaded ${uploadName}`)
+      setOkMsg(j.message ?? `Uploaded ${filename}`)
       setUploadName(""); setUploadBody("")
       if (fileInputRef.current) fileInputRef.current.value = ""
       await refresh()
@@ -235,6 +271,39 @@ export function FileBrowserDialog({ open, onOpenChange, domain, serverIp, snapsh
     } finally {
       setUploadBusy(false)
     }
+  }
+
+  function handleFilePicked(ev: React.ChangeEvent<HTMLInputElement>) {
+    const f = ev.target.files?.[0]
+    if (!f) return
+    // The upload-file API only accepts text bodies (FileReader.readAsText
+    // would return garbage for binaries → server-side write would write
+    // garbled data). Detect common binary types early and tell the user.
+    const looksBinary = /\.(png|jpe?g|gif|webp|ico|pdf|zip|tar|gz|woff2?|ttf|otf|mp[34]|mov)$/i.test(f.name)
+    if (looksBinary) {
+      setErrMsg(`'${f.name}' looks like a binary file — upload-file currently supports text only. Use the SA dashboard for binary uploads.`)
+      if (fileInputRef.current) fileInputRef.current.value = ""
+      return
+    }
+    setUploadName(f.name)
+    const reader = new FileReader()
+    reader.onload = () => {
+      const v = typeof reader.result === "string" ? reader.result : ""
+      setUploadBody(v)
+      // Auto-upload as soon as the file content is loaded — the picker
+      // already conveys the operator's intent ("upload this"). Removes
+      // the trap where user clicks Upload too early (before FileReader
+      // finishes) and nothing happens.
+      void uploadFile(f.name, v)
+    }
+    reader.onerror = () => {
+      setErrMsg(`could not read ${f.name} as text`)
+    }
+    reader.readAsText(f)
+  }
+
+  async function doUpload() {
+    return uploadFile(uploadName, uploadBody)
   }
 
   return (
@@ -404,25 +473,48 @@ export function FileBrowserDialog({ open, onOpenChange, domain, serverIp, snapsh
               </table>
             </div>
 
-            {viewing && (
-              <div className="rounded-md border border-border">
-                <div className="flex items-center justify-between border-b border-border bg-muted/40 px-3 py-2">
-                  <div className="flex items-center gap-2 text-small">
-                    <FileText className="h-3.5 w-3.5 text-muted-foreground" />
-                    <MonoCode>{viewing.name}</MonoCode>
-                    <span className="text-micro text-muted-foreground">{formatBytes(viewing.bytes)}</span>
+            {viewing && (() => {
+              const dirty = viewing.edited !== viewing.original
+              return (
+                <div className="rounded-md border border-border">
+                  <div className="flex items-center justify-between border-b border-border bg-muted/40 px-3 py-2">
+                    <div className="flex items-center gap-2 text-small">
+                      <FileText className="h-3.5 w-3.5 text-muted-foreground" />
+                      <MonoCode>{viewing.name}</MonoCode>
+                      <span className="text-micro text-muted-foreground">{formatBytes(viewing.bytes)}</span>
+                      {dirty && <span className="text-micro text-status-retryable">● modified</span>}
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <Button
+                        variant="default" size="sm" className="h-7 gap-1.5"
+                        onClick={saveViewedFile}
+                        disabled={!dirty || savingFile}
+                        title={dirty ? `Save changes to ${viewing.name}` : "No changes"}
+                      >
+                        {savingFile ? <Loader2 className="h-3 w-3 animate-spin" /> : <Save className="h-3 w-3" />}
+                        Save
+                      </Button>
+                      <Button
+                        variant="ghost" size="icon" className="h-7 w-7"
+                        onClick={() => {
+                          if (dirty && !confirm("Discard unsaved changes?")) return
+                          setViewing(null)
+                        }}
+                        title="Close preview"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
                   </div>
-                  <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => setViewing(null)} title="Close preview">
-                    <X className="h-3.5 w-3.5" />
-                  </Button>
+                  <Textarea
+                    value={viewing.edited}
+                    onChange={(e) => setViewing((v) => v ? { ...v, edited: e.target.value } : v)}
+                    spellCheck={false}
+                    className="min-h-[180px] max-h-[320px] font-mono text-micro"
+                  />
                 </div>
-                <Textarea
-                  readOnly
-                  value={viewing.content}
-                  className="min-h-[180px] max-h-[320px] font-mono text-micro"
-                />
-              </div>
-            )}
+              )
+            })()}
 
             <div className="rounded-md border border-border">
               <div className="border-b border-border bg-muted/40 px-3 py-2 text-small font-medium">
@@ -434,22 +526,38 @@ export function FileBrowserDialog({ open, onOpenChange, domain, serverIp, snapsh
                     ref={fileInputRef}
                     type="file"
                     onChange={handleFilePicked}
+                    disabled={uploadBusy}
                     className="text-small"
                   />
-                  <span className="text-micro text-muted-foreground">or paste below</span>
+                  {uploadBusy
+                    ? <span className="inline-flex items-center gap-1 text-micro text-muted-foreground">
+                        <Loader2 className="h-3 w-3 animate-spin" /> uploading…
+                      </span>
+                    : <span className="text-micro text-muted-foreground">picks auto-upload, or paste below</span>}
                 </div>
                 <Input
-                  placeholder="filename (e.g. about.html)"
+                  placeholder="filename (e.g. about.html) — letters, digits, . _ - only"
                   value={uploadName}
                   onChange={(e) => setUploadName(e.target.value)}
+                  disabled={uploadBusy}
                   className="font-mono"
                 />
                 <Textarea
                   placeholder="file contents…"
                   value={uploadBody}
                   onChange={(e) => setUploadBody(e.target.value)}
+                  disabled={uploadBusy}
                   className="min-h-[100px] max-h-[200px] font-mono text-micro"
                 />
+                {(!uploadName.trim() || !uploadBody) && !uploadBusy && (
+                  <div className="text-micro text-muted-foreground">
+                    {!uploadName.trim() && !uploadBody
+                      ? "Pick a file above OR enter filename + paste contents below to enable Upload."
+                      : !uploadName.trim()
+                      ? "Filename required."
+                      : "File contents required (paste into the box, or pick a file above)."}
+                  </div>
+                )}
                 <div className="flex justify-end">
                   <Button
                     onClick={doUpload}
