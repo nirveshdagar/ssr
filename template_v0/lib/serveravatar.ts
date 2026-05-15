@@ -1839,6 +1839,14 @@ export async function pushSaUiTracker(
             `auto-heal will retry on the next sweep. Site still serving CF Origin.`)
           return
         }
+        // Logically unreachable (autoErr null implies autoRes set on either
+        // attempt), but TS can't infer that through the assignment flow.
+        // Defensive guard + narrowing hint.
+        if (!autoRes) {
+          logPipeline(domain, "sa_ui_sync", "warning",
+            "POST automatic returned no response object — auto-heal will retry.")
+          return
+        }
         if (![200, 201, 202].includes(autoRes.res.status)) {
           const body = await autoRes.res.text()
           // SA's HTTP 500 with "Failed to issue" is misleading — the same
@@ -2132,7 +2140,9 @@ echo "$RESP"
     // Parse the response — last line has __HTTP_STATUS__=NNN
     const statusMatch = out.match(/__HTTP_STATUS__=(\d+)/)
     const httpStatus = statusMatch ? parseInt(statusMatch[1], 10) : 0
-    const bodyMatch = out.match(/^(.+?)\n__HTTP_STATUS__=/s)
+    // [\s\S] matches across newlines without needing the /s flag (ES2018+).
+    // tsconfig target is ES6, so we use the char-class workaround.
+    const bodyMatch = out.match(/^([\s\S]+?)\n__HTTP_STATUS__=/)
     const body = bodyMatch ? bodyMatch[1].trim() : out.trim()
 
     // 200 + success message = win. Anything else = caller falls back to
