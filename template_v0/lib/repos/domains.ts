@@ -117,6 +117,14 @@ export function deleteDomain(domain: string): void {
     try { db.exec("ROLLBACK") } catch { /* ignore */ }
     throw e
   }
+  // Best-effort archive cleanup. Fire-and-forget dynamic import to dodge the
+  // migration.ts → repos/domains.ts cycle. Without this, every soft-delete
+  // path (bare DELETE, bulk-delete, sync-from-SA, server db-delete) leaks the
+  // local site_archives/<domain>.tar.gz forever — only the "Full Delete"
+  // teardown handler cleans it up otherwise.
+  void import("../migration").then(({ deleteArchive }) => {
+    try { deleteArchive(domain) } catch { /* deleteArchive already logs */ }
+  }).catch(() => { /* import failure is harmless — archive will be swept */ })
 }
 
 export function releaseCfKeySlot(domain: string): void {

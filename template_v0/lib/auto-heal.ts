@@ -1428,6 +1428,55 @@ export async function autoFixDownDomains(): Promise<DownAutoFixResult> {
 }
 
 // ---------------------------------------------------------------------------
+// Orphan archive sweeper — defends against any future regression where a
+// delete path forgets to call deleteArchive. data/site_archives/<domain>.tar.gz
+// files that have no matching domain row are removed.
+// ---------------------------------------------------------------------------
+
+export interface OrphanArchiveResult {
+  scanned: number
+  removed: { domain: string; bytes: number }[]
+  bytes_freed: number
+}
+
+export async function cleanOrphanArchives(): Promise<OrphanArchiveResult> {
+  const result: OrphanArchiveResult = { scanned: 0, removed: [], bytes_freed: 0 }
+  try {
+    const { archiveDir } = await import("./migration")
+    const { existsSync, readdirSync, statSync, unlinkSync } = await import("node:fs")
+    const path = await import("node:path")
+    const { getDomain } = await import("./repos/domains")
+
+    const dir = archiveDir()
+    if (!existsSync(dir)) return result
+
+    for (const f of readdirSync(dir)) {
+      if (!f.endsWith(".tar.gz")) continue
+      result.scanned++
+      const domain = f.slice(0, -".tar.gz".length)
+      if (getDomain(domain)) continue // live domain — keep its archive
+
+      const full = path.join(dir, f)
+      try {
+        const bytes = statSync(full).size
+        unlinkSync(full)
+        result.removed.push({ domain, bytes })
+        result.bytes_freed += bytes
+        logPipeline(domain, "orphan_archive_sweep", "info",
+          `Removed orphaned migration archive (${bytes} bytes) — no matching domain row`)
+      } catch (e) {
+        logPipeline(domain, "orphan_archive_sweep", "warning",
+          `Failed to remove ${full}: ${(e as Error).message}`)
+      }
+    }
+  } catch (e) {
+    logPipeline("(orphan-archive-sweep)", "orphan_archive_sweep", "warning",
+      `Sweep init failed: ${(e as Error).message}`)
+  }
+  return result
+}
+
+// ---------------------------------------------------------------------------
 // One tick of the background loop
 // ---------------------------------------------------------------------------
 
@@ -1445,6 +1494,7 @@ export interface AutoHealTickResult {
   downAutoFix: DownAutoFixResult | { error: string }
   deadRetry: DeadServerRetryResult | { error: string }
   destroyDead: DestroyDeadDropletsResult | { error: string }
+  orphanArchives: OrphanArchiveResult | { error: string }
   ranAt: string
 }
 
@@ -1474,6 +1524,7 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
         downAutoFix: { error: "paused" },
         deadRetry: { error: "paused" },
         destroyDead: { error: "paused" },
+        orphanArchives: { error: "paused" },
       }
     }
   } catch { /* if settings read fails, just proceed normally */ }
@@ -1581,6 +1632,13 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
     destroyDead = { error: (e as Error).message }
   }
 
+  let orphanArchives: OrphanArchiveResult | { error: string }
+  try {
+    orphanArchives = await cleanOrphanArchives()
+  } catch (e) {
+    orphanArchives = { error: (e as Error).message }
+  }
+
   // Daily Claude-Code OAuth sentinel — confirms the operator's
   // CLAUDE_CODE_OAUTH_TOKEN still works before the operator gets surprised
   // by a step-9 failure mid-batch. Self-rate-limits to one ping per 24h
@@ -1605,19 +1663,20 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
   const downRepairsN = "fired" in downAutoFix ? downAutoFix.fired.length : 0
   const deadRetryN = "retried" in deadRetry ? deadRetry.retried.length : 0
   const destroyedN = "destroyed" in destroyDead ? destroyDead.destroyed.length : 0
-  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN + stuckN + sslMismatchedN + downRepairsN + deadRetryN + destroyedN > 0) {
+  const orphanArchivesN = "removed" in orphanArchives ? orphanArchives.removed.length : 0
+  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN + stuckN + sslMismatchedN + downRepairsN + deadRetryN + destroyedN + orphanArchivesN > 0) {
     appendAudit(
       "auto_heal_tick", "",
       `claimed=${claimedN} resumed=${resumedN} ns_resumed=${nsResumedN} ` +
       `retried=${retriedN} ssl_reissued=${sslReissuedN} sa_degraded=${degradedN} ` +
       `stuck_recovered=${stuckN} ssl_mismatched=${sslMismatchedN} ` +
       `down_repairs=${downRepairsN} dead_retried=${deadRetryN} ` +
-      `dead_droplets_destroyed=${destroyedN}`,
+      `dead_droplets_destroyed=${destroyedN} orphan_archives_swept=${orphanArchivesN}`,
       null,
     )
   }
 
-  return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, sslSweep, forceHttpsSweep, saTrackerDrift, downAutoFix, deadRetry, destroyDead, ranAt }
+  return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, sslSweep, forceHttpsSweep, saTrackerDrift, downAutoFix, deadRetry, destroyDead, orphanArchives, ranAt }
 }
 
 // ---------------------------------------------------------------------------

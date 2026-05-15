@@ -27,7 +27,7 @@ import { logPipeline } from "./repos/logs"
 
 const ARCHIVE_DIR_REL = path.join("data", "site_archives")
 
-function archiveDir(): string {
+export function archiveDir(): string {
   // Same path-resolution rule as db.ts so Flask + Node share the dir
   if (process.env.SSR_DB_PATH) {
     return path.join(path.dirname(process.env.SSR_DB_PATH), "site_archives")
