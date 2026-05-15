@@ -1564,15 +1564,21 @@ function DomainsPageInner() {
                 className="gap-1.5"
                 onClick={() => {
                   if (selected.size === 0) return
+                  // `selected` is a Set of ROW IDs, not domain names — resolve
+                  // via DOMAINS lookup or you end up opening https://12/ which
+                  // the browser normalizes to https://0.0.0.12/ (bare integers
+                  // are valid IPv4 in URL parsing).
+                  const names = DOMAINS.filter((d) => selected.has(d.id)).map((d) => d.name)
+                  if (names.length === 0) return
                   if (
-                    selected.size > 10 &&
+                    names.length > 10 &&
                     !window.confirm(
-                      `Open ${selected.size} sites in new tabs?\n\n` +
+                      `Open ${names.length} sites in new tabs?\n\n` +
                       `Your browser may block popups beyond ~10 at once. ` +
                       `If some don't open, allow popups for this dashboard and retry.`,
                     )
                   ) return
-                  for (const name of selected) {
+                  for (const name of names) {
                     window.open(`https://${name}`, "_blank", "noopener,noreferrer")
                   }
                 }}
