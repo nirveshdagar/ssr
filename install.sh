@@ -311,16 +311,10 @@ for i in {1..30}; do
 done
 
 # ---------------------------------------------------------------------------
-# Step 11 — firewall
-# ---------------------------------------------------------------------------
-log "ufw firewall"
-ufw allow OpenSSH >/dev/null
-ufw allow 'Nginx Full' >/dev/null
-ufw --force enable >/dev/null
-ok "$(ufw status | head -1)"
-
-# ---------------------------------------------------------------------------
-# Step 12 — nginx
+# Step 11 — nginx (install BEFORE ufw so the 'Nginx Full' app profile exists
+#                 when step 12 references it; previously these were reversed
+#                 and step 11 failed on every fresh server with
+#                 "Could not find a profile matching 'Nginx Full'")
 # ---------------------------------------------------------------------------
 log "nginx reverse proxy"
 apt install -y nginx >/dev/null
@@ -365,6 +359,18 @@ if nginx -t 2>&1 | grep -q "syntax is ok"; then
 else
   err "nginx config test failed — see: nginx -t"
 fi
+
+# ---------------------------------------------------------------------------
+# Step 12 — firewall (after nginx so 'Nginx Full' ufw profile is available)
+# ---------------------------------------------------------------------------
+log "ufw firewall"
+ufw allow OpenSSH >/dev/null
+# 'Nginx Full' opens 80 + 443. Fall back to raw ports if the app profile
+# somehow isn't registered (e.g. nginx package install partially failed).
+ufw allow 'Nginx Full' >/dev/null 2>&1 \
+  || { ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null; }
+ufw --force enable >/dev/null
+ok "$(ufw status | head -1)"
 
 # ---------------------------------------------------------------------------
 # Step 13 — Let's Encrypt TLS
