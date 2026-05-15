@@ -1,0 +1,130 @@
+import { NextResponse, type NextRequest } from "next/server"
+import { runFullPipeline } from "@/lib/pipeline"
+import { getDomain } from "@/lib/repos/domains"
+import { resetStepsFrom, resetSingleStep } from "@/lib/repos/steps"
+import { appendAudit } from "@/lib/repos/audit"
+
+const SAFE_MODEL = /^[A-Za-z0-9._/@:-]{1,128}$/
+const SAFE_PROVIDER = /^[a-z][a-z0-9_-]{0,31}$/
+const SAFE_DOMAIN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/i
+
+export const runtime = "nodejs"
+
+/**
+ * Resume from step N. "Skip this step" is just /run-from/(N+1) — the same
+ * endpoint with the next number.
+ */
+export async function POST(
+  req: NextRequest,
+  { params }: { params: Promise<{ domain: string; step: string }> },
+): Promise<Response> {
+  const { domain, step } = await params
+  const stepNum = Number.parseInt(step, 10)
+  if (!Number.isFinite(stepNum) || stepNum < 1 || stepNum > 10) {
+    return NextResponse.json({ ok: false, error: "step must be between 1 and 10" }, { status: 400 })
+  }
+  if (!SAFE_DOMAIN.test(domain)) {
+    return NextResponse.json({ ok: false, error: "invalid domain shape" }, { status: 400 })
+  }
+  if (!getDomain(domain)) {
+    return NextResponse.json(
+      { ok: false, error: `Unknown domain '${domain}' — add it first` },
+      { status: 404 },
+    )
+  }
+  // Body can be FormData OR JSON — older callers send form-data, the new
+  // Force / Regenerate-with-prompt UI sends JSON to carry custom_prompt /
+  // custom_provider / custom_model.
+  const ct = req.headers.get("content-type") ?? ""
+  let skipPurchase = false
+  let customPrompt: string | null = null
+  let customProvider: string | null = null
+  let customModel: string | null = null
+  let customMasterPrompt: string | null = null
+  let forceRegen = false
+  // When true, the operator wants to retry EXACTLY this step — steps after
+  // it that are already completed should stay completed (the "Force one
+  // step" use case). When false / absent, behave as before: reset step N
+  // and every step after it to pending so the run propagates forward
+  // through them (the "Run from here" / "Resume from failed step" use case).
+  let onlyThis = false
+  const trimOrNull = (v: unknown): string | null => {
+    if (typeof v !== "string") return null
+    const t = v.trim()
+    return t || null
+  }
+  if (ct.includes("application/json")) {
+    const body = (await req.json().catch(() => ({}))) as Record<string, unknown>
+    skipPurchase = body.skip_purchase === true || body.skip_purchase === "on"
+    customPrompt = trimOrNull(body.custom_prompt)
+    customProvider = trimOrNull(body.custom_provider)
+    customModel = trimOrNull(body.custom_model)
+    customMasterPrompt = trimOrNull(body.custom_master_prompt)
+    forceRegen = body.force_regen === true || body.force_regen === "on"
+    onlyThis = body.only_this === true || body.only_this === "on"
+  } else {
+    const form = await req.formData().catch(() => null)
+    skipPurchase = ((form?.get("skip_purchase") as string | null) || "") === "on"
+    customPrompt = trimOrNull(form?.get("custom_prompt"))
+    customProvider = trimOrNull(form?.get("custom_provider"))
+    customModel = trimOrNull(form?.get("custom_model"))
+    customMasterPrompt = trimOrNull(form?.get("custom_master_prompt"))
+    forceRegen = ((form?.get("force_regen") as string | null) || "") === "on"
+    onlyThis = ((form?.get("only_this") as string | null) || "") === "on"
+  }
+  // Hard cap on the override size — large enough for any reasonable prompt
+  // (DEFAULT_MASTER_PROMPT is ~6 KB) but tight enough that a buggy / hostile
+  // client can't queue a 10 MB job payload that bloats every retry.
+  if (customMasterPrompt && customMasterPrompt.length > 32_000) {
+    return NextResponse.json(
+      { ok: false, error: "custom_master_prompt too large (max 32000 chars)" },
+      { status: 413 },
+    )
+  }
+  // Operator explicitly wants to re-run from step N → clear the lock for
+  // step N AND every step after, so the per-step idempotency wrapper
+  // actually executes the work. Earlier steps stay locked (preserved
+  // 'completed' state) so we don't redo step 1's domain-buy or step 6's
+  // 5-15 min server provisioning when the operator just wants to retry
+  // step 9's LLM call.
+  if (customProvider && !SAFE_PROVIDER.test(customProvider)) {
+    return NextResponse.json({ ok: false, error: "invalid custom_provider" }, { status: 400 })
+  }
+  if (customModel && !SAFE_MODEL.test(customModel)) {
+    return NextResponse.json({ ok: false, error: "invalid custom_model" }, { status: 400 })
+  }
+  // Force-one-step vs run-from-here: only_this clears just step N, leaving
+  // later already-completed steps locked so the pipeline's per-step lock
+  // silently skips them. Without only_this, fall back to the original
+  // forward-propagating reset (step N + every step after → pending).
+  if (onlyThis) {
+    resetSingleStep(domain, stepNum)
+  } else {
+    resetStepsFrom(domain, stepNum)
+  }
+  const jobId = runFullPipeline(domain, {
+    skipPurchase, startFrom: stepNum,
+    customPrompt, customProvider, customModel, forceRegen,
+    customMasterPrompt,
+  })
+  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null
+  appendAudit(
+    "pipeline_run_from", domain,
+    `job=${jobId ?? "skipped"} step=${stepNum} only_this=${onlyThis} ` +
+    `skip_purchase=${skipPurchase} ` +
+    `provider=${customProvider ?? ""} model=${customModel ?? ""} ` +
+    `force_regen=${forceRegen} ` +
+    `master_prompt_override=${customMasterPrompt ? `${customMasterPrompt.length}_chars` : "no"}`,
+    ip,
+  )
+  if (jobId == null) {
+    return NextResponse.json({
+      ok: false,
+      message: `Pipeline for ${domain} already running — request ignored`,
+    })
+  }
+  return NextResponse.json({
+    ok: true, job_id: jobId,
+    message: `Pipeline started for ${domain} from step ${stepNum}`,
+  })
+}

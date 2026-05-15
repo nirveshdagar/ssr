@@ -1,0 +1,976 @@
+"use client"
+
+import * as React from "react"
+import {
+  Globe,
+  Server as ServerIcon,
+  Cloud,
+  Play,
+  Ban,
+  Trash2,
+  RotateCw,
+  Heart,
+  Copy,
+  ExternalLink,
+  Sparkles,
+  FileText,
+  ChevronDown,
+  ChevronRight,
+} from "lucide-react"
+import { Button } from "@/components/ui/button"
+import { ButtonGroup } from "@/components/ui/button-group"
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
+  DialogFooter,
+} from "@/components/ui/dialog"
+import { Textarea } from "@/components/ui/textarea"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Checkbox } from "@/components/ui/checkbox"
+import { ModelPicker } from "@/components/ssr/model-picker"
+import { LLM_PROVIDER_OPTIONS } from "@/lib/llm-models"
+import { StatusBadge } from "@/components/ssr/status-badge"
+import { PipelineProgress } from "@/components/ssr/pipeline-progress"
+import { MonoCode } from "@/components/ssr/data-table"
+import { useDomainWatcher, useHeartbeat } from "@/hooks/use-watcher"
+import { useLogs } from "@/hooks/use-logs"
+import { domainActions } from "@/lib/api-actions"
+import { PIPELINE_STEPS as TAXONOMY_STEPS } from "@/lib/status-taxonomy"
+import type { DomainRow } from "@/lib/repos/domains"
+import type { ServerRow as ApiServerRow } from "@/lib/repos/servers"
+import type { CfKeyWithPreview } from "@/lib/repos/cf-keys"
+import type { StepTrackerRow } from "@/lib/repos/steps"
+import type { PipelineLogRow } from "@/lib/repos/logs"
+import type { PipelineStatus } from "@/lib/ssr/mock-data"
+import { cn } from "@/lib/utils"
+
+/**
+ * Stronger-warning text for force-rerun on destructive steps. null = no
+ * extra warning (default confirm copy is enough).
+ */
+function forceRerunWarning(stepNum: number): string | null {
+  switch (stepNum) {
+    case 1: return "Step 1 BUYS THE DOMAIN at the registrar — costs real money. " +
+      "Only force this if the buy was rolled back / the domain row is bring-your-own."
+    case 4: return "Step 4 sets nameservers at Spaceship — rapid retries can rate-limit " +
+      "your registrar account. Wait at least a few minutes between forced retries."
+    case 6: return "Step 6 PROVISIONS A NEW DROPLET on DigitalOcean — costs real money " +
+      "and takes 5–15 minutes. Only force this if the existing server is dead."
+    default: return null
+  }
+}
+
+interface Props {
+  domain: string
+  row: DomainRow
+  server: ApiServerRow | null
+  cfKey: CfKeyWithPreview | null
+  initialSteps: StepTrackerRow[]
+  initialLogs: PipelineLogRow[]
+}
+
+const STATUS_TO_PIPELINE: Record<string, PipelineStatus> = {
+  pending: "pending",
+  purchased: "running",
+  owned: "running",
+  owned_external: "waiting",
+  cf_assigned: "running",
+  zone_created: "running",
+  ns_set: "running",
+  ns_pending_external: "waiting",
+  zone_active: "running",
+  app_created: "running",
+  ssl_installed: "running",
+  hosted: "completed",
+  live: "live",
+  canceled: "canceled",
+  error: "retryable_error",
+  retryable_error: "retryable_error",
+  terminal_error: "terminal_error",
+  content_blocked: "terminal_error",
+  cf_pool_full: "terminal_error",
+  manual_action_required: "waiting",
+  waiting_dns: "waiting",
+  ready_for_ssl: "running",
+  ready_for_content: "running",
+}
+
+export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, initialLogs }: Props) {
+  // Pipeline done? Skip the live polling — the page is showing a complete
+  // pill, the server isn't writing heartbeats, and there's no progress to
+  // chase. Saves ~6 req/min per open detail tab on a 2-CPU box.
+  const pipelineActive = !["live", "completed", "hosted", "canceled",
+    "terminal_error", "content_blocked", "cf_pool_full"].includes(row.status)
+  // Live SWR — falls back to the SSR-rendered initial data so first paint
+  // is instant and the page hydrates with fresher data after a tick.
+  const { steps: liveSteps } = useDomainWatcher(pipelineActive ? domain : null, 1500)
+  const { heartbeat } = useHeartbeat(pipelineActive ? domain : null, 1500)
+  const { events: liveLogs } = useLogs({ domain, limit: 50 })
+
+  const steps = liveSteps ?? initialSteps
+  const logs = liveLogs.length > 0 ? liveLogs : initialLogs.map((l) => ({
+    id: String(l.id), ts: l.created_at, level: ("info" as const),
+    domain: l.domain, step: l.step, message: l.message ?? "", pipeline: `p_${l.id}`,
+  }))
+
+  const currentStep = (() => {
+    const running = steps.find((s) => s.status === "running")
+    if (running) return running.step_num
+    const completed = steps.filter((s) => s.status === "completed" || s.status === "skipped").length
+    return Math.max(1, Math.min(10, completed))
+  })()
+  const status: PipelineStatus = STATUS_TO_PIPELINE[row.status] ?? "pending"
+
+  // ----- Action panel -----
+  const [busy, setBusy] = React.useState<string | null>(null)
+  const [flash, setFlash] = React.useState<{ kind: "ok" | "err"; text: string } | null>(null)
+  function show(kind: "ok" | "err", text: string) {
+    setFlash({ kind, text })
+    window.setTimeout(() => setFlash(null), 5500)
+  }
+  // Run pipeline dialog state — replaces the old confirm() so the operator
+  // can pick a per-run LLM provider/model override (and skip-purchase) without
+  // a forced default. Dialog is identical in shape to the brief dialog, just
+  // without the textarea.
+  const [runDialog, setRunDialog] = React.useState<{
+    open: boolean; skipPurchase: boolean; provider: string; model: string; busy: boolean
+  }>({ open: false, skipPurchase: false, provider: "", model: "", busy: false })
+  function openRunDialog() {
+    setRunDialog({ open: true, skipPurchase: false, provider: "", model: "", busy: false })
+  }
+  async function submitRunDialog() {
+    setRunDialog((s) => ({ ...s, busy: true }))
+    const r = await domainActions.runPipeline(domain, {
+      skipPurchase: runDialog.skipPurchase || undefined,
+      customProvider: runDialog.provider || undefined,
+      customModel: runDialog.model.trim() || undefined,
+    })
+    show(r.ok ? "ok" : "err", r.message ?? r.error ?? "")
+    setRunDialog({ open: false, skipPurchase: false, provider: "", model: "", busy: false })
+  }
+  async function retryStep() {
+    setBusy("retry")
+    const r = await domainActions.runFromStep(domain, currentStep)
+    show(r.ok ? "ok" : "err", r.message ?? r.error ?? "")
+    setBusy(null)
+  }
+  // Brief dialog state — driven by the Regenerate button and the Force
+  // button on step 9. The textarea lets the operator override the LLM's
+  // auto-inferred niche; the provider/model dropdowns let them route this
+  // single call to a different LLM than the global setting. All four fields
+  // are independently optional — empty = use the configured defaults.
+  const [briefDialog, setBriefDialog] = React.useState<{
+    open: boolean
+    prompt: string
+    provider: string
+    model: string
+    busy: boolean
+    showMaster: boolean
+    masterDraft: string
+  }>({ open: false, prompt: "", provider: "", model: "", busy: false, showMaster: false, masterDraft: "" })
+  // Lazily-fetched master prompt for the in-dialog preview. Pulled the
+  // first time the operator opens the dialog so we don't burn an /api hit
+  // on every page load. Re-pulled on each open so /settings edits are
+  // reflected without a page refresh. `baseline` is the unmodified server
+  // value — `briefDialog.masterDraft` starts equal to it; we send an
+  // override only if the operator has actually changed it.
+  const [masterPrompt, setMasterPrompt] = React.useState<{
+    baseline: string; loading: boolean; error: string | null
+  }>({ baseline: "", loading: false, error: null })
+  async function loadMasterPrompt() {
+    setMasterPrompt({ baseline: "", loading: true, error: null })
+    try {
+      const r = await fetch("/api/settings/master-prompt", { credentials: "same-origin" })
+      const j = (await r.json()) as { content?: string; default_content?: string; is_default?: boolean; error?: string }
+      if (!r.ok) {
+        setMasterPrompt({ baseline: "", loading: false, error: j.error ?? `HTTP ${r.status}` })
+        return
+      }
+      const c = j.is_default ? (j.default_content ?? "") : (j.content ?? "")
+      setMasterPrompt({ baseline: c, loading: false, error: null })
+      // Seed the editable draft so the textarea isn't empty when expanded.
+      setBriefDialog((s) => ({ ...s, masterDraft: c }))
+    } catch (e) {
+      setMasterPrompt({ baseline: "", loading: false, error: (e as Error).message })
+    }
+  }
+  function openBriefDialog() {
+    setBriefDialog({ open: true, prompt: "", provider: "", model: "", busy: false, showMaster: false, masterDraft: "" })
+    void loadMasterPrompt()
+  }
+  async function submitBriefDialog() {
+    setBriefDialog((s) => ({ ...s, busy: true }))
+    // Only send the master prompt override when the operator actually
+    // changed it. Sending the unchanged baseline would (a) bloat every
+    // job payload by ~6KB and (b) shadow future /settings edits during
+    // pipeline retries.
+    const draft = briefDialog.masterDraft.trim()
+    const baseline = masterPrompt.baseline.trim()
+    const masterOverride = draft && draft !== baseline ? draft : null
+    const r = await domainActions.runFromStep(domain, 9, {
+      customPrompt: briefDialog.prompt.trim() || null,
+      customProvider: briefDialog.provider.trim() || null,
+      customModel: briefDialog.model.trim() || null,
+      customMasterPrompt: masterOverride,
+    })
+    show(r.ok ? "ok" : "err", r.message ?? r.error ?? "Regenerate requested")
+    setBriefDialog({ open: false, prompt: "", provider: "", model: "", busy: false, showMaster: false, masterDraft: "" })
+  }
+  // Per-step "Run from here" — same primitive as the watcher page's per-row
+  // button. Re-enqueues pipeline.full with start_from=N; smart-resume short-
+  // circuits already-completed upstream work, so safe at any boundary.
+  const [perStepBusy, setPerStepBusy] = React.useState<number | null>(null)
+  async function onRunFromStep(stepNum: number) {
+    setPerStepBusy(stepNum)
+    const r = await domainActions.runFromStep(domain, stepNum)
+    show(r.ok ? "ok" : "err", r.message ?? r.error ?? `Run from step ${stepNum} requested`)
+    setPerStepBusy(null)
+  }
+  // Force re-run on COMPLETED/SKIPPED/PENDING steps. Backend already
+  // supports unlocking via run-from/[step] (resetStepsFrom + startFrom unlock
+  // in isStepLocked), so this is a UI escape hatch with stronger confirmation
+  // for destructive steps (1=domain buy, 4=NS, 6=server provision).
+  //
+  // Special case: step 9 (LLM gen) goes through the brief dialog instead of
+  // a plain confirm() so the operator can paste a custom niche/style brief.
+  async function onForceRerun(stepNum: number, stepName: string) {
+    if (stepNum === 9) {
+      openBriefDialog()
+      return
+    }
+    const destructive = forceRerunWarning(stepNum)
+    const baseMsg =
+      `Force re-run step ${stepNum} (${stepName})?\n\n` +
+      `Only this step will run. Steps AFTER ${stepNum} that are already ` +
+      `completed stay locked — they won't restart. Use "Run from here" on ` +
+      `a failed step if you want forward propagation.`
+    const fullMsg = destructive ? `${baseMsg}\n\n⚠ ${destructive}` : baseMsg
+    if (!confirm(fullMsg)) return
+    setPerStepBusy(stepNum)
+    const r = await domainActions.runFromStep(domain, stepNum, { onlyThis: true })
+    show(r.ok ? "ok" : "err", r.message ?? r.error ?? `Forced re-run of step ${stepNum}`)
+    setPerStepBusy(null)
+  }
+  async function cancelPipeline() {
+    if (!confirm(
+      `Cancel pipeline for ${domain}?\n\n` +
+      `Cancel is GRACEFUL — the worker checks the cancel flag at each step boundary.`,
+    )) return
+    setBusy("cancel")
+    const r = await domainActions.cancelPipeline(domain)
+    show(r.ok ? "ok" : "err", r.message ?? r.error ?? "")
+    setBusy(null)
+  }
+  async function softDelete() {
+    if (!confirm(
+      `Remove ${domain} from dashboard ONLY?\n\n` +
+      `The SA app, CF zone, and Spaceship record stay intact.`,
+    )) return
+    setBusy("delete")
+    const r = await domainActions.delete(domain)
+    show(r.ok ? "ok" : "err", r.message ?? r.error ?? "")
+    if (r.ok) window.location.assign("/domains")
+    setBusy(null)
+  }
+
+  function copy(value: string, label: string) {
+    if (!value) return
+    navigator.clipboard?.writeText(value).then(
+      () => show("ok", `${label} copied`),
+      () => show("err", "Copy failed"),
+    )
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      {flash && (
+        <div
+          role="status"
+          className={cn(
+            "rounded-md border px-3 py-2 text-small",
+            flash.kind === "ok"
+              ? "border-status-completed/40 bg-status-completed/10 text-status-completed"
+              : "border-status-terminal/40 bg-status-terminal/10 text-status-terminal",
+          )}
+        >
+          {flash.text}
+        </div>
+      )}
+
+      {/* ===== Header card ===== */}
+      <section className="rounded-md border border-border bg-card shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
+        <header className="flex flex-wrap items-start justify-between gap-3 border-b border-border px-5 py-4">
+          <div className="flex items-start gap-3 min-w-0">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-muted">
+              <Globe className="h-5 w-5 text-muted-foreground" aria-hidden />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h2 className="truncate text-lg font-semibold tracking-tight font-mono">{domain}</h2>
+                <StatusBadge status={status} />
+                {/* Heartbeat chip — tracks live polling. When the pipeline is
+                    in a success state (hosted/live), the lack of a fresh beat
+                    is EXPECTED (no worker is running) so the chip renders
+                    neutral gray instead of the alarming red. */}
+                {heartbeat && (() => {
+                  const pipelineDone = status === "live" || status === "completed"
+                  return (
+                    <span
+                      className={cn(
+                        "inline-flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 text-xs font-medium",
+                        pipelineDone && "border-border bg-muted/40 text-muted-foreground",
+                        !pipelineDone && heartbeat.alive && "border-status-completed/40 bg-status-completed/10 text-status-completed",
+                        !pipelineDone && !heartbeat.alive && (heartbeat.seconds_ago ?? 999) <= 30 && "border-status-waiting/40 bg-status-waiting/10 text-status-waiting",
+                        !pipelineDone && !heartbeat.alive && (heartbeat.seconds_ago ?? 999) > 30 && "border-status-terminal/40 bg-status-terminal/10 text-status-terminal",
+                      )}
+                      title={heartbeat.last_heartbeat_at ?? "no heartbeat yet"}
+                    >
+                      <Heart className="h-3 w-3" aria-hidden />
+                      {pipelineDone
+                        ? "idle"
+                        : heartbeat.seconds_ago == null
+                          ? "no heartbeat"
+                          : heartbeat.alive
+                            ? "live"
+                            : `${heartbeat.seconds_ago}s ago`}
+                    </span>
+                  )
+                })()}
+              </div>
+              <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                <span>step {currentStep} / 10</span>
+                <span>·</span>
+                <span>created {row.created_at}</span>
+                <span>·</span>
+                <span>updated {row.updated_at}</span>
+              </div>
+            </div>
+          </div>
+          <div className="flex flex-col items-end gap-1.5">
+            <ButtonGroup>
+              <Button
+                size="sm" className="gap-1.5 btn-success"
+                onClick={openRunDialog} disabled={busy !== null}
+                title="Run the full pipeline (smart-resume — auto-detects completed steps). Optional LLM provider override available."
+              >
+                <Play className="h-3.5 w-3.5" /> Run pipeline
+              </Button>
+              <Button
+                size="sm" variant="outline" className="gap-1.5 btn-soft-info"
+                onClick={retryStep} disabled={busy !== null}
+                title={`Re-run pipeline starting at step ${currentStep}`}
+              >
+                <RotateCw className="h-3.5 w-3.5" /> Retry step {currentStep}
+              </Button>
+              <Button
+                size="sm" variant="outline" className="gap-1.5 btn-soft-success"
+                onClick={openBriefDialog} disabled={busy !== null}
+                title="Re-run only steps 9 + 10 (LLM gen + index.php upload). DNS / server / SSL stay intact. Optional brief lets you steer the niche."
+              >
+                <Sparkles className="h-3.5 w-3.5" /> Regenerate site
+              </Button>
+              <Button
+                size="sm" variant="outline" className="gap-1.5 btn-soft-warning"
+                onClick={cancelPipeline} disabled={busy !== null}
+                title="Cancel — graceful, stops at next step boundary"
+              >
+                <Ban className="h-3.5 w-3.5" /> Cancel
+              </Button>
+              <Button
+                size="sm" variant="outline" className="gap-1.5 btn-soft-destructive"
+                onClick={softDelete} disabled={busy !== null}
+                title="Soft delete — remove from dashboard only (services keep running)"
+              >
+                <Trash2 className="h-3.5 w-3.5" /> Soft delete
+              </Button>
+            </ButtonGroup>
+          </div>
+        </header>
+
+        {/* Pipeline progress strip */}
+        <div className="px-5 py-4">
+          <PipelineProgress currentStep={currentStep} status={status} completedAt={row.updated_at} />
+        </div>
+      </section>
+
+      {/* ===== Resource grid: server, CF, DNS ===== */}
+      <section className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+        {/* Server card */}
+        <ResourceCard
+          title="Server"
+          icon={ServerIcon}
+          accent="var(--page-servers)"
+          empty={!server}
+          emptyHint="No server assigned yet — pipeline step 6 picks one."
+        >
+          {server && (
+            <dl className="flex flex-col gap-1.5 text-small">
+              <Row label="Name">
+                <code className="font-mono">{server.name ?? "—"}</code>
+              </Row>
+              <Row label="IP" copyable={server.ip ?? ""} onCopy={copy}>
+                <MonoCode>{server.ip ?? "—"}</MonoCode>
+              </Row>
+              <Row label="DO ID" copyable={server.do_droplet_id ?? ""} onCopy={copy}>
+                <code className="font-mono text-xs text-muted-foreground">
+                  {server.do_droplet_id ?? "—"}
+                </code>
+              </Row>
+              <Row label="SA ID" copyable={server.sa_server_id ?? ""} onCopy={copy}>
+                <code className="font-mono text-xs text-muted-foreground">
+                  {server.sa_server_id ?? "—"}
+                </code>
+              </Row>
+              <Row label="Region">
+                <span className="font-mono uppercase text-xs">{server.region ?? "—"}</span>
+              </Row>
+              <Row label="Sites">
+                <span className="font-mono text-xs">{server.sites_count}/{server.max_sites}</span>
+              </Row>
+            </dl>
+          )}
+        </ResourceCard>
+
+        {/* CF card */}
+        <ResourceCard
+          title="Cloudflare"
+          icon={Cloud}
+          accent="var(--page-cloudflare)"
+          empty={!cfKey && !row.cf_email}
+          emptyHint="No CF key assigned — pipeline step 2 picks one from the pool."
+          actions={
+            row.cf_zone_id ? (
+              <a
+                href={`https://dash.cloudflare.com/?to=/:account/${row.cf_account_id ?? ""}/${domain}`}
+                target="_blank" rel="noopener noreferrer"
+                title="Open this zone in the Cloudflare dashboard"
+                className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+              >
+                <ExternalLink className="h-3 w-3" /> Open in CF
+              </a>
+            ) : undefined
+          }
+        >
+          <dl className="flex flex-col gap-1.5 text-small">
+            <Row label="Pool key">
+              {cfKey ? (
+                <code className="font-mono">{cfKey.alias || `CF#${cfKey.id}`}</code>
+              ) : (
+                <span className="text-muted-foreground">none</span>
+              )}
+            </Row>
+            <Row label="Email">
+              <span className="font-mono text-xs text-muted-foreground">{row.cf_email || "—"}</span>
+            </Row>
+            <Row label="Zone ID" copyable={row.cf_zone_id ?? ""} onCopy={copy}>
+              <code className="font-mono text-xs text-muted-foreground">
+                {row.cf_zone_id ?? "—"}
+              </code>
+            </Row>
+            <Row label="Account ID" copyable={row.cf_account_id ?? ""} onCopy={copy}>
+              <code className="font-mono text-xs text-muted-foreground">
+                {row.cf_account_id ?? "—"}
+              </code>
+            </Row>
+          </dl>
+        </ResourceCard>
+
+        {/* DNS / NS card */}
+        <ResourceCard
+          title="DNS"
+          icon={Globe}
+          accent="var(--page-domains)"
+          empty={!row.cf_nameservers && !row.current_proxy_ip}
+          emptyHint="No DNS data yet — populated after CF zone creation (step 3)."
+        >
+          <dl className="flex flex-col gap-1.5 text-small">
+            <Row label="A record" copyable={row.current_proxy_ip ?? ""} onCopy={copy}>
+              <MonoCode>{row.current_proxy_ip ?? "—"}</MonoCode>
+            </Row>
+            <Row label="apex record">
+              <code className="font-mono text-xs text-muted-foreground">{row.cf_a_record_id ?? "—"}</code>
+            </Row>
+            <Row label="www record">
+              <code className="font-mono text-xs text-muted-foreground">{row.cf_www_record_id ?? "—"}</code>
+            </Row>
+            <Row label="Nameservers" copyable={row.cf_nameservers ?? ""} onCopy={copy}>
+              <span className="font-mono text-xs break-all text-muted-foreground">
+                {row.cf_nameservers ?? "—"}
+              </span>
+            </Row>
+          </dl>
+          {row.cf_nameservers && (
+            <p className="mt-2 text-[11px] leading-snug text-muted-foreground/80">
+              Cloudflare assigns the same NS pair to every zone in one account, so other
+              SSR domains on this CF key will share these nameservers. Verify a unique
+              zone via the <strong>Zone ID</strong> in the Cloudflare card above —
+              that's the per-domain identifier.
+            </p>
+          )}
+        </ResourceCard>
+      </section>
+
+      {/* ===== Pipeline timeline ===== */}
+      <section className="rounded-md border border-border bg-card shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
+        <header className="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
+          <h3 className="text-[13px] font-semibold tracking-tight">Pipeline timeline</h3>
+          <span className="text-xs text-muted-foreground">10 steps</span>
+        </header>
+        <ol className="divide-y divide-border">
+          {(() => {
+            const byNum = new Map(steps.map((s) => [s.step_num, s]))
+            return Array.from({ length: 10 }, (_, i) => i + 1).map((num) => {
+              const s = byNum.get(num)
+              const stepName = s?.step_name ?? TAXONOMY_STEPS[num]
+              const st = (s?.status ?? "pending") as
+                "pending" | "running" | "completed" | "failed" | "skipped" | "warning"
+              let elapsed = ""
+              if (s?.started_at && s?.finished_at) {
+                const a = Date.parse(s.started_at.replace(" ", "T") + "Z")
+                const b = Date.parse(s.finished_at.replace(" ", "T") + "Z")
+                if (Number.isFinite(a) && Number.isFinite(b)) {
+                  elapsed = `${Math.max(0, Math.round((b - a) / 1000))}s`
+                }
+              } else if (s?.started_at && st === "running") {
+                const a = Date.parse(s.started_at.replace(" ", "T") + "Z")
+                if (Number.isFinite(a)) {
+                  elapsed = `${Math.max(0, Math.round((Date.now() - a) / 1000))}s`
+                }
+              }
+              return (
+                <li key={num} className="flex items-start gap-3 px-4 py-3">
+                  <div
+                    className={cn(
+                      "mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full border text-xs font-semibold tabular-nums",
+                      st === "completed" && "border-status-completed bg-status-completed text-primary-foreground",
+                      st === "running" && "border-status-running bg-status-running/15 text-status-running",
+                      st === "failed" && "border-status-terminal bg-status-terminal/15 text-status-terminal",
+                      st === "warning" && "border-status-waiting bg-status-waiting/15 text-status-waiting",
+                      st === "skipped" && "border-muted-foreground/40 bg-muted text-muted-foreground",
+                      st === "pending" && "border-border bg-card text-muted-foreground",
+                    )}
+                    aria-hidden
+                  >
+                    {num}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className={cn("text-[13px] font-medium", st === "pending" && "text-muted-foreground")}>
+                        {stepName}
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <code className="font-mono text-xs text-muted-foreground">step_{num}</code>
+                        {elapsed && (
+                          <span className="font-mono text-xs tabular-nums text-muted-foreground">{elapsed}</span>
+                        )}
+                        {(st === "failed" || st === "warning") && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-6 gap-1 px-1.5 text-xs"
+                            onClick={() => onRunFromStep(num)}
+                            disabled={perStepBusy === num}
+                            title={`Re-run pipeline starting from step ${num} (${stepName})`}
+                          >
+                            <RotateCw className={cn("h-3 w-3", perStepBusy === num && "animate-spin")} />
+                            Run from here
+                          </Button>
+                        )}
+                        {(st === "completed" || st === "skipped" || st === "pending") && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className={cn(
+                              "h-6 gap-1 px-1.5 text-xs text-muted-foreground hover:text-status-terminal",
+                              forceRerunWarning(num) && "hover:text-status-terminal",
+                            )}
+                            onClick={() => onForceRerun(num, stepName)}
+                            disabled={perStepBusy === num}
+                            title={
+                              forceRerunWarning(num)
+                                ? `Force re-run step ${num} — destructive, see warning`
+                                : `Force re-run step ${num} (overrides completion lock)`
+                            }
+                          >
+                            <RotateCw className={cn("h-3 w-3", perStepBusy === num && "animate-spin")} />
+                            Force
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                    {s?.message && (
+                      <div
+                        className={cn(
+                          "mt-2 rounded px-2.5 py-2 font-mono text-[11px] leading-relaxed break-words",
+                          st === "failed"
+                            ? "bg-status-terminal/10 text-status-terminal"
+                            : st === "warning"
+                              ? "bg-status-waiting/10 text-status-waiting"
+                              : "bg-muted/60 text-foreground/80",
+                        )}
+                      >
+                        {s.message}
+                      </div>
+                    )}
+                  </div>
+                </li>
+              )
+            })
+          })()}
+        </ol>
+      </section>
+
+      {/* ===== Log tail ===== */}
+      <section className="rounded-md border border-border bg-card shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
+        <header className="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
+          <h3 className="text-[13px] font-semibold tracking-tight">Recent log entries</h3>
+          <a
+            href={`/logs?domain=${encodeURIComponent(domain)}`}
+            className="text-xs text-muted-foreground hover:text-foreground"
+            title="Open the full Logs page filtered to this domain"
+          >
+            Open in Logs →
+          </a>
+        </header>
+        <div className="max-h-[320px] overflow-y-auto p-3 font-mono text-[11.5px] leading-relaxed">
+          {logs.length === 0 && (
+            <span className="text-xs text-muted-foreground">No log entries yet.</span>
+          )}
+          {logs.slice(0, 50).map((l) => (
+            <div key={l.id} className="flex items-start gap-2 py-0.5">
+              <span className="text-muted-foreground/60 tabular-nums">{l.ts.split(" ")[1] ?? l.ts}</span>
+              <span
+                className={cn(
+                  "uppercase font-semibold w-12 shrink-0",
+                  l.level === "info" && "text-status-running",
+                  l.level === "warn" && "text-status-waiting",
+                  l.level === "error" && "text-status-terminal",
+                  l.level === "debug" && "text-muted-foreground",
+                )}
+              >
+                {l.level}
+              </span>
+              <span className="text-muted-foreground">[{l.step}]</span>
+              <span className="flex-1 text-foreground/85 break-words">{l.message}</span>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* Run pipeline dialog — replaces the old confirm() so the operator can
+          override the default LLM provider/model and skip-purchase flag for
+          this run only. Same three-zone scrolling layout as the brief dialog. */}
+      <Dialog
+        open={runDialog.open}
+        onOpenChange={(o) => setRunDialog((s) => ({ ...s, open: o }))}
+      >
+        <DialogContent className="flex max-h-[90vh] flex-col gap-0 p-0 sm:max-w-[520px]">
+          <DialogHeader className="shrink-0 px-6 pt-6 pb-2">
+            <DialogTitle className="inline-flex items-center gap-2">
+              <Play className="h-4 w-4 text-status-completed" />
+              Run pipeline for <span className="font-mono">{domain}</span>
+            </DialogTitle>
+            <DialogDescription>
+              Smart-resume: the worker auto-detects completed steps and only redoes what's
+              missing. Optional fields below let you skip the registrar purchase or route
+              step 9 (LLM site generation) to a different provider for this run only.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="min-h-0 flex-1 overflow-y-auto px-6 py-3 flex flex-col gap-3">
+            <label className="inline-flex items-center gap-2 text-small">
+              <Checkbox
+                checked={runDialog.skipPurchase}
+                onCheckedChange={(v) => setRunDialog((s) => ({ ...s, skipPurchase: Boolean(v) }))}
+              />
+              Skip purchase (BYO domain — assume already owned)
+            </label>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="text-micro font-medium">
+                  Provider <span className="text-muted-foreground">(this run only)</span>
+                </label>
+                <Select
+                  value={runDialog.provider || "__default__"}
+                  onValueChange={(v) =>
+                    setRunDialog((s) => ({ ...s, provider: v === "__default__" ? "" : v }))
+                  }
+                >
+                  <SelectTrigger className="h-8 text-small mt-1"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__default__">(use default from Settings)</SelectItem>
+                    {LLM_PROVIDER_OPTIONS.map((p) => (
+                      <SelectItem key={p.id} value={p.id}>{p.label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div>
+                <label className="text-micro font-medium">
+                  Model <span className="text-muted-foreground">(optional)</span>
+                </label>
+                <div className="mt-1">
+                  <ModelPicker
+                    provider={runDialog.provider || "anthropic"}
+                    value={runDialog.model}
+                    onChange={(v) => setRunDialog((s) => ({ ...s, model: v }))}
+                    size="sm"
+                  />
+                </div>
+              </div>
+            </div>
+            <p className="text-micro text-muted-foreground">
+              The override only applies to step 9 of THIS run — global Settings are
+              unchanged. Each provider still pulls its API key from Settings.
+            </p>
+          </div>
+          <DialogFooter className="shrink-0 border-t border-border bg-background/95 px-6 py-3">
+            <Button
+              variant="ghost" size="sm"
+              onClick={() => setRunDialog({ open: false, skipPurchase: false, provider: "", model: "", busy: false })}
+              disabled={runDialog.busy}
+            >
+              Cancel
+            </Button>
+            <Button
+              size="sm" className="gap-1.5 btn-success"
+              onClick={submitRunDialog} disabled={runDialog.busy}
+            >
+              {runDialog.busy
+                ? <RotateCw className="h-3.5 w-3.5 animate-spin" />
+                : <Play className="h-3.5 w-3.5" />}
+              Start
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Brief dialog — opened by Regenerate site or Force button on step 9.
+          Three-zone flex layout (header / scrolling middle / footer) so a
+          long pasted brief never pushes the submit button off-screen. Same
+          pattern as OperatorDialog; inlined here because the dynamic submit
+          label needs the dialog's own state. */}
+      <Dialog
+        open={briefDialog.open}
+        onOpenChange={(o) => setBriefDialog((s) => ({ ...s, open: o }))}
+      >
+        <DialogContent className="flex max-h-[90vh] flex-col gap-0 p-0 sm:max-w-[560px]">
+          <DialogHeader className="shrink-0 px-6 pt-6 pb-2">
+            <DialogTitle className="inline-flex items-center gap-2">
+              <Sparkles className="h-4 w-4 text-status-completed" />
+              Regenerate site for <span className="font-mono">{domain}</span>
+            </DialogTitle>
+            <DialogDescription>
+              Optional brief — tell the LLM what kind of site to build. Leave
+              empty to use the default niche-from-domain-name inference. Re-runs
+              steps 9 (LLM) and 10 (upload index.php). DNS / server / SSL stay
+              intact. The current site stays live until the new one finishes.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="min-h-0 flex-1 overflow-y-auto px-6 py-3 flex flex-col gap-3">
+            {/* Master prompt preview — collapsible, read-only. The brief
+                below is ADDED on top of this; the master prompt itself
+                is global and lives in /settings → LLM. */}
+            <div className="rounded-md border border-border/60 bg-muted/20">
+              <button
+                type="button"
+                onClick={() => setBriefDialog((s) => ({ ...s, showMaster: !s.showMaster }))}
+                className="w-full flex items-center justify-between gap-2 px-3 py-2 text-micro text-muted-foreground hover:text-foreground"
+              >
+                <span className="inline-flex items-center gap-1.5">
+                  <FileText className="h-3 w-3" />
+                  <span className="font-medium">Master prompt</span>
+                  <span>(system instruction · editable for THIS run)</span>
+                  {briefDialog.masterDraft.trim() &&
+                   briefDialog.masterDraft.trim() !== masterPrompt.baseline.trim() && (
+                    <span className="rounded bg-status-waiting/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-status-waiting">
+                      modified
+                    </span>
+                  )}
+                </span>
+                <span className="inline-flex items-center gap-2">
+                  {briefDialog.masterDraft && (
+                    <span className="font-mono tabular-nums">
+                      {briefDialog.masterDraft.length.toLocaleString()} chars
+                    </span>
+                  )}
+                  {briefDialog.showMaster
+                    ? <ChevronDown className="h-3 w-3" />
+                    : <ChevronRight className="h-3 w-3" />}
+                </span>
+              </button>
+              {briefDialog.showMaster && (
+                <div className="border-t border-border/60 px-3 py-2 flex flex-col gap-1.5">
+                  {masterPrompt.loading ? (
+                    <div className="text-micro text-muted-foreground">Loading…</div>
+                  ) : masterPrompt.error ? (
+                    <div className="text-micro text-status-terminal">
+                      {masterPrompt.error}
+                    </div>
+                  ) : (
+                    <Textarea
+                      value={briefDialog.masterDraft}
+                      onChange={(e) => setBriefDialog((s) => ({ ...s, masterDraft: e.target.value }))}
+                      rows={10}
+                      className="font-mono text-[11.5px] leading-snug max-h-[260px] resize-y overflow-y-auto bg-card"
+                      placeholder="Master prompt — what the LLM is told before generating each site."
+                    />
+                  )}
+                  <div className="flex items-center justify-between gap-2 text-micro text-muted-foreground">
+                    <span>
+                      Edits override the global master prompt for THIS run only.
+                      Saved settings are unchanged.
+                      {" "}<a href="/settings#llm" className="text-status-running hover:underline">
+                        Edit globally →
+                      </a>
+                    </span>
+                    {briefDialog.masterDraft.trim() !== masterPrompt.baseline.trim() && !masterPrompt.loading && (
+                      <button
+                        type="button"
+                        onClick={() => setBriefDialog((s) => ({ ...s, masterDraft: masterPrompt.baseline }))}
+                        className="text-status-running hover:underline shrink-0"
+                        title="Discard your in-dialog edits and reset to the saved master prompt"
+                      >
+                        Reset to baseline
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+            <div>
+              <label className="text-micro font-medium">
+                Brief <span className="text-muted-foreground">(this run only — added to the master prompt above)</span>
+              </label>
+              <Textarea
+                value={briefDialog.prompt}
+                onChange={(e) => setBriefDialog((s) => ({ ...s, prompt: e.target.value }))}
+                placeholder="e.g. Professional dental clinic landing page in a teal/white palette. Hero with appointment-CTA, services list (cleanings / fillings / cosmetic), team blurb, location map, contact form."
+                rows={6}
+                className="font-mono text-small mt-1"
+                autoFocus
+              />
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="text-micro font-medium">
+                  Provider <span className="text-muted-foreground">(this run only)</span>
+                </label>
+                <Select
+                  value={briefDialog.provider || "__default__"}
+                  onValueChange={(v) =>
+                    setBriefDialog((s) => ({ ...s, provider: v === "__default__" ? "" : v }))
+                  }
+                >
+                  <SelectTrigger className="h-8 text-small mt-1"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__default__">(use global setting)</SelectItem>
+                    {LLM_PROVIDER_OPTIONS.map((p) => (
+                      <SelectItem key={p.id} value={p.id}>{p.label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div>
+                <label className="text-micro font-medium">
+                  Model <span className="text-muted-foreground">(optional override)</span>
+                </label>
+                <div className="mt-1">
+                  <ModelPicker
+                    provider={briefDialog.provider || "anthropic"}
+                    value={briefDialog.model}
+                    onChange={(v) => setBriefDialog((s) => ({ ...s, model: v }))}
+                    size="sm"
+                  />
+                </div>
+              </div>
+            </div>
+            <p className="text-micro text-muted-foreground">
+              Provider / model only override THIS regeneration — the global Settings
+              value is unchanged. Each provider still pulls its API key from the
+              settings page. Safety constraints (no medical / financial / gambling /
+              adult content) still apply — the brief shapes niche + style, not the
+              policy bar.
+            </p>
+          </div>
+          <DialogFooter className="shrink-0 border-t border-border bg-background/95 px-6 py-3">
+            <Button
+              variant="ghost" size="sm"
+              onClick={() => setBriefDialog({ open: false, prompt: "", provider: "", model: "", busy: false, showMaster: false, masterDraft: "" })}
+              disabled={briefDialog.busy}
+            >
+              Cancel
+            </Button>
+            <Button
+              size="sm" className="gap-1.5 btn-soft-success"
+              onClick={submitBriefDialog} disabled={briefDialog.busy}
+            >
+              {briefDialog.busy
+                ? <RotateCw className="h-3.5 w-3.5 animate-spin" />
+                : <Sparkles className="h-3.5 w-3.5" />}
+              {briefDialog.prompt.trim() ? "Regenerate with brief" : "Regenerate (auto-niche)"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  )
+}
+
+function ResourceCard({
+  title, icon: Icon, accent, empty, emptyHint, actions, children,
+}: {
+  title: string
+  icon: React.ComponentType<{ className?: string; style?: React.CSSProperties }>
+  accent: string
+  empty?: boolean
+  emptyHint?: string
+  actions?: React.ReactNode
+  children?: React.ReactNode
+}) {
+  return (
+    <div className="rounded-md border border-border bg-card shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
+      <header className="flex items-center justify-between gap-2 border-b border-border px-4 py-2.5">
+        <div className="flex items-center gap-2">
+          <Icon className="h-3.5 w-3.5" style={{ color: accent }} />
+          <h3 className="text-[13px] font-semibold tracking-tight">{title}</h3>
+        </div>
+        {actions}
+      </header>
+      <div className="px-4 py-3">
+        {empty ? (
+          <p className="text-xs text-muted-foreground">{emptyHint}</p>
+        ) : (
+          children
+        )}
+      </div>
+    </div>
+  )
+}
+
+function Row({
+  label, children, copyable, onCopy,
+}: {
+  label: string
+  children: React.ReactNode
+  copyable?: string
+  onCopy?: (value: string, label: string) => void
+}) {
+  return (
+    <div className="flex items-start justify-between gap-2 group">
+      <dt className="text-xs text-muted-foreground min-w-[80px] shrink-0">{label}</dt>
+      <dd className="flex-1 min-w-0 text-right break-all flex items-center justify-end gap-1.5">
+        {children}
+        {copyable && onCopy && (
+          <button
+            type="button"
+            onClick={() => onCopy(copyable, label)}
+            className="opacity-0 group-hover:opacity-100 transition-opacity rounded p-0.5 text-muted-foreground hover:text-foreground hover:bg-muted"
+            aria-label={`Copy ${label}`}
+            title={`Copy ${label}`}
+          >
+            <Copy className="h-3 w-3" />
+          </button>
+        )}
+      </dd>
+    </div>
+  )
+}

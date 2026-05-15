@@ -1,0 +1,3 @@
+# Force LF line endings on shell scripts so Linux can execute them
+# regardless of the cloning machine's core.autocrlf setting.
+*.sh text eol=lf

@@ -1,0 +1,118 @@
+import { all, getDb, one, run } from "../db"
+
+export interface ServerRow {
+  id: number
+  name: string | null
+  ip: string | null
+  do_droplet_id: string | null
+  sa_server_id: string | null
+  sa_org_id: string | null
+  status: string
+  region: string | null
+  size_slug: string | null
+  max_sites: number
+  sites_count: number
+  created_at: string
+}
+
+const SERVER_COLS = new Set<keyof ServerRow>([
+  "name", "ip", "do_droplet_id", "sa_server_id", "sa_org_id", "status",
+  "region", "size_slug", "max_sites",
+])
+
+export function listServers(): ServerRow[] {
+  // sites_count computed on read — matches the Flask side's get_servers().
+  return all<ServerRow>(`
+    SELECT s.*,
+           (SELECT COUNT(*) FROM domains d WHERE d.server_id = s.id) AS sites_count
+      FROM servers s
+     ORDER BY s.id DESC
+  `)
+}
+
+export function getServer(id: number): ServerRow | undefined {
+  return one<ServerRow>(`
+    SELECT s.*,
+           (SELECT COUNT(*) FROM domains d WHERE d.server_id = s.id) AS sites_count
+      FROM servers s
+     WHERE s.id = ?
+  `, id)
+}
+
+export function updateServer(id: number, updates: Partial<ServerRow>): void {
+  const entries = Object.entries(updates).filter(([k]) => SERVER_COLS.has(k as keyof ServerRow))
+  if (entries.length === 0) return
+  const setClause = entries.map(([k]) => `${k} = ?`).join(", ")
+  const values = entries.map(([, v]) => v as string | number | null)
+  run(`UPDATE servers SET ${setClause} WHERE id = ?`, ...values, id)
+}
+
+export function deleteServerRow(id: number): void {
+  run("DELETE FROM servers WHERE id = ?", id)
+}
+
+export function addServer(name: string, ip: string, doDropletId?: string | null): number {
+  // Gap-filling id allocation (operator preference 2026-05-14): instead of
+  // SQLite's AUTOINCREMENT — which marches monotonically forward and leaves
+  // permanent gaps after deletes — pick the lowest unused id ≥ 1. So if
+  // server #3 is deleted from a fleet of {1,2,3,4}, the next insert gets #3.
+  // Trade-off: log lines like `server-3` may refer to different servers
+  // across time. Acceptable at this scale; timestamps disambiguate.
+  // BEGIN IMMEDIATE so a parallel insert can't pick the same id.
+  const db = getDb()
+  db.exec("BEGIN IMMEDIATE")
+  try {
+    const used = db.prepare("SELECT id FROM servers ORDER BY id").all() as { id: number }[]
+    let nextId = 1
+    for (const row of used) {
+      if (row.id === nextId) nextId++
+      else if (row.id > nextId) break
+    }
+    db.prepare(
+      `INSERT INTO servers(id, name, ip, do_droplet_id, status) VALUES(?, ?, ?, ?, 'creating')`,
+    ).run(nextId, name, ip, doDropletId ?? null)
+    db.exec("COMMIT")
+    return nextId
+  } catch (e) {
+    try { db.exec("ROLLBACK") } catch { /* ignore */ }
+    throw e
+  }
+}
+
+export function countDomainsOnServer(serverId: number): number {
+  const row = one<{ n: number }>(
+    "SELECT COUNT(*) AS n FROM domains WHERE server_id = ?",
+    serverId,
+  )
+  return row?.n ?? 0
+}
+
+/**
+ * Find a server by its public IP. Used as an allowlist gate for SSH/SFTP
+ * routes that take a free-form `server_ip` query/form param — without this
+ * check, an authed operator (or a CSRF foothold) could target any IP with
+ * the dashboard's stored root password (lateral movement, fail2ban abuse
+ * complaints from third parties).
+ */
+export function findServerByIp(ip: string): ServerRow | undefined {
+  return one<ServerRow>(
+    `SELECT s.*,
+            (SELECT COUNT(*) FROM domains d WHERE d.server_id = s.id) AS sites_count
+       FROM servers s
+      WHERE s.ip = ?`,
+    ip,
+  )
+}
+
+/**
+ * Throw if `ip` isn't a known fleet server. Routes that take server_ip
+ * from the request and use it for SSH should call this before opening a
+ * connection. Returns the server row for any subsequent use.
+ */
+export function assertKnownServerIp(ip: string): ServerRow {
+  const row = findServerByIp(ip)
+  if (!row) {
+    throw new Error(`server_ip ${JSON.stringify(ip)} is not a known dashboard server`)
+  }
+  return row
+}

@@ -1,0 +1,61 @@
+# Secrets + state — NEVER commit
+data/
+.ssr_secret_fernet
+.env
+.env.local
+.env.production
+!.env.example
+*.key
+*.pem
+
+# Python bytecode / venv
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+.venv/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs / debug artifacts
+*.log
+logs/
+
+# Node — only template_v0/ has a package.json, but stray probe scripts run
+# from the root sometimes pull deps into a root-level node_modules
+node_modules/
+
+# Build / distribution
+DEPLOY.zip
+dist/
+build/
+*.egg-info/
+
+# Stray SQLite DBs (real DB lives at data/ssr.db; empty *.sqlite3 files
+# appear when SSR_DB_PATH is unset and a probe script falls back to cwd)
+*.sqlite3
+
+# TypeScript incremental compile cache — auto-regenerated, shouldn't be tracked
+tsconfig.tsbuildinfo
+
+# One-off debug / probe scripts left by AI sessions (tmp_*.mjs, tmp_*.sh, etc.).
+# These accidentally got committed once — keep them out of git permanently.
+tmp_*.mjs
+tmp_*.sh
+tmp_*.js
+
+# Claude Code per-conversation scheduled-task state (transient session data)
+.claude/scheduled_tasks.lock
+
+# Session notes with secrets — local-only
+PROGRESS.md
+
+# Claude Code per-user permission allowlist — may contain secrets in command args
+.claude/settings.local.json

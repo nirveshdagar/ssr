@@ -1,0 +1,349 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+@custom-variant dark (&:is(.dark *));
+
+/* ==========================================================================
+   SSR Dashboard Design System — SaaSflow palette
+   - Reference aesthetic: Linear / Vercel / Stripe / shadcn/ui (operator dense)
+   - Primary: royal blue #145aff   (CTAs, primary chart, ring)
+   - Success: green       #1ebd53   (live, completed)
+   - Warning: yellow      #ffcb3d   (waiting, attention)
+   - Info:    sky blue    #47c1fe   (running, neutral info)
+   - Destructive: orange-red #ff7847 (failures, destructive actions)
+   - Foreground: deep navy #0f1f3d   (body text)
+   - Background: cool gray #f5f7fb   (page surface)
+   No purple. No gradients.
+   ========================================================================== */
+
+:root {
+  /* Surfaces */
+  --background: oklch(0.973 0.007 256);          /* #f5f7fb cool gray */
+  --foreground: oklch(0.22 0.057 263);            /* #0f1f3d deep navy */
+  --card: oklch(1 0 0);                           /* pure white surface */
+  --card-foreground: oklch(0.22 0.057 263);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.22 0.057 263);
+
+  /* Brand: royal blue */
+  --primary: oklch(0.55 0.234 264);               /* #145aff */
+  --primary-foreground: oklch(0.99 0 0);
+
+  /* Neutrals */
+  --secondary: oklch(0.961 0.008 256);
+  --secondary-foreground: oklch(0.3 0.04 263);
+  --muted: oklch(0.955 0.008 256);
+  --muted-foreground: oklch(0.5 0.025 256);
+  --accent: oklch(0.95 0.04 264);                 /* very light royal-blue tint */
+  --accent-foreground: oklch(0.4 0.18 264);
+
+  /* Functional */
+  --destructive: oklch(0.71 0.184 38);            /* #ff7847 orange-red */
+  --destructive-foreground: oklch(0.99 0 0);
+  --success: oklch(0.71 0.201 144);               /* #1ebd53 green */
+  --success-foreground: oklch(0.99 0 0);
+  --warning: oklch(0.86 0.164 88);                /* #ffcb3d yellow */
+  --warning-foreground: oklch(0.22 0.057 263);
+  --info: oklch(0.78 0.124 226);                  /* #47c1fe sky */
+  --info-foreground: oklch(0.22 0.057 263);
+  --border: oklch(0.91 0.012 256);
+  --input: oklch(0.91 0.012 256);
+  --ring: oklch(0.55 0.234 264);                  /* matches primary */
+
+  /* Per-page accent identifiers (used for the thin top accent strip + sidebar rail) */
+  --page-dashboard: oklch(0.55 0.234 264);  /* royal blue — primary */
+  --page-domains:   oklch(0.71 0.201 144);  /* success green */
+  --page-servers:   oklch(0.78 0.124 226);  /* info sky */
+  --page-cloudflare:oklch(0.86 0.164 88);   /* warning yellow */
+  --page-watcher:   oklch(0.65 0.205 264);  /* royal blue — slightly lighter to distinguish from dashboard */
+  --page-logs:      oklch(0.32 0.066 263);  /* deep navy — diagnostic tone */
+  --page-audit:     oklch(0.71 0.184 38);   /* destructive orange-red — security/sensitive */
+  --page-settings:  oklch(0.5 0.04 263);    /* slate — neutral config */
+  --page-sa:        oklch(0.62 0.184 287);   /* indigo — control panel */
+
+  /* Status colors — aligned with the functional palette */
+  --status-pending: oklch(0.55 0.025 256);                 /* slate */
+  --status-running: oklch(0.55 0.234 264);                 /* royal blue */
+  --status-completed: oklch(0.71 0.201 144);               /* success green */
+  --status-waiting: oklch(0.86 0.164 88);                  /* warning yellow */
+  --status-retryable: oklch(0.74 0.156 48);                /* warm orange (between warning + destructive) */
+  --status-terminal: oklch(0.71 0.184 38);                 /* destructive orange-red */
+  --status-canceled: oklch(0.6 0.025 256);                 /* muted slate */
+
+  /* Charts — pull straight from the palette */
+  --chart-1: oklch(0.55 0.234 264);                        /* primary royal blue */
+  --chart-2: oklch(0.78 0.124 226);                        /* info sky */
+  --chart-3: oklch(0.71 0.201 144);                        /* success green */
+  --chart-4: oklch(0.86 0.164 88);                         /* warning yellow */
+  --chart-5: oklch(0.71 0.184 38);                         /* destructive orange-red */
+
+  /* Radius — tight per spec */
+  --radius: 0.375rem; /* 6px standard */
+
+  /* Sidebar — matches the cool-gray bg with navy ink */
+  --sidebar: oklch(0.985 0.005 256);
+  --sidebar-foreground: oklch(0.3 0.04 263);
+  --sidebar-primary: oklch(0.55 0.234 264);
+  --sidebar-primary-foreground: oklch(0.99 0 0);
+  --sidebar-accent: oklch(0.95 0.012 256);
+  --sidebar-accent-foreground: oklch(0.22 0.057 263);
+  --sidebar-border: oklch(0.91 0.012 256);
+  --sidebar-ring: oklch(0.55 0.234 264);
+}
+
+.dark {
+  /* Surfaces — keep navy hue family but invert lightness */
+  --background: oklch(0.16 0.022 263);            /* near-black with navy hue */
+  --foreground: oklch(0.96 0.005 256);
+  --card: oklch(0.19 0.025 263);                  /* one hair lighter than bg */
+  --card-foreground: oklch(0.96 0.005 256);
+  --popover: oklch(0.19 0.025 263);
+  --popover-foreground: oklch(0.96 0.005 256);
+
+  /* Brand: royal blue — slightly brighter for dark surface */
+  --primary: oklch(0.66 0.21 264);
+  --primary-foreground: oklch(0.16 0.022 263);
+
+  /* Neutrals */
+  --secondary: oklch(0.23 0.025 263);
+  --secondary-foreground: oklch(0.96 0.005 256);
+  --muted: oklch(0.23 0.025 263);
+  --muted-foreground: oklch(0.65 0.025 256);
+  --accent: oklch(0.27 0.06 264);                 /* dark royal-blue tint */
+  --accent-foreground: oklch(0.85 0.12 264);
+
+  /* Functional — brightened for dark backgrounds */
+  --destructive: oklch(0.77 0.18 38);
+  --destructive-foreground: oklch(0.16 0.022 263);
+  --success: oklch(0.77 0.18 144);
+  --success-foreground: oklch(0.16 0.022 263);
+  --warning: oklch(0.88 0.16 88);
+  --warning-foreground: oklch(0.16 0.022 263);
+  --info: oklch(0.82 0.13 226);
+  --info-foreground: oklch(0.16 0.022 263);
+  --border: oklch(0.27 0.025 263);
+  --input: oklch(0.27 0.025 263);
+  --ring: oklch(0.66 0.21 264);
+
+  /* Per-page accents — match light-mode hues, lifted lightness */
+  --page-dashboard: oklch(0.66 0.21 264);
+  --page-domains:   oklch(0.77 0.18 144);
+  --page-servers:   oklch(0.82 0.13 226);
+  --page-cloudflare:oklch(0.88 0.16 88);
+  --page-watcher:   oklch(0.74 0.19 264);
+  --page-logs:      oklch(0.55 0.07 263);
+  --page-audit:     oklch(0.77 0.18 38);
+  --page-settings:  oklch(0.62 0.045 263);
+  --page-sa:        oklch(0.7 0.184 287);
+
+  /* Status — slightly brighter for dark */
+  --status-pending: oklch(0.65 0.025 256);
+  --status-running: oklch(0.66 0.21 264);
+  --status-completed: oklch(0.77 0.18 144);
+  --status-waiting: oklch(0.88 0.16 88);
+  --status-retryable: oklch(0.78 0.15 48);
+  --status-terminal: oklch(0.77 0.18 38);
+  --status-canceled: oklch(0.6 0.025 256);
+
+  /* Charts */
+  --chart-1: oklch(0.66 0.21 264);
+  --chart-2: oklch(0.82 0.13 226);
+  --chart-3: oklch(0.77 0.18 144);
+  --chart-4: oklch(0.88 0.16 88);
+  --chart-5: oklch(0.77 0.18 38);
+
+  /* Sidebar */
+  --sidebar: oklch(0.17 0.025 263);
+  --sidebar-foreground: oklch(0.85 0.005 256);
+  --sidebar-primary: oklch(0.66 0.21 264);
+  --sidebar-primary-foreground: oklch(0.16 0.022 263);
+  --sidebar-accent: oklch(0.23 0.025 263);
+  --sidebar-accent-foreground: oklch(0.96 0.005 256);
+  --sidebar-border: oklch(0.25 0.025 263);
+  --sidebar-ring: oklch(0.66 0.21 264);
+}
+
+@theme inline {
+  --font-sans: var(--font-inter), 'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono: var(--font-jetbrains-mono), 'JetBrains Mono', ui-monospace, monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-status-pending: var(--status-pending);
+  --color-status-running: var(--status-running);
+  --color-status-completed: var(--status-completed);
+  --color-status-waiting: var(--status-waiting);
+  --color-status-retryable: var(--status-retryable);
+  --color-status-terminal: var(--status-terminal);
+  --color-status-canceled: var(--status-canceled);
+
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  --radius-sm: 0.25rem;   /* 4px */
+  --radius-md: 0.375rem;  /* 6px */
+  --radius-lg: 0.5rem;    /* 8px */
+  --radius-xl: 0.75rem;   /* 12px modal */
+
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply bg-background;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-size: 13px;
+    line-height: 1.5;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  }
+  /* Subtle scrollbar */
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 999px;
+    border: 2px solid var(--background);
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: var(--muted-foreground);
+  }
+}
+
+@layer utilities {
+  .text-micro {
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  .text-small {
+    font-size: 12px;
+    line-height: 1.45;
+  }
+
+  /* Page accent strip — thin colored bar shown above each page header */
+  .page-accent {
+    position: relative;
+  }
+  .page-accent::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    height: 2px;
+    background: var(--page-accent-color, var(--primary));
+    border-radius: 999px;
+  }
+  .accent-dashboard  { --page-accent-color: var(--page-dashboard); }
+  .accent-domains    { --page-accent-color: var(--page-domains); }
+  .accent-servers    { --page-accent-color: var(--page-servers); }
+  .accent-cloudflare { --page-accent-color: var(--page-cloudflare); }
+  .accent-watcher    { --page-accent-color: var(--page-watcher); }
+  .accent-logs       { --page-accent-color: var(--page-logs); }
+  .accent-audit      { --page-accent-color: var(--page-audit); }
+  .accent-settings   { --page-accent-color: var(--page-settings); }
+  .accent-sa         { --page-accent-color: var(--page-sa); }
+
+  /* Colored solid button helpers — use sparingly for semantic actions */
+  .btn-success {
+    background-color: var(--success);
+    color: var(--success-foreground);
+  }
+  .btn-success:hover { filter: brightness(0.95); }
+  .btn-warning {
+    background-color: var(--warning);
+    color: var(--warning-foreground);
+  }
+  .btn-warning:hover { filter: brightness(0.95); }
+  .btn-info {
+    background-color: var(--info);
+    color: var(--info-foreground);
+  }
+  .btn-info:hover { filter: brightness(0.95); }
+
+  /* Soft-tinted button variants (tint background + colored text) */
+  .btn-soft-success {
+    background-color: color-mix(in oklch, var(--success) 14%, transparent);
+    color: var(--success);
+    border: 1px solid color-mix(in oklch, var(--success) 30%, transparent);
+  }
+  .btn-soft-success:hover {
+    background-color: color-mix(in oklch, var(--success) 22%, transparent);
+  }
+  .btn-soft-warning {
+    background-color: color-mix(in oklch, var(--warning) 16%, transparent);
+    color: color-mix(in oklch, var(--warning) 80%, var(--foreground));
+    border: 1px solid color-mix(in oklch, var(--warning) 32%, transparent);
+  }
+  .btn-soft-warning:hover {
+    background-color: color-mix(in oklch, var(--warning) 24%, transparent);
+  }
+  .btn-soft-info {
+    background-color: color-mix(in oklch, var(--info) 14%, transparent);
+    color: var(--info);
+    border: 1px solid color-mix(in oklch, var(--info) 30%, transparent);
+  }
+  .btn-soft-info:hover {
+    background-color: color-mix(in oklch, var(--info) 22%, transparent);
+  }
+  .btn-soft-destructive {
+    background-color: color-mix(in oklch, var(--destructive) 14%, transparent);
+    color: var(--destructive);
+    border: 1px solid color-mix(in oklch, var(--destructive) 30%, transparent);
+  }
+  .btn-soft-destructive:hover {
+    background-color: color-mix(in oklch, var(--destructive) 22%, transparent);
+  }
+
+  /* Pulsing dot for "running" status */
+  @keyframes ssr-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(0.85); }
+  }
+  .animate-status-pulse {
+    animation: ssr-pulse 1.6s ease-in-out infinite;
+  }
+}
