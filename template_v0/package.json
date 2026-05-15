@@ -10,6 +10,7 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
+    "update-chromium": "npm install --no-save patchright@latest patchright-core@latest",
     "postinstall": "patchright install chromium || echo 'patchright chromium install failed — UI fallback for SSL install will be unavailable. Re-run manually: npx patchright install chromium'"
   },
   "dependencies": {

@@ -157,6 +157,23 @@ npm ci >/dev/null
 ok "$(npm ls --depth=0 2>/dev/null | head -1)"
 
 # ---------------------------------------------------------------------------
+# Step 5b — Force-bump patchright to absolute latest (operator policy:
+# "always latest Chromium"). package.json caret-pin gives a reproducible
+# base via npm ci above; this step then overrides patchright + patchright-core
+# to whatever's currently published on npm. --no-save keeps the lockfile
+# untouched so reinstalls remain deterministic until the next git pull.
+# The postinstall hook on the upgraded patchright auto-downloads the
+# matching Chromium revision (no separate `patchright install chromium`
+# call needed here).
+# ---------------------------------------------------------------------------
+log "Upgrading patchright → latest published (always-latest Chromium policy)"
+npm install --no-save patchright@latest patchright-core@latest >/dev/null 2>&1 \
+  && PATCH_VER=$(node -p "require('./node_modules/patchright/package.json').version" 2>/dev/null || echo "?") \
+  && CHROME_REV=$(ls node_modules/patchright-core/.local-browsers 2>/dev/null | grep -E "^chromium-[0-9]+$" | head -1 | sed 's/chromium-//' || echo "?") \
+  && ok "patchright @ $PATCH_VER · Chromium revision $CHROME_REV" \
+  || warn "patchright upgrade failed — keeping the package.json-pinned version"
+
+# ---------------------------------------------------------------------------
 # Step 6 — Chromium runtime libraries (per-Ubuntu via patchright)
 # ---------------------------------------------------------------------------
 log "Chromium runtime libs"

@@ -103,6 +103,18 @@ npm ci
 
 The `postinstall` hook auto-runs `patchright install chromium`. If it fails (network/disk), the message tells you to retry — that's harmless, the dashboard runs fine without the browser binary.
 
+### Always-latest Chromium policy
+
+`install.sh` Step 5b force-bumps `patchright` + `patchright-core` to whatever is currently published on npm (overriding the `package.json` caret-pin). This guarantees fresh installs always get the bleeding-edge Chromium revision that patchright supports. On long-running servers, refresh on demand:
+
+```bash
+cd /opt/ssr/template_v0
+npm run update-chromium
+# prints: patchright X.Y.Z · Chromium chromium-NNNN
+```
+
+The actual Chromium version bundled per patchright revision: see `node_modules/patchright-core/browsers.json` — at the time of writing, patchright 1.59.4 bundles Chromium 147.0.7727.15.
+
 ---
 
 ## 6. Install Chromium runtime libraries (handles 22.04 + 24.04 transparently)
