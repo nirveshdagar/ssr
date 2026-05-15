@@ -1350,6 +1350,20 @@ function DomainsPageInner() {
                           <Eye className="h-3.5 w-3.5" />
                         </Button>
                       </a>
+                      <a
+                        href={`https://${d.name}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        title={`Open https://${d.name} in a new tab — visual check that the site is serving`}
+                      >
+                        <Button
+                          variant="ghost" size="icon"
+                          className="h-7 w-7"
+                          aria-label="Open site in new tab"
+                        >
+                          <ExternalLink className="h-3.5 w-3.5" />
+                        </Button>
+                      </a>
                       <Button
                         variant="ghost" size="icon" className="h-7 w-7"
                         aria-label="Run history"
@@ -1544,6 +1558,27 @@ function DomainsPageInner() {
                 title="Manual fallback — opens the copy-paste walker dialog for each selected domain. Useful for inspecting cert/key text or copying to a non-SA system."
               >
                 <ClipboardCopy className="h-3.5 w-3.5" /> Manual walker
+              </Button>
+              <Button
+                size="sm" variant="outline"
+                className="gap-1.5"
+                onClick={() => {
+                  if (selected.size === 0) return
+                  if (
+                    selected.size > 10 &&
+                    !window.confirm(
+                      `Open ${selected.size} sites in new tabs?\n\n` +
+                      `Your browser may block popups beyond ~10 at once. ` +
+                      `If some don't open, allow popups for this dashboard and retry.`,
+                    )
+                  ) return
+                  for (const name of selected) {
+                    window.open(`https://${name}`, "_blank", "noopener,noreferrer")
+                  }
+                }}
+                title="Open every selected domain (https://) in a new browser tab — quick visual check that each site is serving"
+              >
+                <ExternalLink className="h-3.5 w-3.5" /> Open sites ({selected.size})
               </Button>
               <Button
                 size="sm" variant="outline"
