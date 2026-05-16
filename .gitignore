@@ -48,6 +48,12 @@ build/
 # TypeScript incremental compile cache — auto-regenerated, shouldn't be tracked
 tsconfig.tsbuildinfo
 
+# Next.js regenerates this on EVERY `next build`/`next dev`. It was committed
+# by mistake, so each prod build dirtied it and made the next `git pull`
+# abort ("local changes would be overwritten") — silently freezing the DO
+# droplet on stale code for days. Auto-generated; must never be tracked.
+/template_v0/next-env.d.ts
+
 # One-off debug / probe scripts left by AI sessions (tmp_*.mjs, tmp_*.sh, etc.).
 # These accidentally got committed once — keep them out of git permanently.
 tmp_*.mjs
