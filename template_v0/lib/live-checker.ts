@@ -302,22 +302,35 @@ async function tick(): Promise<void> {
  * statuses, not on transient network failures (returns null in that case so
  * the slow-path threshold still gates the dead-mark).
  */
-async function probeSaAgentDead(saServerId: string): Promise<string | null> {
-  try {
-    const { getServerInfo } = await import("./serveravatar")
-    const info = await getServerInfo(saServerId)
-    const status = String(info.agent_status ?? info.status ?? "").toLowerCase()
-    if (status === "disconnected" || status === "offline" || status === "0") {
-      return `SA agent_status='${status}' (SA confirms server unreachable)`
+export async function probeSaAgentDead(saServerId: string): Promise<string | null> {
+  // SA's cloud<->agent link flaps constantly — a SINGLE 'disconnected' /
+  // 'offline' reading (or a transient 404) is NOT proof the box is dead.
+  // Trusting one reading was the #1 cause of healthy servers being killed
+  // and auto-migrated. Re-confirm with a second poll a few seconds later;
+  // only declare dead if BOTH polls independently say so.
+  const poll = async (): Promise<string | null> => {
+    try {
+      const { getServerInfo } = await import("./serveravatar")
+      const info = await getServerInfo(saServerId)
+      const status = String(info.agent_status ?? info.status ?? "").toLowerCase()
+      if (status === "disconnected" || status === "offline" || status === "0") {
+        return `SA agent_status='${status}'`
+      }
+      return null
+    } catch (e) {
+      if ((e as Error).message.includes("HTTP 404")) {
+        return "SA 404 (server entry deleted from ServerAvatar)"
+      }
+      return null // transient (timeout/5xx/network) — NOT proof of death
     }
-    return null
-  } catch (e) {
-    const msg = (e as Error).message
-    if (msg.includes("HTTP 404")) {
-      return "SA returns 404 (server entry deleted from ServerAvatar)"
-    }
-    return null  // transient — let slow-path handle
   }
+  const first = await poll()
+  if (!first) return null
+  const reconfirmMs = Number(process.env.SSR_SA_RECONFIRM_MS) || 4000
+  await new Promise((r) => setTimeout(r, reconfirmMs))
+  const second = await poll()
+  if (!second) return null // flapped back within seconds → it was transient
+  return `${first}; re-confirmed after 4s (${second}) — SA reports unreachable twice`
 }
 
 async function probeDropletFastDead(dropletId: string): Promise<string | null> {
@@ -344,6 +357,34 @@ async function checkDeadServers(
     `SELECT id, name, ip, status, do_droplet_id, sa_server_id FROM servers WHERE status = 'ready'`,
   )
 
+  // The SA fast-path leans on SA's flaky agent_status, so it needs a much
+  // higher HTTPS-failure gate than the DO fast-path (DO 404/archive is
+  // hard evidence; SA 'disconnected' is not). Tie it to the operator's
+  // configured tolerance, never below 4.
+  const saFastGate = Math.max(4, Math.ceil(threshold / 2))
+
+  // Global sanity guard: if EVERY ready server's domains are failing in
+  // the SAME tick, that's overwhelmingly a dashboard-side / CF-wide
+  // network problem — not every server dying simultaneously. Mass
+  // dead-marking here is catastrophic (spurious droplets + prod domain
+  // churn). Skip this tick; a genuinely-dead single server is still
+  // caught on later ticks (once others recover this guard stops tripping)
+  // by the unchanged slow threshold.
+  if (servers.length >= 2) {
+    const downServers = servers.filter((s) => {
+      const e = byServer.get(s.id)
+      return e !== undefined && e.length > 0 && e.every((x) => x.downStreak >= 2)
+    })
+    if (downServers.length === servers.length) {
+      logPipeline("(live-checker)", "dead_detect", "warning",
+        `ALL ${servers.length} ready servers' domains failing this tick — ` +
+        `treating as a dashboard-side / CF network problem, NOT mass server ` +
+        `death. Skipping dead-marks this tick (slow threshold still applies ` +
+        `to any single server that stays down once others recover).`)
+      return
+    }
+  }
+
   for (const s of servers) {
     const entries = byServer.get(s.id)
     if (!entries || entries.length === 0) continue
@@ -358,11 +399,11 @@ async function checkDeadServers(
     if (!allDown && s.do_droplet_id && entries.every((e) => e.downStreak >= 2)) {
       fastReason = await probeDropletFastDead(s.do_droplet_id)
     }
-    // Fast-path #2: SA-API agent status. If 2+ ticks of HTTPS failures AND
-    // SA reports the agent is offline / disconnected, treat as dead. Catches
-    // the case where the droplet still exists on DO (SA shows the truth that
-    // the server's services are down even if DO says the VM is up).
-    if (!allDown && !fastReason && s.sa_server_id && entries.every((e) => e.downStreak >= 2)) {
+    // Fast-path #2: SA-API agent status. Needs saFastGate consecutive
+    // HTTPS-failure ticks (NOT 2 — SA's agent_status flaps, so this path
+    // must not be near-instant) AND probeSaAgentDead re-confirms SA says
+    // the agent is offline/disconnected across two polls.
+    if (!allDown && !fastReason && s.sa_server_id && entries.every((e) => e.downStreak >= saFastGate)) {
       fastReason = await probeSaAgentDead(s.sa_server_id)
     }
     if (!allDown && !fastReason) continue
