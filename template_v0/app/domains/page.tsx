@@ -1516,7 +1516,10 @@ function DomainsPageInner() {
               />
             </div>
 
-            <ButtonGroup>
+            {/* Wrapping flex (not ButtonGroup): with 8 actions + the
+                selects, a non-wrapping w-fit ButtonGroup overflowed
+                max-w-4xl and clipped Cancel/Delete off-screen. */}
+            <div className="flex flex-wrap items-center gap-1.5">
               <Button
                 size="sm" variant="outline"
                 className="gap-1.5 btn-soft-success"
@@ -1632,7 +1635,7 @@ function DomainsPageInner() {
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
-            </ButtonGroup>
+            </div>
           </div>
         )}
       </div>
