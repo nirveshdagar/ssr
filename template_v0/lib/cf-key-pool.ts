@@ -305,23 +305,41 @@ export async function refreshCfAccountId(cfKeyId: number): Promise<string> {
   return realId
 }
 
-/** Refresh every active key's account_id. Returns one result per key. */
+/**
+ * Refresh every active key's account_id. Returns one result per key, in
+ * key order. Bounded-concurrency worker pool (same shape as bulk-add /
+ * sa-control / migration) — serial was ~1 CF /accounts call per key, so
+ * 500 keys took many minutes and the request timed out. Concurrency is
+ * clamped 1–10, default 5, overridable via SSR_CF_REFRESH_CONCURRENCY.
+ */
 export async function refreshAllCfAccountIds(): Promise<RefreshResult[]> {
-  const out: RefreshResult[] = []
-  for (const k of listCfKeys()) {
-    const before = k.cf_account_id ?? ""
-    try {
-      const after = await refreshCfAccountId(k.id)
-      out.push({
-        id: k.id, email: k.email, alias: k.alias,
-        before, after, changed: before !== after, error: null,
-      })
-    } catch (e) {
-      out.push({
-        id: k.id, email: k.email, alias: k.alias,
-        before, after: before, changed: false, error: (e as Error).message,
-      })
+  const keys = listCfKeys()
+  const out: RefreshResult[] = new Array(keys.length)
+  const cRaw = parseInt(process.env.SSR_CF_REFRESH_CONCURRENCY ?? "5", 10)
+  const concurrency = Number.isFinite(cRaw) ? Math.max(1, Math.min(10, cRaw)) : 5
+  let cursor = 0
+  async function worker(): Promise<void> {
+    for (;;) {
+      const idx = cursor++
+      if (idx >= keys.length) return
+      const k = keys[idx]
+      const before = k.cf_account_id ?? ""
+      try {
+        const after = await refreshCfAccountId(k.id)
+        out[idx] = {
+          id: k.id, email: k.email, alias: k.alias,
+          before, after, changed: before !== after, error: null,
+        }
+      } catch (e) {
+        out[idx] = {
+          id: k.id, email: k.email, alias: k.alias,
+          before, after: before, changed: false, error: (e as Error).message,
+        }
+      }
     }
   }
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, keys.length || 1) }, () => worker()),
+  )
   return out
 }
