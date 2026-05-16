@@ -172,6 +172,13 @@ export function scheduleBootHooks(): void {
   void import("./auto-heal").then(({ startAutoHeal }) => startAutoHeal()).catch(() => {
     /* boot is best-effort — never wedge the server */
   })
+  // Self-heal the denormalized cf_keys.domains_used counter so the
+  // CF-keys page can't go stale without a manual CF sync. Self-skips in
+  // tests / SSR_COUNTER_RECONCILE=0.
+  void import("./counter-reconcile").then(({ startCounterReconcile }) =>
+    startCounterReconcile()).catch(() => {
+    /* boot is best-effort */
+  })
   // Live-checker — ON by default now that Flask is gone (Flask used to
   // run its own; double-running against the same DB caused status thrash).
   // Set SSR_LIVE_CHECKER=0 to opt out (e.g. during a parallel migration
