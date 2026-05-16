@@ -42,6 +42,14 @@ const STRING_FIELDS = [
   "live_check_interval_s",
   "dead_server_threshold_ticks",
   "max_droplets_per_hour",
+  // Default caps stamped on new servers / CF keys. Rendered in Settings
+  // and read by digitalocean.ts (sites_per_server) + cf-key-pool.ts
+  // (cf_domains_per_key), but were MISSING here — so the GET never
+  // returned them and the POST loop silently dropped saves (the field
+  // always reverted to its 60/20 placeholder). Same bug class as the
+  // claude_code_oauth_token note above.
+  "sites_per_server",
+  "cf_domains_per_key",
 ] as const
 
 const CHECKBOX_FIELDS = [
