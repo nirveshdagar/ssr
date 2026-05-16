@@ -2,6 +2,7 @@ import { NextResponse, type NextRequest } from "next/server"
 import { all, one, run } from "@/lib/db"
 import { appendAudit } from "@/lib/repos/audit"
 import { logPipeline } from "@/lib/repos/logs"
+import { decrypt } from "@/lib/secrets-vault"
 
 export const runtime = "nodejs"
 
@@ -35,6 +36,8 @@ interface DomainRow {
   cf_key_id: number | null
   cf_zone_id: string | null
   cf_nameservers: string | null
+  cf_email: string | null
+  cf_global_key: string | null
   status: string
 }
 
@@ -117,10 +120,16 @@ export async function POST(req: NextRequest): Promise<Response> {
       continue
     }
 
+    // cf_keys.api_key is Fernet-encrypted at rest. Decrypt ONCE for both
+    // the CF auth below AND for writing onto domain rows (loadCreds /
+    // CF auth reads domains.cf_global_key as the plaintext key, exactly
+    // like assignCfKeyToDomain stores it).
+    const apiKeyPlain = decrypt(k.api_key)
+
     // Pull all zones for this CF account (paginated, CF caps at 50/page).
     let zones: CfZone[]
     try {
-      zones = await listAllZones(k.email, k.api_key, k.cf_account_id)
+      zones = await listAllZones(k.email, apiKeyPlain, k.cf_account_id)
     } catch (e) {
       report.error = `CF list-zones failed: ${(e as Error).message}`
       reports.push(report)
@@ -130,7 +139,8 @@ export async function POST(req: NextRequest): Promise<Response> {
 
     // DB rows assigned to this key.
     const tracked = all<DomainRow>(
-      `SELECT domain, cf_key_id, cf_zone_id, cf_nameservers, status FROM domains WHERE cf_key_id = ?`,
+      `SELECT domain, cf_key_id, cf_zone_id, cf_nameservers, cf_email, cf_global_key, status
+         FROM domains WHERE cf_key_id = ?`,
       k.id,
     )
     report.domains_tracked = tracked.length
@@ -163,21 +173,28 @@ export async function POST(req: NextRequest): Promise<Response> {
       const nsStr = Array.isArray(zone.name_servers) ? zone.name_servers.join(",") : ""
       const needZoneId = !byIdMatch && !!byNameMatch // cf_zone_id null/stale
       const needNs = (!d.cf_nameservers || !d.cf_nameservers.trim()) && nsStr !== ""
-      if (!needZoneId && !needNs) continue // happy path — fully resolved
+      // cf_email/cf_global_key are what loadCreds() + CF auth actually read.
+      // A domain can resolve by zone_id yet still be missing these (the
+      // "cf_email / cf_global_key missing" NS-check error) — repair it.
+      const needCreds = !d.cf_email || !d.cf_global_key
+      if (!needZoneId && !needNs && !needCreds) continue // fully resolved
       if (!dryRun) {
-        // Non-destructive: only fill cf_nameservers when it's empty.
+        // Non-destructive: only fill columns that are currently empty.
         run(
           `UPDATE domains
               SET cf_zone_id = ?, cf_account_id = ?,
                   cf_nameservers = COALESCE(NULLIF(cf_nameservers, ''), ?),
+                  cf_email = COALESCE(NULLIF(cf_email, ''), ?),
+                  cf_global_key = COALESCE(NULLIF(cf_global_key, ''), ?),
                   updated_at = datetime('now')
             WHERE domain = ?`,
-          zone.id, k.cf_account_id, nsStr || null, d.domain,
+          zone.id, k.cf_account_id, nsStr || null, k.email, apiKeyPlain || null, d.domain,
         )
         logPipeline(d.domain, "cf_sync", "completed",
           `Backfilled` +
           (needZoneId ? ` cf_zone_id=${zone.id} (was ${d.cf_zone_id ?? "NULL"})` : "") +
           (needNs ? ` cf_nameservers=${nsStr}` : "") +
+          (needCreds ? ` cf_email=${k.email} cf_global_key=***` : "") +
           ` — matched on CF`)
         backfilledTotal++
       }
@@ -215,12 +232,16 @@ export async function POST(req: NextRequest): Promise<Response> {
             `UPDATE domains
                 SET cf_key_id = ?, cf_zone_id = ?, cf_account_id = ?,
                     cf_nameservers = COALESCE(NULLIF(cf_nameservers, ''), ?),
+                    cf_email = COALESCE(NULLIF(cf_email, ''), ?),
+                    cf_global_key = COALESCE(NULLIF(cf_global_key, ''), ?),
                     updated_at = datetime('now')
               WHERE LOWER(domain) = ?`,
-            k.id, z.id, k.cf_account_id, nsStr || null, z.name.toLowerCase(),
+            k.id, z.id, k.cf_account_id, nsStr || null, k.email, apiKeyPlain || null,
+            z.name.toLowerCase(),
           )
           logPipeline(z.name, "cf_sync", "completed",
             `Linked unlinked domain to CF: cf_key_id=${k.id} cf_zone_id=${z.id}` +
+            ` cf_email=${k.email} cf_global_key=***` +
             (nsStr ? ` cf_nameservers=${nsStr}` : "") + " — name matched on CF")
           backfilledTotal++
         }
