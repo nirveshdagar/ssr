@@ -139,16 +139,17 @@ export default function ServersPage() {
   }
   async function submitEvacuate() {
     if (!evacuateSource) return
-    if (evacuateName !== evacuateSource.name) {
+    const typed = evacuateName.trim()
+    if (typed !== evacuateSource.name.trim()) {
       setEvacuateResult({
         kind: "err",
-        text: `Typed name doesn't match. Got '${evacuateName}', expected '${evacuateSource.name}'.`,
+        text: `Typed name doesn't match. Got '${typed}', expected '${evacuateSource.name}'.`,
       })
       return
     }
     if (evacuateSource.sites === 0) {
       // Nothing to migrate — fall straight through to hard-delete.
-      const r = await serverActions.delete(evacuateSource.id, evacuateName)
+      const r = await serverActions.delete(evacuateSource.id, typed)
       if (r.ok) {
         setEvacuateSource(null); show("ok", r.message ?? "Server destroyed")
         await refresh()
@@ -311,14 +312,18 @@ export default function ServersPage() {
   }
   async function submitHardDelete() {
     if (!destroyServer) return
-    if (destroyName !== destroyServer.name) {
+    // Trim to match the server, which already .trim()s confirm_name. The
+    // client was needlessly stricter, so a paste with a trailing newline/
+    // space failed here even though the server would have accepted it.
+    const typed = destroyName.trim()
+    if (typed !== destroyServer.name.trim()) {
       setDestroyOneResult({
         kind: "err",
-        text: `Typed name doesn't match. Got '${destroyName}', expected '${destroyServer.name}'.`,
+        text: `Typed name doesn't match. Got '${typed}', expected '${destroyServer.name}'.`,
       })
       return
     }
-    const r = await serverActions.delete(destroyServer.id, destroyName)
+    const r = await serverActions.delete(destroyServer.id, typed)
     if (r.ok) {
       setDestroyServer(null); show("ok", r.message ?? "Server destroyed")
       await refresh()
