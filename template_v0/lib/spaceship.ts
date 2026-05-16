@@ -110,7 +110,22 @@ export async function checkAvailability(
     const body = await safeJson(res)
     throw new Error(extractMessage(body, `HTTP ${res.status}`))
   }
-  return (await res.json()) as AvailabilityResponse
+  // Spaceship's live response is { domains: [{ domain, result: "available"
+  // | "unavailable" | …, premiumPricing: [] }] }. The previously assumed
+  // shape ({ name, isAvailable }) made Boolean(undefined) === false for
+  // every domain, so the pipeline never bought and mislabeled domains as
+  // "registered elsewhere". Normalize here; still accept the old shape.
+  const raw = (await res.json()) as {
+    domains?: { name?: string; domain?: string; isAvailable?: boolean; result?: string }[]
+  }
+  return {
+    domains: (raw.domains ?? []).map((e) => ({
+      name: e.name ?? e.domain ?? "",
+      isAvailable: typeof e.result === "string"
+        ? e.result.toLowerCase() === "available"
+        : Boolean(e.isAvailable),
+    })),
+  }
 }
 
 async function pollAsyncOperation(
