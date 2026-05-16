@@ -24,6 +24,9 @@ export interface DomainRow {
   origin_key_pem: string | null
   content_archive_path: string | null
   cancel_requested: number | null
+  /** 1 = operator dismissed this domain from the /watcher list (UI-only;
+   *  orthogonal to status). Reset to 0 on pipeline run teardown. */
+  watcher_dismissed: number | null
   last_heartbeat_at: string | null
   /** 1 = CF Origin Cert verified on the wire, 0 = wrong cert, NULL = unknown */
   ssl_origin_ok: number | null
@@ -45,7 +48,7 @@ const DOMAIN_COLS = new Set<keyof DomainRow>([
   "status", "cf_email", "cf_global_key", "cf_zone_id", "cf_nameservers",
   "cf_account_id", "server_id", "current_proxy_ip", "site_html",
   "cf_a_record_id", "cf_www_record_id", "origin_cert_pem", "origin_key_pem",
-  "content_archive_path", "cancel_requested",
+  "content_archive_path", "cancel_requested", "watcher_dismissed",
   "ssl_origin_ok", "ssl_last_verified_at",
   "live_ok", "live_reason", "live_http_status", "live_checked_at",
   "content_ok", "content_checked_at",

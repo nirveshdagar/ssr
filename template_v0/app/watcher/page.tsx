@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { Activity, Pause, Ban, RotateCw, ScrollText, Globe, ArrowUpRight } from "lucide-react"
+import { Activity, Pause, Ban, RotateCw, ScrollText, Globe, ArrowUpRight, EyeOff } from "lucide-react"
 import { AppShell } from "@/components/ssr/app-shell"
 import { StatusBadge } from "@/components/ssr/status-badge"
 import { PipelineProgress } from "@/components/ssr/pipeline-progress"
@@ -45,7 +45,7 @@ type WatchedRun = {
 }
 
 export default function WatcherPage() {
-  const { rows: domains } = useDomains()
+  const { rows: domains, refresh: refreshDomains } = useDomains()
   // Fetch the global watcher snapshot BEFORE deriving RUNS so the sidebar
   // can include domains whose pipelines are mid-flight EVEN IF the domain's
   // `status` field is still a transient value (e.g. step 5 polls CF for
@@ -69,14 +69,19 @@ export default function WatcherPage() {
   // states from the active-runs sidebar — UNLESS the domain has a
   // currently-running step_tracker row.
   const RUNS: WatchedRun[] = domains
-    .filter((d) =>
-      d.status === "running" ||
-      d.status === "waiting" ||
-      d.status === "retryable_error" ||
-      d.status === "terminal_error" ||
-      d.status === "canceled" ||
-      activeNames.has(d.name),
-    )
+    .filter((d) => {
+      const watched =
+        d.status === "running" ||
+        d.status === "waiting" ||
+        d.status === "retryable_error" ||
+        d.status === "terminal_error" ||
+        d.status === "canceled" ||
+        activeNames.has(d.name)
+      // Operator-dismissed domains drop out of the list — UNLESS a worker
+      // is actively running one (an in-flight run is never hidden; the
+      // flag is cleared again on run teardown).
+      return watched && (!d.dismissed || activeNames.has(d.name))
+    })
     .map((d, i) => ({
       pipelineId: `run-${d.id}`,
       domain: d.name,
@@ -128,8 +133,13 @@ export default function WatcherPage() {
       }
     }
   }
-  const [busy, setBusy] = React.useState<"cancel" | "retry" | null>(null)
+  const [busy, setBusy] = React.useState<"cancel" | "retry" | "dismiss" | null>(null)
   const [actionMsg, setActionMsg] = React.useState<string>("")
+  // Cancel only does anything while a worker is actively executing this
+  // domain (the cancel route gates on isPipelineRunning). active_domains is
+  // the client-side proxy for that — gate the button on it (item a).
+  const activeIsRunning =
+    active.domain !== "No active runs" && activeNames.has(active.domain)
   async function onCancel() {
     if (active.domain === "No active runs") return
     if (!confirm(
@@ -141,6 +151,20 @@ export default function WatcherPage() {
     setBusy("cancel"); setActionMsg("")
     const r = await domainActions.cancelPipeline(active.domain)
     setActionMsg(r.message ?? r.error ?? "")
+    setBusy(null)
+  }
+  async function onDismiss() {
+    if (active.domain === "No active runs") return
+    if (!confirm(
+      `Remove ${active.domain} from the watcher?\n\n` +
+      `This only hides it from this list — the domain and its real status ` +
+      `are untouched. It reappears if a pipeline runs for it again.`,
+    )) return
+    setBusy("dismiss"); setActionMsg("")
+    const r = await domainActions.dismissWatcher(active.domain)
+    setActionMsg(r.message ?? r.error ?? "")
+    await refreshDomains()
+    setActiveId("")
     setBusy(null)
   }
   async function onRetryStep() {
@@ -323,14 +347,32 @@ export default function WatcherPage() {
                     variant="outline" size="sm"
                     className="gap-1.5 btn-soft-destructive"
                     onClick={onCancel}
-                    disabled={busy !== null || active.domain === "No active runs"}
+                    disabled={busy !== null || active.domain === "No active runs" || !activeIsRunning}
                     title={
                       active.domain === "No active runs"
                         ? "Pick an active run from the sidebar first"
-                        : `Cancel ${active.domain} — graceful, stops at next step boundary`
+                        : !activeIsRunning
+                          ? `Cancel does nothing here — no worker is actively running ${active.domain}. ` +
+                            `It only stops an in-progress pipeline at the next step boundary. ` +
+                            `To clear an idle/errored row, use "Remove from watcher" or delete the domain.`
+                          : `Cancel ${active.domain} — graceful, stops at next step boundary`
                     }
                   >
                     <Ban className="h-3.5 w-3.5" /> Cancel run
+                  </Button>
+                  <Button
+                    variant="outline" size="sm"
+                    className="gap-1.5"
+                    onClick={onDismiss}
+                    disabled={busy !== null || active.domain === "No active runs"}
+                    title={
+                      active.domain === "No active runs"
+                        ? "Pick a run from the sidebar first"
+                        : `Hide ${active.domain} from this list (status untouched; ` +
+                          `reappears if a pipeline runs for it again)`
+                    }
+                  >
+                    <EyeOff className="h-3.5 w-3.5" /> Remove from watcher
                   </Button>
                 </ButtonGroup>
                 {actionMsg && (

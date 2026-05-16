@@ -74,6 +74,7 @@ export const domainActions = {
       .then(async (r) => ({ ok: r.ok, ...((await r.json()) as Record<string, unknown>) }))
   },
   cancelPipeline: (domain: string) => postForm(`/api/domains/${domain}/cancel-pipeline`),
+  dismissWatcher: (domain: string) => postForm(`/api/domains/${domain}/dismiss-watcher`),
   /**
    * Force a fresh TLS probe of the origin and update ssl_origin_ok in DB.
    * Use this when the lock icon disagrees with the operator's expectation —

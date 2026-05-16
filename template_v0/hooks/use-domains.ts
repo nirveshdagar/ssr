@@ -61,6 +61,8 @@ export interface DomainRow {
    *   null  = unknown (probe failed or body too short to classify) */
   contentOk: boolean | null
   contentCheckedAt: string | null
+  /** true = operator hid this domain from the /watcher list (UI-only). */
+  dismissed: boolean
 }
 
 interface ApiDomain {
@@ -86,6 +88,7 @@ interface ApiDomain {
   live_checked_at: string | null
   content_ok: number | null
   content_checked_at: string | null
+  watcher_dismissed: number | null
 }
 
 const NORMALIZE_STATUS: Record<string, PipelineStatus> = {
@@ -147,6 +150,7 @@ export function useDomains() {
     liveCheckedAt: d.live_checked_at,
     contentOk: d.content_ok === 1 ? true : d.content_ok === 0 ? false : null,
     contentCheckedAt: d.content_checked_at,
+    dismissed: d.watcher_dismissed === 1,
   }))
   return { rows, error, isLoading, refresh: mutate }
 }

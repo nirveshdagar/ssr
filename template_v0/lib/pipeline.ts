@@ -457,7 +457,7 @@ async function pipelineWorker(
       }
     } catch { /* never mask the original error */ }
     try {
-      updateDomain(domain, { cancel_requested: 0 } as Parameters<typeof updateDomain>[1])
+      updateDomain(domain, { cancel_requested: 0, watcher_dismissed: 0 } as Parameters<typeof updateDomain>[1])
     } catch { /* ignore */ }
     releaseSlot(domain)
   }

@@ -56,6 +56,7 @@ const CREATE_TABLES = `
     origin_key_pem        TEXT,
     content_archive_path  TEXT,
     cancel_requested      INTEGER DEFAULT 0,
+    watcher_dismissed     INTEGER DEFAULT 0,
     last_heartbeat_at     TEXT,
     created_at            TEXT DEFAULT (datetime('now')),
     updated_at            TEXT DEFAULT (datetime('now'))
@@ -227,6 +228,7 @@ function applyMigrations(db: DatabaseSync): void {
   tryAlter(db, "ALTER TABLE domains ADD COLUMN origin_key_pem TEXT")
   tryAlter(db, "ALTER TABLE domains ADD COLUMN content_archive_path TEXT")
   tryAlter(db, "ALTER TABLE domains ADD COLUMN cancel_requested INTEGER DEFAULT 0")
+  tryAlter(db, "ALTER TABLE domains ADD COLUMN watcher_dismissed INTEGER DEFAULT 0")
   tryAlter(db, "ALTER TABLE servers ADD COLUMN sites_count INTEGER NOT NULL DEFAULT 0")
   tryAlter(db, "ALTER TABLE servers ADD COLUMN max_sites INTEGER NOT NULL DEFAULT 60")
   tryAlter(db, "ALTER TABLE servers ADD COLUMN region TEXT")
