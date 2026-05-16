@@ -20,6 +20,8 @@ interface CfZone {
   id: string
   name: string
   status: string
+  /** CF-assigned nameservers — present in GET /zones, was being discarded. */
+  name_servers?: string[]
 }
 
 interface CfZonesResponse {
@@ -32,6 +34,7 @@ interface DomainRow {
   domain: string
   cf_key_id: number | null
   cf_zone_id: string | null
+  cf_nameservers: string | null
   status: string
 }
 
@@ -127,7 +130,7 @@ export async function POST(req: NextRequest): Promise<Response> {
 
     // DB rows assigned to this key.
     const tracked = all<DomainRow>(
-      `SELECT domain, cf_key_id, cf_zone_id, status FROM domains WHERE cf_key_id = ?`,
+      `SELECT domain, cf_key_id, cf_zone_id, cf_nameservers, status FROM domains WHERE cf_key_id = ?`,
       k.id,
     )
     report.domains_tracked = tracked.length
@@ -137,35 +140,51 @@ export async function POST(req: NextRequest): Promise<Response> {
     const cfById = new Map<string, CfZone>()
     for (const z of zones) cfById.set(z.id, z)
 
-    // Pass 1: orphans + backfill candidates
+    // Pass 1: orphans + backfill candidates. Backfills cf_zone_id +
+    // cf_account_id AND cf_nameservers. The last was previously never
+    // captured here, so SA-imported / externally-synced domains (which
+    // import-from-sa creates with no CF fields at all) never got their
+    // CF nameservers recorded — that was the reported "sync doesn't
+    // update the nameservers" bug.
     for (const d of tracked) {
       const lower = d.domain.toLowerCase()
-      const byNameMatch = cfByName.get(lower)
       const byIdMatch = d.cf_zone_id ? cfById.get(d.cf_zone_id) : null
-      if (byIdMatch) continue // happy path — cf_zone_id resolves
-      if (byNameMatch) {
-        // Backfillable: name exists on CF but DB's cf_zone_id is null/stale
-        if (!dryRun) {
-          run(
-            `UPDATE domains SET cf_zone_id = ?, cf_account_id = ?, updated_at = datetime('now') WHERE domain = ?`,
-            byNameMatch.id, k.cf_account_id, d.domain,
-          )
-          logPipeline(d.domain, "cf_sync", "completed",
-            `Backfilled cf_zone_id=${byNameMatch.id} (was ${d.cf_zone_id ?? "NULL"}) — name matched on CF`)
-          backfilledTotal++
-        }
-        report.backfilled.push({
+      const byNameMatch = cfByName.get(lower)
+      const zone = byIdMatch ?? byNameMatch
+      if (!zone) {
+        // Neither id nor name matches — true orphan.
+        report.ssr_orphans.push({
           domain: d.domain,
-          before_zone_id: d.cf_zone_id,
-          after_zone_id: byNameMatch.id,
+          cf_zone_id: d.cf_zone_id,
+          ssr_status: d.status,
         })
         continue
       }
-      // Neither id nor name matches — true orphan.
-      report.ssr_orphans.push({
+      const nsStr = Array.isArray(zone.name_servers) ? zone.name_servers.join(",") : ""
+      const needZoneId = !byIdMatch && !!byNameMatch // cf_zone_id null/stale
+      const needNs = (!d.cf_nameservers || !d.cf_nameservers.trim()) && nsStr !== ""
+      if (!needZoneId && !needNs) continue // happy path — fully resolved
+      if (!dryRun) {
+        // Non-destructive: only fill cf_nameservers when it's empty.
+        run(
+          `UPDATE domains
+              SET cf_zone_id = ?, cf_account_id = ?,
+                  cf_nameservers = COALESCE(NULLIF(cf_nameservers, ''), ?),
+                  updated_at = datetime('now')
+            WHERE domain = ?`,
+          zone.id, k.cf_account_id, nsStr || null, d.domain,
+        )
+        logPipeline(d.domain, "cf_sync", "completed",
+          `Backfilled` +
+          (needZoneId ? ` cf_zone_id=${zone.id} (was ${d.cf_zone_id ?? "NULL"})` : "") +
+          (needNs ? ` cf_nameservers=${nsStr}` : "") +
+          ` — matched on CF`)
+        backfilledTotal++
+      }
+      report.backfilled.push({
         domain: d.domain,
-        cf_zone_id: d.cf_zone_id,
-        ssr_status: d.status,
+        before_zone_id: d.cf_zone_id,
+        after_zone_id: zone.id,
       })
     }
 
@@ -173,14 +192,43 @@ export async function POST(req: NextRequest): Promise<Response> {
     const trackedNames = new Set(tracked.map((d) => d.domain.toLowerCase()))
     for (const z of zones) {
       if (trackedNames.has(z.name.toLowerCase())) continue
-      // Check if a DOMAIN with this name exists ANYWHERE (assigned to a different key)
-      const otherKeyMatch = one<{ cf_key_id: number | null }>(
-        `SELECT cf_key_id FROM domains WHERE LOWER(domain) = ? LIMIT 1`,
+      // Does a DOMAIN row with this name exist anywhere?
+      const existing = one<{ cf_key_id: number | null; cf_nameservers: string | null }>(
+        `SELECT cf_key_id, cf_nameservers FROM domains WHERE LOWER(domain) = ? LIMIT 1`,
         z.name.toLowerCase(),
       )
-      if (otherKeyMatch && otherKeyMatch.cf_key_id != null && otherKeyMatch.cf_key_id !== k.id) {
-        // Domain row exists on a DIFFERENT key — that's its own kind of drift,
-        // but not "untracked from this key's perspective". Skip.
+      if (existing && existing.cf_key_id != null && existing.cf_key_id !== k.id) {
+        // Domain row exists on a DIFFERENT key — its own kind of drift,
+        // not "untracked from this key's perspective". Skip.
+        continue
+      }
+      if (existing && existing.cf_key_id == null) {
+        // UNLINKED domain row (e.g. import-from-sa creates rows with no CF
+        // fields at all) whose name matches a zone in THIS key's account.
+        // Link it: assign the key + zone + account + nameservers. This is
+        // the case that was previously only flagged "cf_untracked" and
+        // never fixed — the reported "sync doesn't set nameservers for
+        // SA-imported domains" bug. Non-destructive (only fills NULLs).
+        const nsStr = Array.isArray(z.name_servers) ? z.name_servers.join(",") : ""
+        if (!dryRun) {
+          run(
+            `UPDATE domains
+                SET cf_key_id = ?, cf_zone_id = ?, cf_account_id = ?,
+                    cf_nameservers = COALESCE(NULLIF(cf_nameservers, ''), ?),
+                    updated_at = datetime('now')
+              WHERE LOWER(domain) = ?`,
+            k.id, z.id, k.cf_account_id, nsStr || null, z.name.toLowerCase(),
+          )
+          logPipeline(z.name, "cf_sync", "completed",
+            `Linked unlinked domain to CF: cf_key_id=${k.id} cf_zone_id=${z.id}` +
+            (nsStr ? ` cf_nameservers=${nsStr}` : "") + " — name matched on CF")
+          backfilledTotal++
+        }
+        report.backfilled.push({
+          domain: z.name,
+          before_zone_id: null,
+          after_zone_id: z.id,
+        })
         continue
       }
       report.cf_untracked.push({
