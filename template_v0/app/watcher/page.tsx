@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { Activity, Pause, Ban, RotateCw, ScrollText, Globe, ArrowUpRight, EyeOff } from "lucide-react"
+import { Activity, Pause, Ban, RotateCw, ScrollText, Globe, ArrowUpRight, EyeOff, Coins } from "lucide-react"
 import { AppShell } from "@/components/ssr/app-shell"
 import { StatusBadge } from "@/components/ssr/status-badge"
 import { PipelineProgress } from "@/components/ssr/pipeline-progress"
@@ -133,7 +133,7 @@ export default function WatcherPage() {
       }
     }
   }
-  const [busy, setBusy] = React.useState<"cancel" | "retry" | "dismiss" | null>(null)
+  const [busy, setBusy] = React.useState<"cancel" | "retry" | "dismiss" | "resetbuy" | null>(null)
   const [actionMsg, setActionMsg] = React.useState<string>("")
   // Cancel only does anything while a worker is actively executing this
   // domain (the cancel route gates on isPipelineRunning). active_domains is
@@ -165,6 +165,20 @@ export default function WatcherPage() {
     setActionMsg(r.message ?? r.error ?? "")
     await refreshDomains()
     setActiveId("")
+    setBusy(null)
+  }
+  async function onResetBuy() {
+    if (active.domain === "No active runs") return
+    if (!confirm(
+      `Reset Step 1 and re-BUY ${active.domain}?\n\n` +
+      `Step 1 PURCHASES the domain at the registrar — real money. Only do ` +
+      `this if it is NOT actually registered yet (e.g. the buy failed). ` +
+      `Clears the stuck status so the purchase re-runs without delete + re-add.`,
+    )) return
+    setBusy("resetbuy"); setActionMsg("")
+    const r = await domainActions.resetBuy(active.domain)
+    setActionMsg(r.message ?? r.error ?? "")
+    await refreshDomains()
     setBusy(null)
   }
   async function onRetryStep() {
@@ -373,6 +387,21 @@ export default function WatcherPage() {
                     }
                   >
                     <EyeOff className="h-3.5 w-3.5" /> Remove from watcher
+                  </Button>
+                  <Button
+                    variant="outline" size="sm"
+                    className="gap-1.5 btn-soft-destructive"
+                    onClick={onResetBuy}
+                    disabled={busy !== null || active.domain === "No active runs"}
+                    title={
+                      active.domain === "No active runs"
+                        ? "Pick a run from the sidebar first"
+                        : `Clear the stuck status so Step 1 re-runs the BUY for ` +
+                          `${active.domain} (real money — only if not actually registered). ` +
+                          `No delete + re-add needed.`
+                    }
+                  >
+                    <Coins className="h-3.5 w-3.5" /> Reset &amp; re-buy
                   </Button>
                 </ButtonGroup>
                 {actionMsg && (
