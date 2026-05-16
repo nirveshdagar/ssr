@@ -25,8 +25,11 @@ venv/
 Thumbs.db
 
 # Logs / debug artifacts
+# NOTE: keep `/logs/` anchored to repo root — an unanchored `logs/` also
+# matched the Next.js route dirs template_v0/app/logs/ and app/api/logs/,
+# silently keeping them out of git (caused a prod 404 on /logs).
 *.log
-logs/
+/logs/
 
 # Node — only template_v0/ has a package.json, but stray probe scripts run
 # from the root sometimes pull deps into a root-level node_modules
