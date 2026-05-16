@@ -391,6 +391,7 @@ export default function ServersPage() {
 
   const totalDomains = SERVERS.reduce((acc, s) => acc + s.domains, 0)
   const totalCapacity = SERVERS.filter((s) => s.status === "active").reduce((acc, s) => acc + s.capacity, 0)
+  const deadCount = SERVERS.filter((s) => s.status === "dead").length
 
   return (
     <AppShell
@@ -456,6 +457,22 @@ export default function ServersPage() {
       }
     >
       <div className="flex flex-col gap-3">
+        {deadCount > 0 && (
+          <div
+            role="alert"
+            className="flex items-center gap-2 rounded-md border border-status-terminal/50 bg-status-terminal/10 px-3 py-2 text-small text-status-terminal"
+          >
+            <AlertTriangle className="h-4 w-4 shrink-0" />
+            <span>
+              <span className="font-semibold">
+                {deadCount} server{deadCount === 1 ? "" : "s"} dead.
+              </span>{" "}
+              Sites on {deadCount === 1 ? "it are" : "them are"} down until
+              re-provisioned — use the “dead” filter below to act; auto-heal
+              re-migrates automatically when auto-migrate is enabled.
+            </span>
+          </div>
+        )}
         {flash && (
           <div
             role="status"
