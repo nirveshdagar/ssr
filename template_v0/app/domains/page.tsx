@@ -102,10 +102,15 @@ function DomainsPageInner() {
   const initialFilter = (sp.get("status") as PipelineStatus | "all" | null) ?? "all"
   const initialRaw = sp.get("raw")
   const initialQuery = sp.get("q") ?? ""
+  // ?server=<id> — Servers page "View domains hosted here" links here. The
+  // page never honored it, so that feature looked "missing" (landed on the
+  // full unfiltered list). Honor it now.
+  const initialServer = sp.get("server")
   const [filter, setFilter] = React.useState<PipelineStatus | "all">(initialFilter)
   /** When non-null, takes precedence over the chip filter — this is the
    *  fine-grained 22-status dropdown matching Flask's domains.html. */
   const [rawStatusFilter, setRawStatusFilter] = React.useState<string | null>(initialRaw)
+  const [serverFilter, setServerFilter] = React.useState<string | null>(initialServer)
   const [query, setQuery] = React.useState(initialQuery)
   const [selected, setSelected] = React.useState<Set<string>>(new Set())
 
@@ -116,13 +121,14 @@ function DomainsPageInner() {
     if (filter !== "all") params.set("status", filter)
     if (rawStatusFilter) params.set("raw", rawStatusFilter)
     if (query.trim()) params.set("q", query)
+    if (serverFilter) params.set("server", serverFilter)
     const qs = params.toString()
     const target = qs ? `${pathname}?${qs}` : pathname
     const id = window.setTimeout(() => {
       router.replace(target, { scroll: false })
     }, 250)
     return () => window.clearTimeout(id)
-  }, [filter, rawStatusFilter, query, pathname, router])
+  }, [filter, rawStatusFilter, query, serverFilter, pathname, router])
 
   const { rows: DOMAINS, isLoading, refresh } = useDomains()
   const { rows: SERVERS } = useServers()
@@ -855,6 +861,7 @@ function DomainsPageInner() {
     } else if (filter !== "all" && d.status !== filter) {
       return false
     }
+    if (serverFilter && String(d.serverId ?? "") !== serverFilter) return false
     if (isBulkListMode) {
       if (!tokenSet.has(d.name.toLowerCase())) return false
     } else if (query.trim()) {
@@ -1094,14 +1101,27 @@ function DomainsPageInner() {
                 </span>
               ) : null}
             </div>
-            {(query || filter !== "all" || rawStatusFilter) && (
+            {(query || filter !== "all" || rawStatusFilter || serverFilter) && (
               <Button
                 variant="outline" size="sm" className="gap-1.5"
-                onClick={() => { setQuery(""); setFilter("all"); setRawStatusFilter(null) }}
+                onClick={() => { setQuery(""); setFilter("all"); setRawStatusFilter(null); setServerFilter(null) }}
                 title="Clear search, status chip, and exact-status filter"
               >
                 <X className="h-3.5 w-3.5" /> Clear filters
               </Button>
+            )}
+            {serverFilter && (
+              <span className="inline-flex items-center gap-1 rounded bg-muted px-2 py-1 text-small">
+                Server: <code className="font-mono">srv-{serverFilter}</code>
+                <button
+                  onClick={() => setServerFilter(null)}
+                  aria-label="Clear server filter"
+                  title="Show all servers' domains"
+                  className="text-muted-foreground hover:text-foreground"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </span>
             )}
             <div className="ml-auto text-micro text-muted-foreground">
               {filtered.length} of {DOMAINS.length}
