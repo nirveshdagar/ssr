@@ -306,6 +306,15 @@ export async function POST(req: NextRequest): Promise<Response> {
             const { captureCfRecordIds } = await import("@/lib/migration")
             await captureCfRecordIds(dd.domain)
           } catch { /* record-id cache is non-fatal */ }
+          // Mirror pipeline step 7: record the A-record target so the
+          // /domains page (which shows current_proxy_ip as the IP) and
+          // downstream checks reflect reality. Without this the records
+          // exist in CF but the page shows "—".
+          run(
+            `UPDATE domains SET current_proxy_ip = ?, updated_at = datetime('now')
+              WHERE domain = ?`,
+            dd.ip, dd.domain,
+          )
           logPipeline(dd.domain, "cf_sync", "completed",
             `Step-7 DNS applied (A @+www -> ${dd.ip} proxied, SSL full, ` +
             `always-HTTPS) — externally-added domain`)
@@ -317,6 +326,31 @@ export async function POST(req: NextRequest): Promise<Response> {
         }
       }
       report.dns_fixed.push({ domain: dd.domain, ip: dd.ip })
+    }
+
+    // Reconcile current_proxy_ip from the assigned server for ANY linked
+    // domain that's missing it — including ones whose A record was already
+    // created on a prior run (Pass 3's cf_a_record_id filter skips those,
+    // so they'd otherwise show "—" on /domains forever). Pure DB, no CF
+    // calls, no cap. Non-destructive (only fills blank current_proxy_ip).
+    if (!dryRun) {
+      const proxyFix = run(
+        `UPDATE domains
+            SET current_proxy_ip = (SELECT s.ip FROM servers s WHERE s.id = domains.server_id),
+                updated_at = datetime('now')
+          WHERE cf_key_id = ?
+            AND (current_proxy_ip IS NULL OR current_proxy_ip = '')
+            AND server_id IS NOT NULL
+            AND (SELECT s.ip FROM servers s WHERE s.id = domains.server_id) IS NOT NULL
+            AND (SELECT s.ip FROM servers s WHERE s.id = domains.server_id) <> ''`,
+        k.id,
+      )
+      const proxyChanged = Number(proxyFix?.changes ?? 0)
+      if (proxyChanged > 0) {
+        logPipeline("", "cf_sync", "completed",
+          `Backfilled current_proxy_ip from server for ${proxyChanged} ` +
+          `domain(s) on key ${k.alias ?? k.email}`)
+      }
     }
 
     // Reconcile the denormalized cf_keys.domains_used counter. It's only
