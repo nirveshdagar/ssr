@@ -15,7 +15,7 @@
  * data/ssr.db, and pipeline_log entries written here are visible to the
  * Flask UI immediately.
  */
-import { getSetting } from "./repos/settings"
+import { getSetting, setSetting } from "./repos/settings"
 import { logPipeline } from "./repos/logs"
 
 const API_BASE = "https://spaceship.dev/api/v1"
@@ -86,10 +86,22 @@ async function spaceshipFetch(
 }
 
 function extractMessage(body: unknown, fallback: string): string {
-  if (body && typeof body === "object" && "message" in body) {
-    const m = (body as { message?: unknown }).message
-    if (typeof m === "string" && m) return m
+  if (body && typeof body === "object") {
+    const o = body as Record<string, unknown>
+    const base = typeof o.message === "string" && o.message ? o.message : fallback
+    // Spaceship 4xx validation bodies (e.g. 422 on purchase) carry the
+    // useful field-level specifics in `errors`/`detail`, NOT `message`.
+    // Append them instead of swallowing — opaque "HTTP 422" cost us a
+    // round-trip during the 2026-05-16 buy investigation.
+    const detail = o.errors ?? o.detail ?? o.data
+    if (detail !== undefined) {
+      let d: string
+      try { d = JSON.stringify(detail) } catch { d = String(detail) }
+      return `${base} — ${d}`.slice(0, 600)
+    }
+    return base
   }
+  if (typeof body === "string" && body) return `${fallback}: ${body}`.slice(0, 600)
   return fallback
 }
 
@@ -146,35 +158,61 @@ async function pollAsyncOperation(
   return { ok: false, error: "Operation timed out" }
 }
 
-interface ContactInfo {
-  firstName: string
-  lastName: string
-  email: string
-  phone: string
-  address: {
-    line1: string
-    city: string
-    state: string
-    zip: string
-    country: string
-  }
+/**
+ * Spaceship wants phone as dotted E.164: "+<cc>.<subscriber>". Operators
+ * usually store it human-formatted ("+1 3073180850"); convert the first
+ * separator run to a dot and strip the rest. Already-dotted values pass
+ * through unchanged. If it's too mangled to parse we send it as-is and let
+ * Spaceship's (now surfaced) 422 say so rather than silently corrupt it.
+ */
+function normalizePhone(raw: string): string {
+  const t = raw.trim()
+  if (/^\+\d+\.\d+$/.test(t)) return t
+  return t.replace(/\s+/, ".").replace(/[\s()-]/g, "")
 }
 
-function buildContacts(): { registrant: ContactInfo; admin: ContactInfo; tech: ContactInfo; billing: ContactInfo } {
-  const registrant: ContactInfo = {
+/**
+ * Flat contact body Spaceship's `PUT /api/v1/contacts` expects (discovered
+ * 2026-05-16 — POST 404s, nested `address` 422s; it returns
+ * `{ contactId }`). Defaults keep a never-empty body for unconfigured
+ * fields, but a real registration needs valid registrant_* settings.
+ */
+function buildContactBody(): Record<string, string> {
+  return {
     firstName: getSetting("registrant_first_name") || "Domain",
     lastName: getSetting("registrant_last_name") || "Admin",
     email: getSetting("registrant_email") || "",
-    phone: getSetting("registrant_phone") || "+1.0000000000",
-    address: {
-      line1: getSetting("registrant_address") || "123 Main St",
-      city: getSetting("registrant_city") || "New York",
-      state: getSetting("registrant_state") || "NY",
-      zip: getSetting("registrant_zip") || "10001",
-      country: getSetting("registrant_country") || "US",
-    },
+    phone: normalizePhone(getSetting("registrant_phone") || "+1.0000000000"),
+    address1: getSetting("registrant_address") || "123 Main St",
+    city: getSetting("registrant_city") || "New York",
+    stateProvince: getSetting("registrant_state") || "NY",
+    postalCode: getSetting("registrant_zip") || "10001",
+    country: getSetting("registrant_country") || "US",
   }
-  return { registrant, admin: registrant, tech: registrant, billing: registrant }
+}
+
+/**
+ * Spaceship's domain-register endpoint takes contact *ID strings*, not
+ * inline contact objects (that was the HTTP 422 on every buy). Create one
+ * contact and cache its id in settings so we don't mint a new contact on
+ * every purchase.
+ */
+async function ensureContactId(): Promise<string> {
+  const cached = getSetting("spaceship_contact_id")
+  if (cached) return cached
+  const res = await spaceshipFetch(`${API_BASE}/contacts`, {
+    method: "PUT",
+    headers: headers(),
+    body: JSON.stringify(buildContactBody()),
+  }, { retries: 0 })
+  if (!res.ok) {
+    const body = await safeJson(res)
+    throw new Error(`contact create failed: ${extractMessage(body, `HTTP ${res.status}`)}`)
+  }
+  const data = (await res.json()) as { contactId?: string }
+  if (!data.contactId) throw new Error("contact create returned no contactId")
+  setSetting("spaceship_contact_id", data.contactId)
+  return data.contactId
 }
 
 export async function purchaseDomain(
@@ -195,11 +233,14 @@ export async function purchaseDomain(
       return { ok: true, result: { idempotent: true } }
     } catch { /* not in account — proceed to purchase */ }
 
+    const contactId = await ensureContactId()
     const payload = {
       autoRenew: false,
       years,
-      privacyProtection: { level: "high" },
-      contacts: buildContacts(),
+      privacyProtection: { level: "high", userConsent: true },
+      contacts: {
+        registrant: contactId, admin: contactId, tech: contactId, billing: contactId,
+      },
     }
     // Don't retry POST /domains automatically — every retry is a new
     // purchase attempt and the side effect is a real charge. The pre-check

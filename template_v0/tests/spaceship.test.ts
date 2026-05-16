@@ -47,3 +47,55 @@ describe("checkAvailability — Spaceship response-shape normalization", () => {
     expect(r.domains[0]).toEqual({ name: "legacy.site", isAvailable: true })
   })
 })
+
+interface Call { method: string; url: string; body: string }
+
+/** Route the Spaceship calls purchaseDomain makes:
+ *  GET /domains/<d>  -> 404 (not owned, idempotency precheck throws)
+ *  PUT /contacts     -> 200 { contactId }
+ *  POST /domains/<d> -> 200 (purchase ok). Records every call. */
+function installSpaceshipMock(opts: { contactId: string }) {
+  const calls: Call[] = []
+  vi.stubGlobal("fetch", async (input: unknown, init?: { method?: string; body?: unknown }) => {
+    const url = String(input)
+    const method = (init?.method || "GET").toUpperCase()
+    calls.push({ method, url, body: typeof init?.body === "string" ? init.body : "" })
+    if (method === "GET" && /\/domains\//.test(url)) return new Response("{}", { status: 404 })
+    if (method === "PUT" && /\/contacts$/.test(url)) {
+      return new Response(JSON.stringify({ contactId: opts.contactId }), { status: 200 })
+    }
+    if (method === "POST" && /\/domains\//.test(url)) return new Response("{}", { status: 200 })
+    return new Response("{}", { status: 500 })
+  })
+  return calls
+}
+
+describe("purchaseDomain — contact-ID payload (Spaceship schema fix)", () => {
+  it("creates a contact, then sends string contact IDs + privacyProtection.userConsent", async () => {
+    const calls = installSpaceshipMock({ contactId: "CID-NEW" })
+    const { purchaseDomain } = await import("@/lib/spaceship")
+    const r = await purchaseDomain("buyme.site")
+    expect(r.ok).toBe(true)
+
+    expect(calls.some((c) => c.method === "PUT" && /\/contacts$/.test(c.url))).toBe(true)
+    const post = calls.find((c) => c.method === "POST" && /\/domains\/buyme\.site$/.test(c.url))
+    expect(post).toBeTruthy()
+    const payload = JSON.parse(post!.body)
+    expect(payload.contacts).toEqual({
+      registrant: "CID-NEW", admin: "CID-NEW", tech: "CID-NEW", billing: "CID-NEW",
+    })
+    expect(payload.privacyProtection).toEqual({ level: "high", userConsent: true })
+  })
+
+  it("reuses a cached spaceship_contact_id (no PUT /contacts)", async () => {
+    const { setSetting } = await import("@/lib/repos/settings")
+    setSetting("spaceship_contact_id", "CID-CACHED")
+    const calls = installSpaceshipMock({ contactId: "SHOULD-NOT-BE-USED" })
+    const { purchaseDomain } = await import("@/lib/spaceship")
+    const r = await purchaseDomain("buyme2.site")
+    expect(r.ok).toBe(true)
+    expect(calls.some((c) => c.method === "PUT")).toBe(false)
+    const post = calls.find((c) => c.method === "POST")!
+    expect(JSON.parse(post.body).contacts.registrant).toBe("CID-CACHED")
+  })
+})
