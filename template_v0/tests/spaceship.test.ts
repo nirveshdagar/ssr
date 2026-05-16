@@ -46,6 +46,19 @@ describe("checkAvailability — Spaceship response-shape normalization", () => {
     const r = await checkAvailability("legacy.site")
     expect(r.domains[0]).toEqual({ name: "legacy.site", isAvailable: true })
   })
+
+  it("an empty domains array is still valid (benign — must NOT throw)", async () => {
+    stubFetchJson({ domains: [] })
+    const { checkAvailability } = await import("@/lib/spaceship")
+    expect((await checkAvailability("x.site")).domains).toEqual([])
+  })
+
+  it("FAILS LOUD when the response has no domains array (the original silent bug)", async () => {
+    stubFetchJson({ totally: "different shape" })
+    const { checkAvailability } = await import("@/lib/spaceship")
+    const { ExternalApiShapeError } = await import("@/lib/ext-api")
+    await expect(checkAvailability("x.site")).rejects.toBeInstanceOf(ExternalApiShapeError)
+  })
 })
 
 interface Call { method: string; url: string; body: string }

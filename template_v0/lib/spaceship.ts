@@ -17,6 +17,7 @@
  */
 import { getSetting, setSetting } from "./repos/settings"
 import { logPipeline } from "./repos/logs"
+import { requireShape } from "./ext-api"
 
 const API_BASE = "https://spaceship.dev/api/v1"
 
@@ -127,11 +128,19 @@ export async function checkAvailability(
   // shape ({ name, isAvailable }) made Boolean(undefined) === false for
   // every domain, so the pipeline never bought and mislabeled domains as
   // "registered elsewhere". Normalize here; still accept the old shape.
-  const raw = (await res.json()) as {
-    domains?: { name?: string; domain?: string; isAvailable?: boolean; result?: string }[]
-  }
+  // Fail loud if `domains` isn't an array — that exact silent gap
+  // ("no domains array" → [] → every domain looked unavailable → never
+  // bought) was the original bug. An empty array is still valid (a
+  // legitimately-unavailable result), so only the structure is checked.
+  const raw = requireShape<{
+    domains: { name?: string; domain?: string; isAvailable?: boolean; result?: string }[]
+  }>(
+    "spaceship /domains/available",
+    await res.json(),
+    (v) => !!v && typeof v === "object" && Array.isArray((v as { domains?: unknown }).domains),
+  )
   return {
-    domains: (raw.domains ?? []).map((e) => ({
+    domains: raw.domains.map((e) => ({
       name: e.name ?? e.domain ?? "",
       isAvailable: typeof e.result === "string"
         ? e.result.toLowerCase() === "available"
