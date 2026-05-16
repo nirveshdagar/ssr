@@ -42,6 +42,7 @@ import type { StepTrackerRow } from "@/lib/repos/steps"
 import type { PipelineLogRow } from "@/lib/repos/logs"
 import type { PipelineStatus } from "@/lib/ssr/mock-data"
 import { cn } from "@/lib/utils"
+import { copyText } from "@/lib/clipboard"
 
 /**
  * Stronger-warning text for force-rerun on destructive steps. null = no
@@ -274,9 +275,8 @@ export function DomainDetailClient({ domain, row, server, cfKey, initialSteps, i
 
   function copy(value: string, label: string) {
     if (!value) return
-    navigator.clipboard?.writeText(value).then(
-      () => show("ok", `${label} copied`),
-      () => show("err", "Copy failed"),
+    void copyText(value).then((ok) =>
+      ok ? show("ok", `${label} copied`) : show("err", "Copy failed"),
     )
   }
 

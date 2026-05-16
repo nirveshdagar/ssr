@@ -50,6 +50,7 @@ import {
   Select, SelectTrigger, SelectValue, SelectContent, SelectItem,
 } from "@/components/ui/select"
 import { cn } from "@/lib/utils"
+import { copyText } from "@/lib/clipboard"
 
 // Same regions Flask exposes in templates/servers.html
 const DO_REGIONS = [
@@ -1017,12 +1018,11 @@ export default function ServersPage() {
               <Button
                 type="button" variant="outline" size="sm" className="gap-1.5 h-7"
                 onClick={async () => {
-                  try {
-                    await navigator.clipboard.writeText(destroyServer.name)
+                  if (await copyText(destroyServer.name)) {
                     setDestroyOneResult({ kind: "ok", text: `Copied "${destroyServer.name}" — paste below.` })
                     setTimeout(() => setDestroyOneResult((r) => (r?.text?.startsWith("Copied ") ? null : r)), 2500)
-                  } catch (e) {
-                    setDestroyOneResult({ kind: "err", text: `Copy failed: ${(e as Error).message}` })
+                  } else {
+                    setDestroyOneResult({ kind: "err", text: `Copy blocked — select the name and copy manually` })
                   }
                 }}
               >
@@ -1117,12 +1117,11 @@ export default function ServersPage() {
               <Button
                 type="button" variant="outline" size="sm" className="gap-1.5 h-7"
                 onClick={async () => {
-                  try {
-                    await navigator.clipboard.writeText(evacuateSource.name)
+                  if (await copyText(evacuateSource.name)) {
                     setEvacuateResult({ kind: "ok", text: `Copied "${evacuateSource.name}" — paste below.` })
                     setTimeout(() => setEvacuateResult((r) => (r?.text?.startsWith("Copied ") ? null : r)), 2500)
-                  } catch (e) {
-                    setEvacuateResult({ kind: "err", text: `Copy failed: ${(e as Error).message}` })
+                  } else {
+                    setEvacuateResult({ kind: "err", text: `Copy blocked — select the name and copy manually` })
                   }
                 }}
               >

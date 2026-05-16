@@ -71,6 +71,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { PIPELINE_STEPS } from "@/lib/status-taxonomy"
 import { RAW_STATUSES, RAW_STATUS_GROUPS } from "@/lib/ssr/domain-statuses"
 import { cn } from "@/lib/utils"
+import { copyText } from "@/lib/clipboard"
 
 // Coarse "chip" filters — match the 7 most common buckets.
 const STATUS_FILTERS: { key: PipelineStatus | "all"; label: string }[] = [
@@ -338,12 +339,11 @@ function DomainsPageInner() {
     }
   }
   async function copyToClipboard(text: string, which: "cert" | "key"): Promise<void> {
-    try {
-      await navigator.clipboard.writeText(text)
+    if (await copyText(text)) {
       setCertCopied(which)
       setTimeout(() => setCertCopied((c) => (c === which ? null : c)), 2500)
-    } catch (e) {
-      show("err", `Clipboard write failed: ${(e as Error).message}`)
+    } else {
+      show("err", "Clipboard blocked — select the text and copy manually")
     }
   }
   // Start the bulk push: filter to ssl_origin_ok=1, then call the dashboard's

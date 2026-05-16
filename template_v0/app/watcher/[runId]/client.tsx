@@ -10,6 +10,7 @@ import type { PipelineRunRow, PipelineStepRunRow } from "@/lib/repos/steps"
 import { PIPELINE_STEPS as TAXONOMY_STEPS } from "@/lib/status-taxonomy"
 import type { PipelineStatus } from "@/lib/ssr/mock-data"
 import { cn } from "@/lib/utils"
+import { copyText } from "@/lib/clipboard"
 
 const RUN_STATUS_TO_PIPELINE: Record<string, PipelineStatus> = {
   running: "running",
@@ -40,9 +41,8 @@ export function RunDetailClient({ run, steps, startedHuman, endedHuman, dur }: P
   }
   function copy(value: string, label: string) {
     if (!value) return
-    navigator.clipboard?.writeText(value).then(
-      () => show("ok", `${label} copied`),
-      () => show("err", "Copy failed"),
+    void copyText(value).then((ok) =>
+      ok ? show("ok", `${label} copied`) : show("err", "Copy failed"),
     )
   }
   async function retryFromStep(stepNum: number) {
