@@ -52,6 +52,20 @@ describe("preflight (offline checks only)", () => {
     expect(r.ok).toBe(true)
   })
 
+  it("checkLlmKey does NOT false-alarm 'no API key' for a CLI provider", async () => {
+    // Regression: anthropic_cli authenticates via the claude CLI, never an
+    // API key — the old check fired "no API key configured". The message
+    // must now be CLI-appropriate (and never claim a missing API key).
+    const { setSetting } = await import("@/lib/repos/settings")
+    const { checkLlmKey } = await import("@/lib/preflight")
+    setSetting("llm_provider", "anthropic_cli")
+    const r = checkLlmKey()
+    // In CI the claude binary isn't installed, so this is a *real* fail —
+    // but with the correct reason, not the misleading API-key one.
+    expect(r.message).not.toMatch(/API key/i)
+    expect(r.message).toMatch(/CLI/)
+  })
+
   it("checkRootPassword fails when missing, passes when set", async () => {
     const { setSetting } = await import("@/lib/repos/settings")
     const { checkRootPassword } = await import("@/lib/preflight")

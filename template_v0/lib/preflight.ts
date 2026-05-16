@@ -16,6 +16,7 @@ import path from "node:path"
 import os from "node:os"
 import { all } from "./db"
 import { getSetting } from "./repos/settings"
+import { getCliStatus, type CliProvider } from "./llm-cli"
 
 export interface CheckResult {
   ok: boolean
@@ -103,25 +104,45 @@ export async function checkSpaceshipAuth(opts: { skipPurchase?: boolean } = {}):
   const apiSecret = (getSetting("spaceship_api_secret") || "").trim()
   if (!apiKey || !apiSecret) return fail("SPACESHIP_API_KEY / _SECRET not both set")
   try {
-    const r = await fetch("https://spaceship.dev/api/v1/domains?take=1", {
-      headers: {
-        "X-API-Key": apiKey,
-        "X-API-Secret": apiSecret,
-        Accept: "application/json",
-      },
-      signal: AbortSignal.timeout(15_000),
-    })
-    if (!r.ok) {
-      return fail(`Spaceship API rejected (HTTP ${r.status})`, { body: (await r.text()).slice(0, 140) })
-    }
+    // Reuse the maintained spaceship lib (correct query shape +
+    // headers()). The old raw `?take=1` fetch 422'd — Spaceship's list
+    // endpoint needs the `?take=25&skip=0` form (proven), so a hand-rolled
+    // probe was a false "API rejected". listDomains() throws on non-2xx.
+    const { listDomains } = await import("./spaceship")
+    await listDomains(25, 0)
     return ok("Spaceship ok")
   } catch (e) {
-    return fail(`Spaceship unreachable: ${(e as Error).name}: ${(e as Error).message}`)
+    return fail(`Spaceship API check failed: ${(e as Error).message}`)
   }
+}
+
+// llm_provider values that are CLI-auth (no API key) → their CliProvider.
+const CLI_LLM_PROVIDERS: Record<string, CliProvider> = {
+  anthropic_cli: "anthropic_cli",
+  openai_cli: "openai",
 }
 
 export function checkLlmKey(): CheckResult {
   const provider = (getSetting("llm_provider") || "anthropic").trim().toLowerCase()
+
+  // CLI providers authenticate via CLI login / OAuth token, NEVER an API
+  // key — demanding llm_api_key_* was a false "no API key" alarm.
+  const cli = CLI_LLM_PROVIDERS[provider]
+  if (cli) {
+    const st = getCliStatus(cli)
+    if (!st.installed) {
+      return fail(`LLM provider=${provider} — ${st.bin} CLI not installed (Settings → AI generator)`)
+    }
+    // anthropic_cli can be authed via the claude_code_oauth_token setting
+    // even when isLoggedIn() can't see a macOS-Keychain login.
+    const oauthFallback =
+      cli === "anthropic_cli" && (getSetting("claude_code_oauth_token") || "").trim() !== ""
+    if (st.loggedIn || oauthFallback) {
+      return ok(`LLM provider=${provider} — CLI authed${st.account ? ` (${st.account})` : ""}`)
+    }
+    return fail(`LLM provider=${provider} — ${st.bin} CLI not logged in (Settings → AI generator)`)
+  }
+
   const key = (getSetting(`llm_api_key_${provider}`) || "").trim() ||
               (getSetting("llm_api_key") || "").trim()
   if (!key) return fail(`LLM provider=${provider} but no API key configured`)
