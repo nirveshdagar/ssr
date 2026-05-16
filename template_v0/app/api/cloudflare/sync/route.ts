@@ -259,6 +259,22 @@ export async function POST(req: NextRequest): Promise<Response> {
       })
     }
 
+    // Reconcile the denormalized cf_keys.domains_used counter. It's only
+    // ever +1'd inside assignCfKeyToDomain, so domains linked any other
+    // way (this sync's backfill/link, SA-import, bulk-import) never bumped
+    // it — the CF-keys page then shows 0/stale "domains" for the key even
+    // though rows point at it. Recompute from the source of truth.
+    const realCount = one<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM domains WHERE cf_key_id = ?`, k.id,
+    )?.n ?? 0
+    if (!dryRun && realCount !== report.domains_tracked) {
+      run(`UPDATE cf_keys SET domains_used = ? WHERE id = ?`, realCount, k.id)
+      logPipeline("", "cf_sync", "completed",
+        `Recomputed cf_keys[id=${k.id} ${k.alias ?? k.email}].domains_used ` +
+        `${report.domains_tracked} -> ${realCount}`)
+    }
+    report.domains_tracked = realCount
+
     reports.push(report)
   }
 
