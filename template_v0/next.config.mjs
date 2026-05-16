@@ -1,5 +1,25 @@
+import { execSync } from "node:child_process"
+
+// Capture the git SHA + build time at build so the running app can report
+// exactly which commit it's serving. The root cause of the 2026-05-16
+// saga was prod silently running stale code with no way to tell at a
+// glance. Falls back to "dev" when git is unavailable (won't fail build).
+let gitSha = process.env.SSR_GIT_SHA || "dev"
+try {
+  gitSha =
+    execSync("git rev-parse --short HEAD", { stdio: ["ignore", "pipe", "ignore"] })
+      .toString()
+      .trim() || gitSha
+} catch {
+  /* git missing / not a repo — keep fallback */
+}
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  env: {
+    SSR_GIT_SHA: gitSha,
+    SSR_BUILD_TIME: new Date().toISOString(),
+  },
   typescript: {
     ignoreBuildErrors: false,
   },

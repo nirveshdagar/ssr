@@ -108,6 +108,14 @@ export function AppSidebar() {
             <span className="text-micro text-muted-foreground">Single user</span>
           </div>
         </div>
+        {/* Running build SHA — so "is prod current?" is a glance, not an
+            SSH investigation (the 2026-05-16 stale-prod saga). */}
+        <div
+          className="mt-2 text-micro font-mono text-muted-foreground/70"
+          title={`Build ${process.env.SSR_GIT_SHA ?? "unknown"} · ${process.env.SSR_BUILD_TIME ?? "?"}`}
+        >
+          build {process.env.SSR_GIT_SHA ?? "unknown"}
+        </div>
       </div>
     </aside>
   )

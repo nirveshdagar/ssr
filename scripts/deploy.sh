@@ -42,5 +42,7 @@ systemctl --no-pager --lines=0 status "$SERVICE" || true
 
 echo
 echo "==> Deployed: $BEFORE -> $AFTER"
-echo "    Verify the running build matches with:  curl -s localhost:3000/api/health"
-echo "    (health now reports the git SHA — it should read $AFTER)"
+echo "    Verify the RUNNING build == $AFTER:"
+echo "      - dashboard sidebar footer shows 'build <sha>', or"
+echo "      - logged in: curl -s --cookie \"\$SSR_COOKIE\" localhost:3000/api/version"
+echo "    (/api/health stays version-free by design — don't rely on it for this)"
