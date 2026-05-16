@@ -102,12 +102,19 @@ export async function POST(req: NextRequest): Promise<Response> {
       ok: true,
       message: "No active CF keys to sync",
       reports: [] as KeyReport[],
-      summary: { keys_synced: 0, ssr_orphans: 0, cf_untracked: 0, backfilled: 0, dns_fixed: 0, needs_server: 0, errors: 0 },
+      summary: { keys_synced: 0, ssr_orphans: 0, cf_untracked: 0, backfilled: 0, dns_fixed: 0, dns_deferred: 0, needs_server: 0, errors: 0 },
     })
   }
 
   const reports: KeyReport[] = []
   let backfilledTotal = 0
+  // Pass-3 step-7 DNS is ~4 sequential CF calls/domain (~5s). Cap how many
+  // we do per sync request so it never times out (nginx kills ~60s on
+  // prod). It's idempotent — domains keep their cf_a_record_id=NULL until
+  // done, so the operator just runs sync again to finish the rest.
+  const DNS_PER_RUN = Number(process.env.SSR_CF_SYNC_DNS_PER_RUN) || 6
+  let dnsOpsThisRun = 0
+  let dnsDeferred = 0
 
   for (const k of keys) {
     const report: KeyReport = {
@@ -285,7 +292,9 @@ export async function POST(req: NextRequest): Promise<Response> {
     )
     for (const dd of needDns) {
       if (!dd.server_id || !dd.ip) { report.needs_server.push(dd.domain); continue }
+      if (!dryRun && dnsOpsThisRun >= DNS_PER_RUN) { dnsDeferred++; continue }
       if (!dryRun) {
+        dnsOpsThisRun++
         try {
           const ok = await setupDomainDns(dd.domain, dd.ip)
           if (!ok) {
@@ -338,6 +347,7 @@ export async function POST(req: NextRequest): Promise<Response> {
     cf_untracked: reports.reduce((n, r) => n + r.cf_untracked.length, 0),
     backfilled: backfilledTotal,
     dns_fixed: reports.reduce((n, r) => n + r.dns_fixed.length, 0),
+    dns_deferred: dnsDeferred,
     needs_server: reports.reduce((n, r) => n + r.needs_server.length, 0),
     errors: reports.filter((r) => r.error !== null).length,
   }
@@ -362,6 +372,9 @@ export async function POST(req: NextRequest): Promise<Response> {
       `${summary.ssr_orphans} DB orphan(s) (zone gone on CF), ` +
       `${summary.cf_untracked} CF zone(s) not in DB, ` +
       `${summary.dns_fixed} domain(s) got step-7 DNS` +
+      (summary.dns_deferred > 0
+        ? `, ${summary.dns_deferred} more need DNS — RUN CF SYNC AGAIN to finish them`
+        : "") +
       (summary.needs_server > 0 ? `, ${summary.needs_server} need a server assigned` : "") +
       (summary.errors > 0 ? `, ${summary.errors} key(s) errored` : "") +
       (dryRun ? " — dry run, no writes" : ""),
