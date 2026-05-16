@@ -1047,6 +1047,11 @@ export default function ServersPage() {
           <FieldDescription className="text-status-terminal">
             Submit stays disabled until the typed name matches exactly.
           </FieldDescription>
+          <FieldDescription>
+            Over plain HTTP the “Copy” button can’t reach the clipboard.
+            Reliable way: <strong>click the name above</strong> (it selects),
+            press <strong>Ctrl/⌘+C</strong>, then <strong>Ctrl/⌘+V</strong> here.
+          </FieldDescription>
         </Field>
       </OperatorDialog>
 
