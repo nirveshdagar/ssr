@@ -107,6 +107,10 @@ const NORMALIZE_STATUS: Record<string, PipelineStatus> = {
   live: "live",
   canceled: "canceled",
   error: "retryable_error",
+  // Without this, a failed buy normalized to "pending" (the ?? fallback)
+  // and the /watcher RUNS filter — which never shows "pending" — hid it
+  // entirely, so the operator couldn't see or act on a failed purchase.
+  purchase_failed: "retryable_error",
   retryable_error: "retryable_error",
   terminal_error: "terminal_error",
   content_blocked: "terminal_error",
