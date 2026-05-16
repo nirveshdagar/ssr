@@ -12,6 +12,7 @@ import {
 } from "lucide-react"
 import { AppShell } from "@/components/ssr/app-shell"
 import { ConfigHealthBanner } from "@/components/ssr/config-health-banner"
+import { toast } from "sonner"
 import { KpiTile, KpiTileSkeleton } from "@/components/ssr/kpi-tile"
 import { StatusBadge } from "@/components/ssr/status-badge"
 import { PipelineProgress } from "@/components/ssr/pipeline-progress"
@@ -87,7 +88,8 @@ export default function DashboardPage() {
               const v = window.prompt("Domain to run pipeline on:")?.trim()
               if (!v) return
               const r = await domainActions.runPipeline(v)
-              window.alert(r.message ?? r.error ?? "submitted")
+              if (r.ok) toast.success(r.message ?? `Pipeline started for ${v}`)
+              else toast.error(r.error ?? r.message ?? `Failed to start pipeline for ${v}`)
             }}
           >
             <Plus className="h-3.5 w-3.5" /> New pipeline

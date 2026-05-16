@@ -7,6 +7,7 @@ import {
   Boxes, ShieldCheck, ArrowUp, ArrowDown, Replace, Pencil, Scissors, Upload, FileUp,
 } from "lucide-react"
 import useSWR from "swr"
+import { toast } from "sonner"
 import { AppShell } from "@/components/ssr/app-shell"
 import { StatusBadge } from "@/components/ssr/status-badge"
 import { OperatorDialog } from "@/components/ssr/operator-dialog"
@@ -597,7 +598,7 @@ function AppDrawer({
     const lnRaw = window.prompt("Line number to replace (1-indexed):", "1")
     if (!lnRaw) return
     const line = parseInt(lnRaw, 10)
-    if (!Number.isFinite(line) || line < 1) { alert("Invalid line number"); return }
+    if (!Number.isFinite(line) || line < 1) { toast.error("Invalid line number"); return }
     const repl = window.prompt(`New content for line ${line}:`, "")
     if (repl == null) return
     applyOp({ kind: "replace_line", line, replace: repl })
@@ -852,7 +853,7 @@ function BulkEditDialog({
 
   async function run() {
     const op = buildOp()
-    if (!op) { alert("Operation parameters incomplete"); return }
+    if (!op) { toast.error("Operation parameters incomplete"); return }
     if (!dryRun && !confirm(
       `You are about to modify ${targets.length} application(s). Each will get an index.php.bak ` +
       `backup before write. Continue?`,
@@ -867,7 +868,7 @@ function BulkEditDialog({
     const j = await r.json()
     setRunning(false)
     if (!j.ok) {
-      alert(`Bulk edit failed: ${j.error}`); return
+      toast.error(`Bulk edit failed: ${j.error}`); return
     }
     setProgress({ items: j.items, succeeded: j.succeeded, failed: j.failed, unchanged: j.unchanged })
     if (!dryRun) onDone({ succeeded: j.succeeded, failed: j.failed, unchanged: j.unchanged })
@@ -1023,16 +1024,16 @@ function UploadFileDialog({
 
   async function submit() {
     const fname = filename.trim()
-    if (!fname) { alert("Filename required"); return }
+    if (!fname) { toast.error("Filename required"); return }
     let content = body
     if (picked) {
       const fromFile = await readPickedFile()
-      if (fromFile == null) { alert("Failed to read selected file"); return }
+      if (fromFile == null) { toast.error("Failed to read selected file"); return }
       content = fromFile
       // If filename input is empty, use the picked file's name
       if (!filename.trim() && picked.name) setFilename(picked.name)
     }
-    if (!content) { alert("Content cannot be empty"); return }
+    if (!content) { toast.error("Content cannot be empty"); return }
     if (ctx.mode === "bulk" && !confirm(
       `Upload ${fname} (${content.length} bytes) to ${targetCount} app(s)?\n\n` +
       `Lands in /public_html/ on each. Existing files with the same name are overwritten.`,
@@ -1064,7 +1065,7 @@ function UploadFileDialog({
     })
     const j = await r.json()
     setRunning(false)
-    if (!j.ok) { alert(`Bulk upload failed: ${j.error}`); return }
+    if (!j.ok) { toast.error(`Bulk upload failed: ${j.error}`); return }
     setBulkProgress({ items: j.items, succeeded: j.succeeded, failed: j.failed })
     onDone(j.message ?? `Uploaded to ${j.succeeded}/${targetCount}`, j.failed === 0)
   }
