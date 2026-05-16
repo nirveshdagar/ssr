@@ -49,6 +49,7 @@ import {
 import { enqueueJob, registerHandler } from "./jobs"
 import {
   checkAvailability, purchaseDomain, setNameservers, listDomains as spaceshipListDomains,
+  getDomainInfo,
 } from "./spaceship"
 import {
   createZoneForDomain, getZoneStatus, fetchOriginCaCert, setupDomainDns,
@@ -755,22 +756,34 @@ async function step1BuyOrDetect(domain: string, skipPurchase: boolean): Promise<
     return true
   }
 
-  // Unavailable — is it in our Spaceship account? Paginate (cap 25/page)
+  // Unavailable — is it in our Spaceship account? Direct lookup first
+  // (GET /domains/{domain} 200 = owned): instant, and correct even when
+  // the account has >1000 domains where pagination would miss it. This is
+  // the path that catches a domain the operator just bought on Spaceship's
+  // website (card checkout) so the pipeline continues as bring-your-own.
   let foundHere = false
   try {
-    let skip = 0
-    for (let page = 0; page < 40; page++) {
-      const resp = await spaceshipListDomains(25, skip) as { items?: { name?: string }[]; data?: { name?: string }[] }
-      const items = resp.items ?? resp.data ?? []
-      if (items.some((it) => (it.name ?? "").toLowerCase() === domain.toLowerCase())) {
-        foundHere = true; break
+    await getDomainInfo(domain)
+    foundHere = true
+  } catch { /* not found via direct lookup — fall back to paginating */ }
+  // Fallback: paginate (cap 25/page) in case the direct lookup had a
+  // transient error but the domain is in the account.
+  if (!foundHere) {
+    try {
+      let skip = 0
+      for (let page = 0; page < 40; page++) {
+        const resp = await spaceshipListDomains(25, skip) as { items?: { name?: string }[]; data?: { name?: string }[] }
+        const items = resp.items ?? resp.data ?? []
+        if (items.some((it) => (it.name ?? "").toLowerCase() === domain.toLowerCase())) {
+          foundHere = true; break
+        }
+        if (items.length < 25) break
+        skip += 25
       }
-      if (items.length < 25) break
-      skip += 25
+    } catch (e) {
+      logPipeline(domain, "detect", "warning",
+        `Spaceship list_domains paging stopped: ${(e as Error).message}`)
     }
-  } catch (e) {
-    logPipeline(domain, "detect", "warning",
-      `Spaceship list_domains paging stopped: ${(e as Error).message}`)
   }
   if (foundHere) {
     updateStep(domain, 1, "completed", "Bring-your-own (found in Spaceship account)")
