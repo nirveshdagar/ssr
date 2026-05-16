@@ -3,6 +3,7 @@ import { all, one, run } from "@/lib/db"
 import { appendAudit } from "@/lib/repos/audit"
 import { logPipeline } from "@/lib/repos/logs"
 import { decrypt } from "@/lib/secrets-vault"
+import { setupDomainDns } from "@/lib/cloudflare"
 
 export const runtime = "nodejs"
 
@@ -55,6 +56,12 @@ interface KeyReport {
   /** DB rows where cf_zone_id is null/stale BUT a name match exists on CF —
    *  backfilled cf_zone_id (and cf_account_id) on this run. */
   backfilled: { domain: string; before_zone_id: string | null; after_zone_id: string }[]
+  /** Externally-added domains that had no A record and a server — full
+   *  step-7 DNS setup (A @+www proxied, SSL full, always-HTTPS) applied. */
+  dns_fixed: { domain: string; ip: string }[]
+  /** Linked domains with no A record AND no server assigned — can't point
+   *  an A record anywhere; surfaced so the operator assigns a server. */
+  needs_server: string[]
   error: string | null
 }
 
@@ -95,7 +102,7 @@ export async function POST(req: NextRequest): Promise<Response> {
       ok: true,
       message: "No active CF keys to sync",
       reports: [] as KeyReport[],
-      summary: { keys_synced: 0, ssr_orphans: 0, cf_untracked: 0, backfilled: 0, errors: 0 },
+      summary: { keys_synced: 0, ssr_orphans: 0, cf_untracked: 0, backfilled: 0, dns_fixed: 0, needs_server: 0, errors: 0 },
     })
   }
 
@@ -112,6 +119,8 @@ export async function POST(req: NextRequest): Promise<Response> {
       ssr_orphans: [],
       cf_untracked: [],
       backfilled: [],
+      dns_fixed: [],
+      needs_server: [],
       error: null,
     }
 
@@ -260,6 +269,47 @@ export async function POST(req: NextRequest): Promise<Response> {
       })
     }
 
+    // Pass 3: externally-added domains assigned to this key that still
+    // have NO A record. They never ran pipeline step 7, so give them the
+    // full step-7 DNS setup (A @+www -> server IP proxied, SSL full,
+    // always-HTTPS) so they behave exactly like pipeline-built domains.
+    // Domains with no server can't point an A record anywhere — surface
+    // them instead. dry_run previews without writing to Cloudflare.
+    const needDns = all<{
+      domain: string; server_id: number | null; cf_a_record_id: string | null; ip: string | null
+    }>(
+      `SELECT d.domain, d.server_id, d.cf_a_record_id, s.ip
+         FROM domains d LEFT JOIN servers s ON s.id = d.server_id
+        WHERE d.cf_key_id = ? AND (d.cf_a_record_id IS NULL OR d.cf_a_record_id = '')`,
+      k.id,
+    )
+    for (const dd of needDns) {
+      if (!dd.server_id || !dd.ip) { report.needs_server.push(dd.domain); continue }
+      if (!dryRun) {
+        try {
+          const ok = await setupDomainDns(dd.domain, dd.ip)
+          if (!ok) {
+            logPipeline(dd.domain, "cf_sync", "warning",
+              `Step-7 DNS setup returned false (-> ${dd.ip}); will retry next sync`)
+            continue
+          }
+          try {
+            const { captureCfRecordIds } = await import("@/lib/migration")
+            await captureCfRecordIds(dd.domain)
+          } catch { /* record-id cache is non-fatal */ }
+          logPipeline(dd.domain, "cf_sync", "completed",
+            `Step-7 DNS applied (A @+www -> ${dd.ip} proxied, SSL full, ` +
+            `always-HTTPS) — externally-added domain`)
+          backfilledTotal++
+        } catch (e) {
+          logPipeline(dd.domain, "cf_sync", "failed",
+            `Step-7 DNS setup failed: ${(e as Error).message}`)
+          continue
+        }
+      }
+      report.dns_fixed.push({ domain: dd.domain, ip: dd.ip })
+    }
+
     // Reconcile the denormalized cf_keys.domains_used counter. It's only
     // ever +1'd inside assignCfKeyToDomain, so domains linked any other
     // way (this sync's backfill/link, SA-import, bulk-import) never bumped
@@ -287,6 +337,8 @@ export async function POST(req: NextRequest): Promise<Response> {
     ssr_orphans: reports.reduce((n, r) => n + r.ssr_orphans.length, 0),
     cf_untracked: reports.reduce((n, r) => n + r.cf_untracked.length, 0),
     backfilled: backfilledTotal,
+    dns_fixed: reports.reduce((n, r) => n + r.dns_fixed.length, 0),
+    needs_server: reports.reduce((n, r) => n + r.needs_server.length, 0),
     errors: reports.filter((r) => r.error !== null).length,
   }
 
@@ -308,7 +360,9 @@ export async function POST(req: NextRequest): Promise<Response> {
       `Synced ${summary.keys_synced}/${keys.length} key(s). ` +
       `Backfilled ${summary.backfilled}, ` +
       `${summary.ssr_orphans} DB orphan(s) (zone gone on CF), ` +
-      `${summary.cf_untracked} CF zone(s) not in DB` +
+      `${summary.cf_untracked} CF zone(s) not in DB, ` +
+      `${summary.dns_fixed} domain(s) got step-7 DNS` +
+      (summary.needs_server > 0 ? `, ${summary.needs_server} need a server assigned` : "") +
       (summary.errors > 0 ? `, ${summary.errors} key(s) errored` : "") +
       (dryRun ? " — dry run, no writes" : ""),
   })
