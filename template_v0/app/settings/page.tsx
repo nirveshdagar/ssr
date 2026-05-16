@@ -28,6 +28,7 @@ import {
   Radio,
 } from "lucide-react"
 import { AppShell } from "@/components/ssr/app-shell"
+import { RequiredSettingsBanner } from "@/components/ssr/required-settings-banner"
 import { Button } from "@/components/ui/button"
 import { Field, FieldGroup, FieldLabel, FieldDescription } from "@/components/ui/field"
 import { InputGroup, InputGroupInput, InputGroupAddon } from "@/components/ui/input-group"
@@ -189,6 +190,7 @@ export default function SettingsPage() {
         settings.has_password ? <LogoutButton /> : null
       }
     >
+      <RequiredSettingsBanner values={settings as unknown as Record<string, unknown>} />
       <div className="grid grid-cols-1 lg:grid-cols-[220px_1fr] gap-6">
         <aside className="lg:sticky lg:top-[120px] lg:self-start">
           <nav aria-label="Settings sections">
