@@ -1601,7 +1601,10 @@ function CliAuthPanel({
       if (!r.ok) return
       const j = (await r.json()) as CliStatusResp
       setStatus(j)
-    } catch { /* leave previous status */ }
+    } catch (e) {
+      // Keep previous status, but don't fail silently — observability.
+      console.warn("[settings] LLM CLI status poll failed:", e)
+    }
   }, [provider])
 
   React.useEffect(() => {
@@ -2024,8 +2027,10 @@ function LogoutButton() {
     setBusy(true)
     try {
       await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" })
-    } catch {
-      /* swallow — cookie may already be cleared */
+    } catch (e) {
+      // Best-effort: cookie may already be cleared; redirect happens
+      // regardless. Log so it's not a fully silent failure.
+      console.warn("[settings] logout request failed:", e)
     } finally {
       window.location.assign("/login")
     }
