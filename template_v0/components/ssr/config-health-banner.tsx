@@ -24,8 +24,30 @@ const LABELS: Record<string, string> = {
  * separate-DB Spaceship/registrant gap that cost days) is obvious at a
  * glance instead of only surfacing when a pipeline fails.
  */
+function RecheckButton(
+  { label, busy, onRun }: { label: string; busy: boolean; onRun: () => void },
+) {
+  return (
+    <button
+      onClick={onRun}
+      disabled={busy}
+      className="inline-flex items-center gap-1 text-micro text-muted-foreground hover:text-foreground disabled:opacity-60"
+    >
+      <RefreshCw className={cn("h-3 w-3", busy && "animate-spin")} />
+      {busy ? "Rechecking…" : label}
+    </button>
+  )
+}
+
 export function ConfigHealthBanner() {
   const { report, error, isLoading, refresh } = usePreflight()
+  // Recheck hits live CF/DO/SA/Spaceship — ~10s. Without a busy state the
+  // button looked dead ("checker button does not work"). Show a spinner.
+  const [rechecking, setRechecking] = React.useState(false)
+  const doRecheck = React.useCallback(async () => {
+    setRechecking(true)
+    try { await refresh() } finally { setRechecking(false) }
+  }, [refresh])
 
   if (isLoading && !report) {
     return (
@@ -38,9 +60,7 @@ export function ConfigHealthBanner() {
     return (
       <div className="flex items-center justify-between gap-2 rounded-md border border-status-waiting/40 bg-status-waiting/10 px-4 py-2.5 text-small">
         <span className="text-status-waiting">Couldn’t run config health check.</span>
-        <button onClick={() => refresh()} className="inline-flex items-center gap-1 text-micro text-muted-foreground hover:text-foreground">
-          <RefreshCw className="h-3 w-3" /> Retry
-        </button>
+        <RecheckButton label="Retry" busy={rechecking} onRun={doRecheck} />
       </div>
     )
   }
@@ -54,9 +74,7 @@ export function ConfigHealthBanner() {
           <CheckCircle2 className="h-3.5 w-3.5 text-status-completed" />
           Environment config OK ({Object.keys(report.checks).length} checks)
         </span>
-        <button onClick={() => refresh()} className="inline-flex items-center gap-1 text-micro text-muted-foreground hover:text-foreground">
-          <RefreshCw className="h-3 w-3" /> Recheck
-        </button>
+        <RecheckButton label="Recheck" busy={rechecking} onRun={doRecheck} />
       </div>
     )
   }
@@ -68,9 +86,7 @@ export function ConfigHealthBanner() {
           <AlertTriangle className="h-4 w-4" />
           Environment config problem — {failing.length} of {Object.keys(report.checks).length} checks failing
         </span>
-        <button onClick={() => refresh()} className="inline-flex items-center gap-1 text-micro text-muted-foreground hover:text-foreground">
-          <RefreshCw className="h-3 w-3" /> Recheck
-        </button>
+        <RecheckButton label="Recheck" busy={rechecking} onRun={doRecheck} />
       </div>
       <ul className="mt-2 flex flex-col gap-1">
         {failing.map(([key, c]) => (

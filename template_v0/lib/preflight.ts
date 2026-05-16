@@ -171,15 +171,19 @@ export function checkServerCapacity(): CheckResult {
       },
     )
   }
+  // No spare ready capacity is NOT a config error: the pipeline
+  // provisions a droplet on demand. The real prerequisite — a healthy DO
+  // token — is its own check (checkDoToken). Returning fail() here just
+  // made the dashboard banner cry wolf on a normal/idle fleet.
   if (rows.length > 0) {
-    return fail(
-      `All ${rows.length} ready server(s) are at max_sites. ` +
-      `Pipeline will try to provision a new droplet.`,
+    return ok(
+      `All ${rows.length} ready server(s) at max_sites — pipeline will ` +
+      `provision a new droplet on demand.`,
     )
   }
-  return fail(
-    "No ready servers. Pipeline will try to provision a new droplet " +
-    "(requires healthy DO token).",
+  return ok(
+    "No ready servers yet — the pipeline provisions a droplet on demand. " +
+    "Not a config error (the DO-token prerequisite has its own check).",
   )
 }
 

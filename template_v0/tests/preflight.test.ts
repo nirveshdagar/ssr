@@ -74,11 +74,14 @@ describe("preflight (offline checks only)", () => {
     expect(checkRootPassword().ok).toBe(true)
   })
 
-  it("checkServerCapacity fails when no servers", async () => {
+  it("checkServerCapacity is informational (ok) when no ready servers — pipeline auto-provisions", async () => {
     const { checkServerCapacity } = await import("@/lib/preflight")
     const r = checkServerCapacity()
-    expect(r.ok).toBe(false)
-    expect(r.message).toMatch(/No ready servers/)
+    // Regression: this used to fail() and red-flag the dashboard banner
+    // even though "no ready servers" is normal (pipeline provisions on
+    // demand; the DO token has its own check).
+    expect(r.ok).toBe(true)
+    expect(r.message).toMatch(/provisions a droplet on demand/)
   })
 
   it("checkSpaceshipAuth skipped when skipPurchase=true", async () => {
