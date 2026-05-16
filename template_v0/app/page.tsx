@@ -11,6 +11,7 @@ import {
   RefreshCw,
 } from "lucide-react"
 import { AppShell } from "@/components/ssr/app-shell"
+import { ConfigHealthBanner } from "@/components/ssr/config-health-banner"
 import { KpiTile, KpiTileSkeleton } from "@/components/ssr/kpi-tile"
 import { StatusBadge } from "@/components/ssr/status-badge"
 import { PipelineProgress } from "@/components/ssr/pipeline-progress"
@@ -174,6 +175,10 @@ export default function DashboardPage() {
           />
           </>}
         </section>
+
+        {/* Config health — loud when the environment is misconfigured
+            (the separate-DB Spaceship/registrant gap that cost days). */}
+        <ConfigHealthBanner />
 
         {/* Two-up: active runs + activity */}
         <section className="grid grid-cols-1 lg:grid-cols-3 gap-3">
