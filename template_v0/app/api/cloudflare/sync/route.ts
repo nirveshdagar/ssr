@@ -15,6 +15,7 @@ interface KeyRow {
   alias: string | null
   cf_account_id: string | null
   is_active: number
+  domains_used: number
 }
 
 interface CfZone {
@@ -86,7 +87,7 @@ export async function POST(req: NextRequest): Promise<Response> {
   const dryRun = ((form?.get("dry_run") as string | null) || "") === "on"
 
   const keys = all<KeyRow>(
-    `SELECT id, email, api_key, alias, cf_account_id, is_active
+    `SELECT id, email, api_key, alias, cf_account_id, is_active, domains_used
        FROM cf_keys WHERE is_active = 1 ORDER BY id ASC`,
   )
   if (keys.length === 0) {
@@ -267,11 +268,14 @@ export async function POST(req: NextRequest): Promise<Response> {
     const realCount = one<{ n: number }>(
       `SELECT COUNT(*) AS n FROM domains WHERE cf_key_id = ?`, k.id,
     )?.n ?? 0
-    if (!dryRun && realCount !== report.domains_tracked) {
+    // Compare against the STORED counter (k.domains_used), not
+    // report.domains_tracked — the latter is itself COUNT(cf_key_id=k.id)
+    // so it always equalled realCount and the update never fired.
+    if (!dryRun && realCount !== k.domains_used) {
       run(`UPDATE cf_keys SET domains_used = ? WHERE id = ?`, realCount, k.id)
       logPipeline("", "cf_sync", "completed",
         `Recomputed cf_keys[id=${k.id} ${k.alias ?? k.email}].domains_used ` +
-        `${report.domains_tracked} -> ${realCount}`)
+        `${k.domains_used} -> ${realCount}`)
     }
     report.domains_tracked = realCount
 
