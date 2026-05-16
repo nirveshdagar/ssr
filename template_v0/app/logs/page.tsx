@@ -52,6 +52,10 @@ function LogsPageInner() {
   const [domainFilter, setDomainFilter] = React.useState<string | null>(sp.get("domain"))
   const [query, setQuery] = React.useState(sp.get("q") ?? "")
   const [stepFilter, setStepFilter] = React.useState<string | null>(sp.get("step"))
+  // Rows fetched (most-recent N). Was hard-pinned at 500, silently hiding
+  // older history; the API already supports up to 5000.
+  const [rowLimit, setRowLimit] = React.useState<number>(500)
+  const ROW_OPTIONS = [500, 1000, 2000, 5000]
 
   // Reflect filters back into the URL so the view is shareable + bookmarkable.
   React.useEffect(() => {
@@ -68,7 +72,7 @@ function LogsPageInner() {
     return () => window.clearTimeout(id)
   }, [level, domainFilter, stepFilter, query, pathname, router])
 
-  const { events: LOG_EVENTS } = useLogs({ domain: domainFilter, limit: 500 })
+  const { events: LOG_EVENTS } = useLogs({ domain: domainFilter, limit: rowLimit })
   const { rows: DOMAINS } = useDomains()
 
   const counts: Record<string, number> = { all: LOG_EVENTS.length, info: 0, warn: 0, error: 0, debug: 0 }
@@ -218,8 +222,28 @@ function LogsPageInner() {
                 <X className="h-3.5 w-3.5" /> Clear
               </Button>
             )}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="outline" size="sm" className="gap-1.5"
+                  title="How many of the most-recent log rows to load (API supports up to 5000)"
+                >
+                  {rowLimit} rows
+                  <ChevronDown className="h-3.5 w-3.5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="w-40">
+                <DropdownMenuLabel>Rows to load</DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                {ROW_OPTIONS.map((n) => (
+                  <DropdownMenuItem key={n} onClick={() => setRowLimit(n)}>
+                    {n.toLocaleString()} {n === rowLimit ? "✓" : ""}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
             <div className="ml-auto text-micro text-muted-foreground">
-              {filtered.length} of {LOG_EVENTS.length}
+              {filtered.length} of {LOG_EVENTS.length} (last {rowLimit.toLocaleString()})
             </div>
           </DataTableToolbar>
 
