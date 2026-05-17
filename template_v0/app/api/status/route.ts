@@ -55,7 +55,21 @@ export async function GET(_req: NextRequest): Promise<Response> {
   const domains = listDomains()
   const recentLogs = listPipelineLogs({ limit: 10 })
   const active = getAllActiveWatchers()
-  const watcherRuns = domains.filter((d) => WATCHER_RUN_STATUSES.has(d.status)).length
+  // Lockstep with the app/watcher/page.tsx RUNS filter: a domain is an
+  // active "run" when its status is in the watcher bucket OR it has a
+  // step_tracker row running RIGHT NOW. The latter is what a HEALTHY
+  // in-flight pipeline looks like — its status sits at a progress value
+  // (`cf_assigned`, `zone_created`, `provisioned`, …), none of which are
+  // in WATCHER_RUN_STATUSES — so the old status-only count showed 0 in
+  // the sidebar while the watcher page correctly showed the run.
+  // Dismissed domains drop out UNLESS a worker is actively running one
+  // (an in-flight run is never hidden — mirrors the page).
+  const activeSet = new Set(active)
+  const watcherRuns = domains.filter((d) => {
+    const watched = WATCHER_RUN_STATUSES.has(d.status) || activeSet.has(d.domain)
+    const dismissed = (d.watcher_dismissed ?? 0) === 1
+    return watched && (!dismissed || activeSet.has(d.domain))
+  }).length
 
   const serverCount = one<{ n: number }>(`SELECT COUNT(*) AS n FROM servers`)?.n ?? 0
   const cfKeyCount = one<{ n: number }>(`SELECT COUNT(*) AS n FROM cf_keys`)?.n ?? 0
