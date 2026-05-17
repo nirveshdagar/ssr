@@ -346,7 +346,7 @@ async function probeDropletFastDead(dropletId: string): Promise<string | null> {
   }
 }
 
-async function checkDeadServers(
+export async function checkDeadServers(
   byServer: Map<number, { domain: string; downStreak: number }[]>,
 ): Promise<void> {
   const thresholdRaw = parseInt(getSetting("dead_server_threshold_ticks") || "10", 10)
@@ -389,37 +389,58 @@ async function checkDeadServers(
     const entries = byServer.get(s.id)
     if (!entries || entries.length === 0) continue
     const allDown = entries.every((e) => e.downStreak >= threshold)
+    const worst = entries.reduce((m, e) => Math.max(m, e.downStreak), 0)
 
-    // Fast-path #1: if all domains on this server have failed at least 2 ticks
-    // AND DO confirms the droplet is gone (404) or archived, declare dead
-    // NOW instead of waiting for the full threshold. Saves up to ~9 minutes
-    // on the default 10-tick × 60-s setup when an operator deletes the
-    // droplet from the DO console.
-    let fastReason: string | null = null
-    if (!allDown && s.do_droplet_id && entries.every((e) => e.downStreak >= 2)) {
-      fastReason = await probeDropletFastDead(s.do_droplet_id)
+    // "Down enough to even investigate this server." Slow path = the full
+    // threshold; DO fast-gate = 2 ticks (a 404/archive is hard evidence so
+    // we may act sooner); SA fast-gate = saFastGate (SA's agent_status
+    // flaps, so it needs many more ticks). Below all of these → ignore.
+    const downEnough =
+      allDown ||
+      (s.do_droplet_id != null && entries.every((e) => e.downStreak >= 2)) ||
+      (s.sa_server_id != null && entries.every((e) => e.downStreak >= saFastGate))
+    if (!downEnough) continue
+
+    // HARD RULE — the false-dead fix. "All sites down" is necessary but
+    // NEVER sufficient to declare a SERVER dead and migrate it. Migration
+    // is expensive and near-irreversible (fresh $$ droplet + prod domain
+    // churn + old box torn down), and all-sites-down is FAR more often a
+    // site/SSL/CF/nginx fault on a perfectly ALIVE droplet than an actual
+    // dead box. So before ever migrating, REQUIRE positive proof the box
+    // itself is gone: DO reports the droplet 404/archived, OR SA
+    // re-confirms (two polls) the agent is offline/disconnected. The old
+    // slow path skipped these probes entirely once allDown was true and
+    // migrated on HTTPS-failure alone — that is what kept killing healthy
+    // servers and double-provisioning. If neither probe confirms death,
+    // the server is alive: refuse to migrate, log loudly, and leave the
+    // real (site-level) cause to auto-heal / the operator.
+    let deadReason: string | null = null
+    if (s.do_droplet_id) deadReason = await probeDropletFastDead(s.do_droplet_id)
+    if (!deadReason && s.sa_server_id) deadReason = await probeSaAgentDead(s.sa_server_id)
+
+    if (!deadReason) {
+      const why = (!s.do_droplet_id && !s.sa_server_id)
+        ? "no DO/SA handle on this server row, so liveness is unverifiable — " +
+          "NOT migrating on HTTPS-failure alone"
+        : "DO/SA confirm the droplet + agent are ALIVE"
+      logPipeline(`server-${s.id}`, "dead_detect", "warning",
+        `Server #${s.id} (${s.name} / ${s.ip}): all ${entries.length} site(s) ` +
+        `failing HTTPS for ${worst}+ tick(s), but ${why}. This is a ` +
+        `site/SSL/CF/nginx problem, NOT server death — REFUSING to migrate ` +
+        `(migrating would burn a fresh droplet for nothing). Fix the site ` +
+        `cause; auto-heal + the next live-check tick will re-evaluate.`)
+      continue
     }
-    // Fast-path #2: SA-API agent status. Needs saFastGate consecutive
-    // HTTPS-failure ticks (NOT 2 — SA's agent_status flaps, so this path
-    // must not be near-instant) AND probeSaAgentDead re-confirms SA says
-    // the agent is offline/disconnected across two polls.
-    if (!allDown && !fastReason && s.sa_server_id && entries.every((e) => e.downStreak >= saFastGate)) {
-      fastReason = await probeSaAgentDead(s.sa_server_id)
-    }
-    if (!allDown && !fastReason) continue
 
     // Short-circuit: already migrating
     if (migrating.has(s.id)) continue
     migrating.add(s.id)
 
     run(`UPDATE servers SET status='dead' WHERE id = ?`, s.id)
-    const worst = entries.reduce((m, e) => Math.max(m, e.downStreak), 0)
-    const msg = fastReason
-      ? `Server #${s.id} (${s.name} / ${s.ip}) marked DEAD via fast-path — ` +
-        `${fastReason} · ${entries.length} domain(s) failing for ${worst}+ tick(s)`
-      : `Server #${s.id} (${s.name} / ${s.ip}) marked DEAD — ` +
-        `all ${entries.length} domains down for ${worst}+ ticks (threshold=${threshold})`
-    logPipeline(`server-${s.id}`, "dead_detect", "warning", msg)
+    logPipeline(`server-${s.id}`, "dead_detect", "warning",
+      `Server #${s.id} (${s.name} / ${s.ip}) marked DEAD — server-liveness ` +
+      `CONFIRMED gone: ${deadReason} · ${entries.length} site(s) failing for ` +
+      `${worst}+ tick(s) (threshold=${threshold})`)
 
     // Multi-channel alert (best-effort — notify module is wired separately)
     try {
