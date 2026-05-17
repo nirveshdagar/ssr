@@ -117,3 +117,31 @@ describe("pipeline handlers register without conflict", () => {
     expect(() => registerPipelineHandlers()).not.toThrow()
   })
 })
+
+describe("isSaCreateAppMaybeDuplicate (step 7 SA-500 recovery classifier)", () => {
+  it("flags the EXACT generic SA create-app 500 the operator hit", async () => {
+    const { isSaCreateAppMaybeDuplicate } = await import("@/lib/pipeline")
+    // Verbatim from the report — must trigger the findAppId reuse probe,
+    // NOT loop on retryable_error.
+    expect(isSaCreateAppMaybeDuplicate(
+      `SA createApplication: All SA tokens failed — primary: HTTP 500 — ` +
+      `{"message":"Something went really wrong while creating custom application!"}`,
+    )).toBe(true)
+  })
+
+  it("still flags SA's explicit duplicate validation messages", async () => {
+    const { isSaCreateAppMaybeDuplicate } = await import("@/lib/pipeline")
+    expect(isSaCreateAppMaybeDuplicate("Application name already exists")).toBe(true)
+    expect(isSaCreateAppMaybeDuplicate("Application domain already exists")).toBe(true)
+    expect(isSaCreateAppMaybeDuplicate("App already exists on this server")).toBe(true)
+  })
+
+  it("does NOT flag unrelated SA / pipeline failures (no false reuse-probe)", async () => {
+    const { isSaCreateAppMaybeDuplicate } = await import("@/lib/pipeline")
+    expect(isSaCreateAppMaybeDuplicate("HTTP 401 unauthorized — bad SA token")).toBe(false)
+    expect(isSaCreateAppMaybeDuplicate("CF DNS setup: zone not active")).toBe(false)
+    expect(isSaCreateAppMaybeDuplicate("Something went wrong while deleting application.")).toBe(false)
+    expect(isSaCreateAppMaybeDuplicate("ECONNREFUSED sa.api:443")).toBe(false)
+    expect(isSaCreateAppMaybeDuplicate("")).toBe(false)
+  })
+})

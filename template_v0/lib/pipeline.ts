@@ -1075,27 +1075,36 @@ async function step7CreateAppAndDns(domain: string, server: ServerRow): Promise<
     // "already there" — look up the existing app id and continue. Mirrors
     // the same idempotent-on-create pattern step 3 (CF zone) uses.
     const msg = (e as Error).message
-    const isDup = /already exists/i.test(msg) ||
-      /Application name already exists/i.test(msg) ||
-      /Application domain already exists/i.test(msg)
-    if (isDup) {
+    // SA returns its GENERIC HTTP 500 ("...creating custom application!")
+    // for partial-state duplicate collisions, NOT an "already exists"
+    // message. Probe SA and REUSE a pre-existing app instead of looping
+    // on retryable_error forever. Only reuse one that actually exists;
+    // otherwise fail exactly as before (a genuine SA/agent-side failure).
+    if (isSaCreateAppMaybeDuplicate(msg)) {
+      let existing: string | null = null
       try {
-        const existing = await findAppId(server.sa_server_id!, domain)
-        if (!existing) {
-          updateStep(domain, 7, "failed",
-            `SA says app exists but findAppId returned null: ${msg}`)
-          updateDomain(domain, { status: "retryable_error" })
-          return false
-        }
-        appId = existing
-        logPipeline(domain, "sa_create_app", "warning",
-          `App ${appId} already exists on SA — reusing instead of failing`)
+        existing = await findAppId(server.sa_server_id!, domain)
       } catch (lookupErr) {
         updateStep(domain, 7, "failed",
-          `SA app exists but findAppId threw: ${(lookupErr as Error).message}`)
+          `SA createApplication failed; existing-app lookup also threw: ` +
+          `${(lookupErr as Error).message} (orig: ${msg.slice(0, 200)})`)
         updateDomain(domain, { status: "retryable_error" })
         return false
       }
+      if (!existing) {
+        // Nothing on the server to reuse → this was a real SA/agent-side
+        // failure, not a duplicate. Retry later (auto-heal / operator);
+        // if the server's agent is actually dead the live-checker owns
+        // that path.
+        updateStep(domain, 7, "failed",
+          `SA createApplication failed and no existing app found to reuse: ${msg.slice(0, 300)}`)
+        updateDomain(domain, { status: "retryable_error" })
+        return false
+      }
+      appId = existing
+      logPipeline(domain, "sa_create_app", "warning",
+        `createApplication 500'd but app ${appId} already exists on SA ` +
+        `(partial-create collision) — reusing it instead of failing`)
     } else {
       updateStep(domain, 7, "failed", `SA createApplication: ${msg}`)
       updateDomain(domain, { status: "retryable_error" })
@@ -1295,6 +1304,27 @@ export function isPermanentLlmError(msg: string): boolean {
   if (/model[_\s-]?not[_\s-]?found/i.test(m)) return true
   if (/unsupported\s+model/i.test(m)) return true
   if (/incorrect\s+api\s+key/i.test(m)) return true
+  return false
+}
+
+/**
+ * SA's create-custom-application endpoint returns HTTP 500 with a GENERIC
+ * body ("Something went really wrong while creating custom application!")
+ * for what are really duplicate / partial-state collisions — a prior run
+ * created the app (or its system user / vhost) then died before recording
+ * the appId, so the retry collides. SA does NOT emit an "already exists"
+ * message in that case, and token failover is useless (deterministic, not
+ * auth/load — that's why the operator sees "All SA tokens failed").
+ *
+ * Returns true when the error MIGHT mean the app is already on the server,
+ * so step 7 should probe SA (findAppId) and reuse it instead of looping on
+ * retryable_error forever. The caller only ever reuses an app that
+ * demonstrably exists, so a true here never masks a genuine failure.
+ */
+export function isSaCreateAppMaybeDuplicate(msg: string): boolean {
+  const m = String(msg)
+  if (/already exists/i.test(m)) return true               // explicit SA dup
+  if (/creating custom application/i.test(m)) return true   // SA's generic 500 catch-all
   return false
 }
 
