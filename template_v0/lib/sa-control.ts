@@ -27,6 +27,7 @@ import { getSetting } from "./repos/settings"
 import { logPipeline } from "./repos/logs"
 import { listServers as listDbServers } from "./repos/servers"
 import { listDomains } from "./repos/domains"
+import { parseVhostProbe, decideQuarantine, type QuarantineDecision } from "./vhost-guard"
 import {
   SshSession,
   listServers as listSaServers,
@@ -709,6 +710,126 @@ export async function restartPhpFpm(serverIp: string): Promise<{ ok: boolean; ou
       ok ? "completed" : "failed",
       `PHP-FPM restart: ${r.stdout.slice(0, 200)}`)
     return { ok, output: r.stdout || r.stderr || "" }
+  } finally {
+    ssh?.close()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Apache vhost blast-radius guard — read-only probe + surgical quarantine.
+// A single partial-create vhost (missing DocumentRoot/ErrorLog dir) makes
+// `apache2ctl configtest` FATAL → apache won't start → EVERY site on the
+// droplet down. This detects that exact condition and parks ONLY the
+// provably-broken conf(s), then reloads — converting a whole-box outage
+// into one parked site. Decision logic is the unit-tested vhost-guard.ts;
+// this is the SSH execution. Reuses openSsh (server_root_password).
+// ---------------------------------------------------------------------------
+
+export interface VhostGuardResult {
+  ok: boolean
+  acted: boolean
+  decision: QuarantineDecision | null
+  quarantined: string[]
+  configtestOkAfter: boolean | null
+  reloaded: boolean
+  message: string
+}
+
+// Safety: only ever move files matching SA's conf naming under sites-enabled.
+const SAFE_CONF = /^\/etc\/apache2\/sites-enabled\/[A-Za-z0-9._-]+\.conf$/
+
+const PROBE_SCRIPT = [
+  "echo CONFIGTEST_START",
+  "apache2ctl configtest 2>&1",
+  'echo "CONFIGTEST_END rc=$?"',
+  'for f in /etc/apache2/sites-enabled/*.conf; do',
+  '  [ -e "$f" ] || continue',
+  `  dr=$(grep -hoP '^\\s*DocumentRoot\\s+\\K\\S+' "$f" 2>/dev/null | head -1 | tr -d '"')`,
+  `  el=$(grep -hoP '^\\s*ErrorLog\\s+\\K\\S+' "$f" 2>/dev/null | head -1 | tr -d '"')`,
+  '  eld=""; [ -n "$el" ] && eld=$(dirname "$el")',
+  '  drx=N; [ -n "$dr" ] && [ -d "$dr" ] && drx=Y',
+  '  elx=N; [ -n "$eld" ] && [ -d "$eld" ] && elx=Y',
+  '  echo "VHOST|$f|dr=$dr|drx=$drx|eld=$eld|elx=$elx"',
+  "done",
+].join("\n")
+
+/**
+ * @param dryRun when true (default), probe + decide ONLY — never moves a
+ *   file or touches apache. The unattended sweep passes dryRun=false.
+ */
+export async function quarantineBrokenVhosts(
+  serverIp: string,
+  dryRun = true,
+): Promise<VhostGuardResult> {
+  let ssh: SshSession | null = null
+  try {
+    ssh = await openSsh(serverIp)
+    const probeRaw = (await ssh.exec(PROBE_SCRIPT, { timeoutMs: 25_000 })).stdout
+    const probe = parseVhostProbe(probeRaw)
+    const decision = decideQuarantine(probe)
+
+    if (!decision.act) {
+      return {
+        ok: true, acted: false, decision, quarantined: [],
+        configtestOkAfter: probe.configtestOk, reloaded: false,
+        message: decision.reason,
+      }
+    }
+    // Belt-and-suspenders: never move anything outside the SA conf shape.
+    const targets = decision.quarantine
+      .map((q) => q.conf)
+      .filter((c) => SAFE_CONF.test(c))
+    if (targets.length === 0) {
+      return {
+        ok: false, acted: false, decision, quarantined: [],
+        configtestOkAfter: false, reloaded: false,
+        message: "broken confs failed the safe-path allowlist — refusing to move anything",
+      }
+    }
+    if (dryRun) {
+      return {
+        ok: true, acted: false, decision, quarantined: targets,
+        configtestOkAfter: false, reloaded: false,
+        message: `DRY-RUN — would quarantine ${targets.length} conf(s): ${targets.join(", ")}`,
+      }
+    }
+
+    const mv = targets.map((c) => `mv ${JSON.stringify(c)} /etc/apache2/sites-quarantined/ 2>&1`).join(" ; ")
+    const actScript = [
+      "mkdir -p /etc/apache2/sites-quarantined",
+      mv,
+      "echo CONFIGTEST_START",
+      "apache2ctl configtest 2>&1",
+      'echo "CONFIGTEST_END rc=$?"',
+      "if apache2ctl configtest >/dev/null 2>&1; then",
+      "  systemctl reload apache2 2>&1 || systemctl restart apache2 2>&1",
+      '  echo "RELOADED=$?"; systemctl is-active apache2',
+      "else",
+      '  echo "RELOAD_SKIPPED configtest still failing"',
+      "fi",
+    ].join("\n")
+    const res = (await ssh.exec(actScript, { timeoutMs: 30_000 })).stdout
+    const after = parseVhostProbe(res) // reuses CONFIGTEST_START/END markers
+    const reloaded = /RELOADED=0/.test(res) && /^active$/m.test(res)
+    logPipeline(`server-ssh-${serverIp}`, "vhost_guard",
+      after.configtestOk && reloaded ? "completed" : "warning",
+      `Quarantined ${targets.length} broken vhost(s): ${targets.join(", ")} · ` +
+      `configtest now ${after.configtestOk ? "OK" : "STILL FAILING"} · ` +
+      `apache ${reloaded ? "reloaded" : "NOT reloaded"}`)
+    return {
+      ok: after.configtestOk && reloaded,
+      acted: true, decision, quarantined: targets,
+      configtestOkAfter: after.configtestOk, reloaded,
+      message: `Parked ${targets.join(", ")}; configtest ` +
+        `${after.configtestOk ? "OK" : "still failing"}; apache ` +
+        `${reloaded ? "reloaded (sites back up)" : "NOT reloaded"}`,
+    }
+  } catch (e) {
+    return {
+      ok: false, acted: false, decision: null, quarantined: [],
+      configtestOkAfter: null, reloaded: false,
+      message: `vhost-guard SSH failed for ${serverIp}: ${(e as Error).message}`,
+    }
   } finally {
     ssh?.close()
   }

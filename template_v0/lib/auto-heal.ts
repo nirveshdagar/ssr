@@ -1495,6 +1495,7 @@ export interface AutoHealTickResult {
   deadRetry: DeadServerRetryResult | { error: string }
   destroyDead: DestroyDeadDropletsResult | { error: string }
   orphanArchives: OrphanArchiveResult | { error: string }
+  vhostGuard: VhostGuardSweepResult | { error: string }
   ranAt: string
 }
 
@@ -1525,6 +1526,7 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
         deadRetry: { error: "paused" },
         destroyDead: { error: "paused" },
         orphanArchives: { error: "paused" },
+        vhostGuard: { error: "paused" },
       }
     }
   } catch { /* if settings read fails, just proceed normally */ }
@@ -1632,6 +1634,16 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
     destroyDead = { error: (e as Error).message }
   }
 
+  // Apache vhost blast-radius guard — a single partial-create vhost with a
+  // missing DocumentRoot/ErrorLog dir makes configtest fatal and takes
+  // EVERY site on the droplet down. Park only the broken conf(s), reload.
+  let vhostGuard: VhostGuardSweepResult | { error: string }
+  try {
+    vhostGuard = await autoFixBrokenApacheVhost()
+  } catch (e) {
+    vhostGuard = { error: (e as Error).message }
+  }
+
   let orphanArchives: OrphanArchiveResult | { error: string }
   try {
     orphanArchives = await cleanOrphanArchives()
@@ -1664,19 +1676,21 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
   const deadRetryN = "retried" in deadRetry ? deadRetry.retried.length : 0
   const destroyedN = "destroyed" in destroyDead ? destroyDead.destroyed.length : 0
   const orphanArchivesN = "removed" in orphanArchives ? orphanArchives.removed.length : 0
-  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN + stuckN + sslMismatchedN + downRepairsN + deadRetryN + destroyedN + orphanArchivesN > 0) {
+  const vhostGuardN = "fixed" in vhostGuard ? vhostGuard.fixed.length : 0
+  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN + stuckN + sslMismatchedN + downRepairsN + deadRetryN + destroyedN + orphanArchivesN + vhostGuardN > 0) {
     appendAudit(
       "auto_heal_tick", "",
       `claimed=${claimedN} resumed=${resumedN} ns_resumed=${nsResumedN} ` +
       `retried=${retriedN} ssl_reissued=${sslReissuedN} sa_degraded=${degradedN} ` +
       `stuck_recovered=${stuckN} ssl_mismatched=${sslMismatchedN} ` +
       `down_repairs=${downRepairsN} dead_retried=${deadRetryN} ` +
-      `dead_droplets_destroyed=${destroyedN} orphan_archives_swept=${orphanArchivesN}`,
+      `dead_droplets_destroyed=${destroyedN} orphan_archives_swept=${orphanArchivesN} ` +
+      `vhost_guard_fixed=${vhostGuardN}`,
       null,
     )
   }
 
-  return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, sslSweep, forceHttpsSweep, saTrackerDrift, downAutoFix, deadRetry, destroyDead, orphanArchives, ranAt }
+  return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, sslSweep, forceHttpsSweep, saTrackerDrift, downAutoFix, deadRetry, destroyDead, orphanArchives, vhostGuard, ranAt }
 }
 
 // ---------------------------------------------------------------------------
@@ -2032,6 +2046,115 @@ export function stopAutoHeal(): void {
   globalThis.__ssrAutoHealStartScheduled = false
 }
 
+// ---------------------------------------------------------------------------
+// Apache vhost blast-radius guard sweep. A partial-create vhost with a
+// missing DocumentRoot/ErrorLog dir makes `apache2ctl configtest` FATAL →
+// apache won't start → EVERY site on the droplet is down (9h outage,
+// 2026-05-17). This finds the symptom (a ready server with origin-down
+// domains), SSHes in, and parks ONLY the provably-broken conf(s) via the
+// unit-tested vhost-guard core, then reloads apache — turning a whole-box
+// outage into one parked site. The parked site flips to retryable_error so
+// the pipeline rebuilds it (5df30c8 makes that rebuild self-heal).
+//
+// Gated by auto_migrate_enabled (same master switch as the sibling
+// sweeps). Safe by construction: quarantineBrokenVhosts only acts when
+// configtest is CURRENTLY failing AND every conf it parks has a
+// provably-missing dir — a healthy server is a no-op even if probed.
+// ---------------------------------------------------------------------------
+
+export interface VhostGuardSweepResult {
+  fixed: { server_id: number; ip: string; quarantined: string[]; message: string }[]
+  skipped: { server_id: number; ip: string; reason: string }[]
+}
+
+// Bound the guard's OWN blast radius: if one server needs more than this
+// many confs parked, that's systemic (disk/ /home wiped) — alert a human,
+// don't auto-park a whole fleet.
+const VHOST_GUARD_MAX_PARK = Number(process.env.SSR_VHOST_GUARD_MAX_PARK) || 5
+const VHOST_GUARD_MAX_SERVERS = Number(process.env.SSR_VHOST_GUARD_MAX_SERVERS) || 3
+
+export async function autoFixBrokenApacheVhost(): Promise<VhostGuardSweepResult> {
+  const fixed: VhostGuardSweepResult["fixed"] = []
+  const skipped: VhostGuardSweepResult["skipped"] = []
+  if ((getSetting("auto_migrate_enabled") || "0") !== "1") return { fixed, skipped }
+
+  const { quarantineBrokenVhosts } = await import("./sa-control")
+  const { updateDomain } = await import("./repos/domains")
+  const domains = listDomains()
+  const servers = listDbServers().filter((s) => s.status === "ready" && s.ip)
+  let acted = 0
+
+  for (const s of servers) {
+    const ip = s.ip as string
+    if (acted >= VHOST_GUARD_MAX_SERVERS) {
+      skipped.push({ server_id: s.id, ip, reason: "per-tick server cap reached" })
+      continue
+    }
+    const onServer = domains.filter((d) => d.server_id === s.id)
+    // Cheap pre-filter: only SSH a server actually showing the symptom —
+    // ≥1 hosted/live domain with live_ok=0 (origin failing). Healthy
+    // server → skipped without an SSH.
+    const originDown = onServer.filter(
+      (d) => (d.status === "hosted" || d.status === "live") && d.live_ok === 0,
+    )
+    if (originDown.length === 0) {
+      skipped.push({ server_id: s.id, ip, reason: "no origin-down domains — not a candidate" })
+      continue
+    }
+    const probe = await quarantineBrokenVhosts(ip, true) // dry-run first
+    if (!probe.decision || !probe.decision.act) {
+      skipped.push({ server_id: s.id, ip, reason: probe.message })
+      continue
+    }
+    if (probe.decision.quarantine.length > VHOST_GUARD_MAX_PARK) {
+      const msg = `${probe.decision.quarantine.length} confs would be parked (> cap ` +
+        `${VHOST_GUARD_MAX_PARK}) — SYSTEMIC, NOT auto-acting; needs a human`
+      skipped.push({ server_id: s.id, ip, reason: msg })
+      logPipeline(`server-${s.id}`, "vhost_guard", "warning", `${ip}: ${msg}`)
+      try {
+        const { notify } = await import("./notify")
+        await notify(`vhost-guard: systemic apache breakage on server #${s.id}`,
+          `${probe.decision.quarantine.length} vhosts have missing dirs on ${ip}. ` +
+          `Refusing to auto-park that many — investigate (disk / /home wiped?).`,
+          { severity: "error", dedupeKey: `vhost_guard_systemic:${s.id}` })
+      } catch { /* best-effort */ }
+      continue
+    }
+    const r = await quarantineBrokenVhosts(ip, false) // act
+    acted++
+    if (r.acted && r.ok) {
+      const parked: string[] = []
+      for (const conf of r.quarantined) {
+        const norm = (x: string) => x.replace(/[^a-z0-9]/gi, "").toLowerCase()
+        const hit = onServer.find(
+          (d) => norm(conf).includes(norm(d.domain.split(".")[0])),
+        )
+        if (hit) {
+          updateDomain(hit.domain, { status: "retryable_error" } as Parameters<typeof updateDomain>[1])
+          parked.push(hit.domain)
+        }
+      }
+      fixed.push({ server_id: s.id, ip, quarantined: r.quarantined, message: r.message })
+      logPipeline(`server-${s.id}`, "vhost_guard", "completed",
+        `Blast-radius guard: parked ${r.quarantined.length} broken vhost(s) on ${ip}, ` +
+        `apache reloaded — other sites restored. Flagged for rebuild: ` +
+        `${parked.join(", ") || "(conf→domain unmatched)"}`)
+      try {
+        const { notify } = await import("./notify")
+        await notify(`vhost-guard: restored apache on server #${s.id}`,
+          `Parked ${r.quarantined.join(", ")} on ${ip} + reloaded apache — other ` +
+          `sites back up. Flagged for pipeline rebuild: ${parked.join(", ") || "(none matched)"}.`,
+          { severity: "warning", dedupeKey: `vhost_guard_fixed:${s.id}:${r.quarantined.length}` })
+      } catch { /* best-effort */ }
+    } else {
+      skipped.push({ server_id: s.id, ip, reason: r.message })
+      logPipeline(`server-${s.id}`, "vhost_guard", "warning",
+        `vhost-guard acted but did not fully recover ${ip}: ${r.message}`)
+    }
+  }
+  return { fixed, skipped }
+}
+
 // Exported for tests
 export const _internal = {
   reconcileOrphanServers,
@@ -2039,6 +2162,7 @@ export const _internal = {
   autoCheckPendingNs,
   autoHealTickOnce,
   autoFixDownDomains,
+  autoFixBrokenApacheVhost,
 }
 
 /** Reset auto-heal in-memory streak state — useful for tests. */
