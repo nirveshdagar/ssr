@@ -439,6 +439,23 @@ export interface SslSweepResult {
  *      the cert on the same server. Per-domain dedupe key prevents
  *      enqueueing repeated retries while one is in flight.
  */
+/**
+ * Gate for the SAFE SSL/origin-cert self-heal sweeps (origin-cert reissue,
+ * force-HTTPS, SA-tracker drift). Reissuing + reinstalling the CF Origin
+ * cert is idempotent and already per-domain rate-capped — fundamentally
+ * UNLIKE migration (which spends money and churns prod). It must NOT be
+ * hostage to `auto_migrate_enabled`: an operator who deliberately turns
+ * migration OFF (e.g. the false-dead stopgap) still wants broken/missing
+ * SSL to heal itself. Dedicated switch, DEFAULT ON — set
+ * `auto_ssl_heal_enabled=0` to opt out. (Root cause of "many sites have
+ * no SSL": these sweeps were gated behind auto_migrate_enabled=0, so the
+ * CF Origin cert — already generated and stored in domains.origin_cert_pem
+ * — was never installed on the box.)
+ */
+export function sslHealEnabled(): boolean {
+  return ((getSetting("auto_ssl_heal_enabled") || "1").trim() || "1") !== "0"
+}
+
 export async function checkOriginCerts(): Promise<SslSweepResult> {
   const rows = all<{ domain: string; server_id: number; current_proxy_ip: string | null }>(
     `SELECT d.domain, d.server_id, s.ip AS current_proxy_ip
@@ -451,7 +468,7 @@ export async function checkOriginCerts(): Promise<SslSweepResult> {
 
   const { verifyOriginCertIsCustom } = await import("./serveravatar")
   const { updateDomain } = await import("./repos/domains")
-  const autoFixEnabled = (getSetting("auto_migrate_enabled") || "0") === "1"
+  const autoFixEnabled = sslHealEnabled()
   const nowIso = new Date().toISOString().replace(/\.\d{3}Z$/, "Z")
 
   for (const r of rows) {
@@ -609,7 +626,7 @@ export async function checkOriginCerts(): Promise<SslSweepResult> {
         `${probe.message}\n\n` +
         (autoFixEnabled
           ? `Auto-fix: pipeline.full from step 8 has been queued. Watch /logs.`
-          : `Likely fix: enable auto_migrate_enabled, OR manually re-run the pipeline for this domain from step 8.`),
+          : `Likely fix: ensure auto_ssl_heal_enabled is not '0' (it defaults ON), OR manually re-run the pipeline for this domain from step 8.`),
         { severity: "warning", dedupeKey: `ssl_mismatch:${r.domain}` },
       )
     } catch { /* notify is best-effort */ }
@@ -659,7 +676,7 @@ export async function checkForceHttpsRedirects(): Promise<ForceHttpsSweepResult>
   if (rows.length === 0) return result
 
   const { probeForceHttps } = await import("./serveravatar")
-  const autoFixEnabled = (getSetting("auto_migrate_enabled") || "0") === "1"
+  const autoFixEnabled = sslHealEnabled()
 
   for (const r of rows) {
     if (!r.current_proxy_ip) continue
@@ -766,7 +783,7 @@ export async function checkForceHttpsRedirects(): Promise<ForceHttpsSweepResult>
         `instead of redirecting to https://. ${probe.message}\n\n` +
         (autoFixEnabled
           ? `Auto-fix: pipeline.full from step 8 queued. Watch /logs.`
-          : `Likely fix: enable auto_migrate_enabled, OR manually re-run step 8 for this domain.`),
+          : `Likely fix: ensure auto_ssl_heal_enabled is not '0' (it defaults ON), OR manually re-run step 8 for this domain.`),
         { severity: "warning", dedupeKey: `force_https:${r.domain}` },
       )
     } catch { /* notify is best-effort */ }
@@ -823,7 +840,7 @@ export async function checkSaTrackerDrift(): Promise<SaTrackerDriftResult> {
   }
 
   const { listApplications } = await import("./serveravatar")
-  const autoFixEnabled = (getSetting("auto_migrate_enabled") || "0") === "1"
+  const autoFixEnabled = sslHealEnabled()
   const MAX_PER_HOUR = Number.parseInt(
     process.env.SSR_SA_TRACKER_MAX_AUTOFIX_PER_HOUR ?? "", 10,
   ) || 3

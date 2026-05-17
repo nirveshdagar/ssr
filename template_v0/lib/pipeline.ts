@@ -1068,6 +1068,25 @@ async function step7CreateAppAndDns(domain: string, server: ServerRow): Promise<
 
   updateStep(domain, 7, "running", `Creating SA app for ${domain} on ${server.name}...`)
   let appId: string
+  // PROACTIVE duplicate-app guard. The DB skip-guard above is narrow (only
+  // app_created/ssl_installed/live AND matching proxy IP). A re-run from a
+  // LATER failed step (8/10), or after a status bounce, slips past it and
+  // would create a SECOND SA application record for the same domain — the
+  // "duplicate site on ServerAvatar" the operator sees. Ask SA
+  // authoritatively FIRST and reuse any existing app. `isSaCreateAppMaybe
+  // Duplicate` (5df30c8) only fires REACTIVELY on SA's 500; SA also
+  // sometimes creates a dup WITHOUT 500ing, which this closes. findAppId
+  // throwing (SA token/list failure) is non-fatal — fall through to
+  // createApplication, whose own catch still handles the reactive case.
+  const preExisting = await findAppId(server.sa_server_id!, domain).catch(() => null)
+  if (preExisting) {
+    appId = preExisting
+    updateStep(domain, 7, "running",
+      `App ${appId} already exists on SA — reusing (proactive dup-guard, no duplicate created)`)
+    logPipeline(domain, "sa_create_app", "warning",
+      `Proactive dup-guard: SA already has app ${appId} for ${domain} on ` +
+      `${server.name} — reusing instead of creating a duplicate`)
+  } else
   try {
     appId = await createApplication(server.sa_server_id!, domain)
   } catch (e) {

@@ -54,6 +54,10 @@ const STRING_FIELDS = [
 
 const CHECKBOX_FIELDS = [
   "auto_migrate_enabled",
+  // Safe idempotent SSL/origin-cert self-heal. DEFAULT ON in code
+  // (sslHealEnabled()) — present here so the operator can explicitly
+  // turn it OFF; decoupled from auto_migrate_enabled on purpose.
+  "auto_ssl_heal_enabled",
   "auto_cleanup_dead_servers",
   "do_use_backup_first",
   "notifications_enabled",
