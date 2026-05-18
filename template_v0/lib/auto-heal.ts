@@ -480,12 +480,18 @@ export async function checkOriginCerts(): Promise<SslSweepResult> {
   // finds the cert fine (sets ssl_origin_ok=1, no re-fire) or wrong (re-
   // fires step 8 — exactly the wanted remediation; the per-hour cap +
   // giveup already prevent loops). ssl_installed too (same rationale).
+  // CAP per tick (rotating: least-recently-verified first). Without this
+  // the 372af83 status-widening pulled ~all domains in and the per-domain
+  // retry-backoff made one sweep run >10 min, wedging the whole tick.
+  const cap = Number(process.env.SSR_SSL_VERIFY_MAX_PER_TICK) || 6
   const rows = all<{ domain: string; server_id: number; current_proxy_ip: string | null }>(
     `SELECT d.domain, d.server_id, s.ip AS current_proxy_ip
        FROM domains d
        JOIN servers s ON s.id = d.server_id
       WHERE d.status IN ('hosted','live','ssl_installed','retryable_error')
-        AND s.ip IS NOT NULL`,
+        AND s.ip IS NOT NULL
+      ORDER BY (d.ssl_last_verified_at IS NULL) DESC, d.ssl_last_verified_at ASC
+      LIMIT ${cap}`,
   )
   const result: SslSweepResult = { checked: 0, mismatched: [], enqueuedReinstalls: [] }
   if (rows.length === 0) return result
@@ -509,7 +515,10 @@ export async function checkOriginCerts(): Promise<SslSweepResult> {
     // install has settled. Only persistent mismatch reaches the auto-fix.
     let probe
     let probeAttempts = 0
-    const RETRY_DELAYS_MS = [15_000, 45_000]  // 0s, +15s, +60s total
+    // ONE short re-probe (was [15_000,45_000] = 60s/domain → with the
+    // widened selection that wedged the tick). 6s still catches a brief
+    // SA install race; the 5-min tick cadence is the real debounce.
+    const RETRY_DELAYS_MS = [6_000]
     try {
       // eslint-disable-next-line no-constant-condition
       while (true) {
@@ -1543,6 +1552,22 @@ export interface AutoHealTickResult {
   ranAt: string
 }
 
+/**
+ * Hard per-sweep timeout so one slow/hung sweep (always an SSH/probe-heavy
+ * one) can NEVER wedge the whole auto-heal tick. Regression 2026-05-18:
+ * checkOriginCerts ran ~11 min (N domains × 60s retry-backoff) so the tick
+ * never completed → operator saw "tick not happening" for 14 min. On
+ * timeout the sweep is recorded as an error and the tick proceeds; its
+ * (capped) work simply retries next tick.
+ */
+function withSweepTimeout<T>(p: Promise<T>, label: string, ms = 90_000): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, rej) =>
+      setTimeout(() => rej(new Error(`sweep '${label}' exceeded ${ms}ms budget`)), ms)),
+  ])
+}
+
 export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
   const ranAt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z")
 
@@ -1632,28 +1657,28 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
 
   let sslSweep: SslSweepResult | { error: string }
   try {
-    sslSweep = await checkOriginCerts()
+    sslSweep = await withSweepTimeout(checkOriginCerts(), "checkOriginCerts")
   } catch (e) {
     sslSweep = { error: (e as Error).message }
   }
 
   let forceHttpsSweep: ForceHttpsSweepResult | { error: string }
   try {
-    forceHttpsSweep = await checkForceHttpsRedirects()
+    forceHttpsSweep = await withSweepTimeout(checkForceHttpsRedirects(), "forceHttps")
   } catch (e) {
     forceHttpsSweep = { error: (e as Error).message }
   }
 
   let saTrackerDrift: SaTrackerDriftResult | { error: string }
   try {
-    saTrackerDrift = await checkSaTrackerDrift()
+    saTrackerDrift = await withSweepTimeout(checkSaTrackerDrift(), "saTrackerDrift")
   } catch (e) {
     saTrackerDrift = { error: (e as Error).message }
   }
 
   let downAutoFix: DownAutoFixResult | { error: string }
   try {
-    downAutoFix = await autoFixDownDomains()
+    downAutoFix = await withSweepTimeout(autoFixDownDomains(), "downAutoFix")
   } catch (e) {
     downAutoFix = { error: (e as Error).message }
   }
@@ -1686,7 +1711,7 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
   // EVERY site on the droplet down. Park only the broken conf(s), reload.
   let vhostGuard: VhostGuardSweepResult | { error: string }
   try {
-    vhostGuard = await autoFixBrokenApacheVhost()
+    vhostGuard = await withSweepTimeout(autoFixBrokenApacheVhost(), "vhostGuard")
   } catch (e) {
     vhostGuard = { error: (e as Error).message }
   }
@@ -1695,7 +1720,7 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
   // conservative core, capped). Deletes only dead empty dup records.
   let dupCleanup: DupCleanupSweepResult | { error: string }
   try {
-    dupCleanup = await autoCleanupDuplicateSaApps()
+    dupCleanup = await withSweepTimeout(autoCleanupDuplicateSaApps(), "dupCleanup")
   } catch (e) {
     dupCleanup = { error: (e as Error).message }
   }
@@ -1705,7 +1730,7 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
   // (step 10 skipped/locked or wrote to a non-served path).
   let entryHeal: EntryHealResult | { error: string }
   try {
-    entryHeal = await autoFixMissingEntryFile()
+    entryHeal = await withSweepTimeout(autoFixMissingEntryFile(), "entryHeal")
   } catch (e) {
     entryHeal = { error: (e as Error).message }
   }
@@ -1715,7 +1740,7 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
   // only escalates what they couldn't fix.
   let appRebuild: AppRebuildResult | { error: string }
   try {
-    appRebuild = await autoRebuildUnscaffoldedApp()
+    appRebuild = await withSweepTimeout(autoRebuildUnscaffoldedApp(), "appRebuild")
   } catch (e) {
     appRebuild = { error: (e as Error).message }
   }
@@ -2327,7 +2352,7 @@ export interface EntryHealResult {
   skipped: number
 }
 
-const ENTRY_HEAL_MAX_PER_TICK = Number(process.env.SSR_ENTRY_HEAL_MAX_PER_TICK) || 10
+const ENTRY_HEAL_MAX_PER_TICK = Number(process.env.SSR_ENTRY_HEAL_MAX_PER_TICK) || 3
 const ENTRY_HEAL_MAX_PER_HOUR = Number(process.env.SSR_ENTRY_HEAL_MAX_PER_HOUR) || 3
 
 export async function autoFixMissingEntryFile(): Promise<EntryHealResult> {
