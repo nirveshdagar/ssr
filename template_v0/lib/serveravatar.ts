@@ -1251,8 +1251,30 @@ export async function installCustomSsl(opts: InstallSslOpts): Promise<{ ok: bool
     `/organizations/{ORG_ID}/servers/${opts.saServerId}` +
     `/applications/${opts.appId}/ssl`
 
+  // Verify a tier's claimed success against the ACTUAL origin cert before
+  // trusting it. SA's API/UI routinely report "SSL installed" (HTTP 2xx)
+  // while Apache still serves the box self-signed cert (no real :443
+  // vhost) — root cause of the endless WRONG-ISSUER retry loop: step 8
+  // "succeeded" via API, the pipeline's post-verify caught the wrong cert
+  // → retryable → re-fire → API lies again → the deterministic SSH
+  // synthesize tier NEVER runs. Only a DEFINITIVE wrong-issuer (ok===false)
+  // overrides the tier; inconclusive (timeout/no-ip) still trusts it so a
+  // flaky probe can't force SSH forever (the pipeline-level verify still
+  // guards genuine cases).
+  const tierServesOurCert = async (): Promise<boolean> => {
+    if (!opts.serverIp || !opts.domain) return true
+    const v = await verifyOriginCertIsCustom(opts.serverIp, opts.domain, 12_000)
+    if (v.ok === false) {
+      logPipeline(opts.domain, "ssl_install", "warning",
+        `Tier reported SSL installed but origin still serves the WRONG cert ` +
+        `(${v.message}) — NOT trusting it; escalating to next tier.`)
+      return false
+    }
+    return true
+  }
+
   const apiResult = await tryApiSslFlow(sslPath, opts)
-  if (apiResult.ok) return apiResult
+  if (apiResult.ok && await tierServesOurCert()) return apiResult
 
   // The API path's documented failure mode is HTTP 500 with the body
   // `{"message":"Something went wrong while creating custom ssl certificate."}`
@@ -1292,13 +1314,13 @@ export async function installCustomSsl(opts: InstallSslOpts): Promise<{ ok: bool
         chainPem: "",
         forceHttps: opts.forceHttps !== false,
       })
-      if (ui.ok) {
+      if (ui.ok && await tierServesOurCert()) {
         return {
           ok: true,
           message: `Installed via SA UI${apiBenign ? "" : " (API path unavailable)"}`,
         }
       }
-      uiMsg = ui.message
+      uiMsg = ui.message || (ui.ok ? "UI reported ok but origin served wrong cert" : "")
     } catch (e) {
       uiMsg = `UI automation: ${(e as Error).name}: ${(e as Error).message}`
     }
