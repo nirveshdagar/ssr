@@ -22,7 +22,7 @@
  * Disabled in tests (NODE_ENV=test) and skippable via SSR_AUTOHEAL=0.
  */
 
-import { listServers as listDbServers, updateServer } from "./repos/servers"
+import { listServers as listDbServers, updateServer, getServer } from "./repos/servers"
 import { listServers as listSaServers } from "./serveravatar"
 import { listDomains } from "./repos/domains"
 import { getSetting } from "./repos/settings"
@@ -31,6 +31,8 @@ import { appendAudit } from "./repos/audit"
 import { isRetryableError } from "./status-taxonomy"
 import { isPipelineRunning, runFullPipeline } from "./pipeline"
 import { decideEntryHeal } from "./entry-verify"
+import { decideAppRebuild, rebuildNeedsSaDelete, type AppScaffoldState } from "./app-rebuild-guard"
+import { extractDocRoot } from "./dup-app-guard"
 import { getZoneStatus } from "./cloudflare"
 import { all, one } from "./db"
 
@@ -1537,6 +1539,7 @@ export interface AutoHealTickResult {
   vhostGuard: VhostGuardSweepResult | { error: string }
   dupCleanup: DupCleanupSweepResult | { error: string }
   entryHeal: EntryHealResult | { error: string }
+  appRebuild: AppRebuildResult | { error: string }
   ranAt: string
 }
 
@@ -1570,6 +1573,7 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
         vhostGuard: { error: "paused" },
         dupCleanup: { error: "paused" },
         entryHeal: { error: "paused" },
+        appRebuild: { error: "paused" },
       }
     }
   } catch { /* if settings read fails, just proceed normally */ }
@@ -1706,6 +1710,16 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
     entryHeal = { error: (e as Error).message }
   }
 
+  // SA-app rebuild escalation — last resort for genuinely-unscaffolded
+  // apps that SSL/entry-file heals can't touch. Runs AFTER them so it
+  // only escalates what they couldn't fix.
+  let appRebuild: AppRebuildResult | { error: string }
+  try {
+    appRebuild = await autoRebuildUnscaffoldedApp()
+  } catch (e) {
+    appRebuild = { error: (e as Error).message }
+  }
+
   let orphanArchives: OrphanArchiveResult | { error: string }
   try {
     orphanArchives = await cleanOrphanArchives()
@@ -1741,7 +1755,8 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
   const vhostGuardN = "fixed" in vhostGuard ? vhostGuard.fixed.length : 0
   const dupCleanupN = "deleted" in dupCleanup ? dupCleanup.deleted.length : 0
   const entryHealN = "reuploaded" in entryHeal ? entryHeal.reuploaded.length : 0
-  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN + stuckN + sslMismatchedN + downRepairsN + deadRetryN + destroyedN + orphanArchivesN + vhostGuardN + dupCleanupN + entryHealN > 0) {
+  const appRebuildN = "rebuilt" in appRebuild ? appRebuild.rebuilt.length : 0
+  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN + stuckN + sslMismatchedN + downRepairsN + deadRetryN + destroyedN + orphanArchivesN + vhostGuardN + dupCleanupN + entryHealN + appRebuildN > 0) {
     appendAudit(
       "auto_heal_tick", "",
       `claimed=${claimedN} resumed=${resumedN} ns_resumed=${nsResumedN} ` +
@@ -1750,12 +1765,12 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
       `down_repairs=${downRepairsN} dead_retried=${deadRetryN} ` +
       `dead_droplets_destroyed=${destroyedN} orphan_archives_swept=${orphanArchivesN} ` +
       `vhost_guard_fixed=${vhostGuardN} dup_apps_cleaned=${dupCleanupN} ` +
-      `entry_files_reuploaded=${entryHealN}`,
+      `entry_files_reuploaded=${entryHealN} app_rebuilds=${appRebuildN}`,
       null,
     )
   }
 
-  return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, sslSweep, forceHttpsSweep, saTrackerDrift, downAutoFix, deadRetry, destroyDead, orphanArchives, vhostGuard, dupCleanup, entryHeal, ranAt }
+  return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, sslSweep, forceHttpsSweep, saTrackerDrift, downAutoFix, deadRetry, destroyDead, orphanArchives, vhostGuard, dupCleanup, entryHeal, appRebuild, ranAt }
 }
 
 // ---------------------------------------------------------------------------
@@ -2403,6 +2418,150 @@ export async function autoFixMissingEntryFile(): Promise<EntryHealResult> {
   return out
 }
 
+// ---------------------------------------------------------------------------
+// SA-app rebuild ESCALATION. The last manual loop: SA's partial-create
+// left a domain with no app dir (or no SA app at all) — SSL re-install +
+// entry-file re-upload cannot fix that; the app must be torn down +
+// recreated so SA scaffolds dir+fpm-pool+vhost (done by hand for
+// conceptden this session). Fires only AFTER the cheaper heals have
+// given up (entry_heal_giveup) or the pipeline explicitly said "needs SA
+// app rebuild" / "App not found on SA server", and only on a POSITIVE
+// not-scaffolded determination. DESTRUCTIVE (deletes an SA app + full
+// re-run) → gated by auto_migrate_enabled, tiny per-tick + per-day caps.
+// ---------------------------------------------------------------------------
+
+export interface AppRebuildResult {
+  checked: number
+  rebuilt: { domain: string; jobId: number; state: AppScaffoldState }[]
+  gaveUp: string[]
+  skipped: number
+}
+
+const APP_REBUILD_MAX_PER_TICK = Number(process.env.SSR_APP_REBUILD_MAX_PER_TICK) || 2
+const APP_REBUILD_MAX_PER_DAY = Number(process.env.SSR_APP_REBUILD_MAX_PER_DAY) || 2
+
+export async function autoRebuildUnscaffoldedApp(): Promise<AppRebuildResult> {
+  const out: AppRebuildResult = { checked: 0, rebuilt: [], gaveUp: [], skipped: 0 }
+  if ((getSetting("auto_migrate_enabled") || "0") !== "1") return out
+
+  // Candidates: domains the cheaper heals ESCALATED — entry-heal gave up
+  // in the last 6h, OR the pipeline explicitly flagged unscaffolded in the
+  // last 2h. Conservative: this never originates a rebuild, only escalates.
+  const cand = new Set<string>()
+  for (const r of all<{ target: string }>(
+    `SELECT DISTINCT target FROM audit_log
+      WHERE action = 'entry_heal_giveup'
+        AND created_at >= datetime('now','-6 hours')`,
+  )) if (r.target) cand.add(r.target)
+  for (const r of all<{ domain: string }>(
+    `SELECT DISTINCT domain FROM pipeline_log
+      WHERE created_at >= datetime('now','-2 hours')
+        AND (message LIKE '%needs SA app rebuild%' OR message LIKE '%App not found on SA server%')`,
+  )) if (r.domain) cand.add(r.domain)
+  if (cand.size === 0) return out
+
+  const { getDomain } = await import("./repos/domains")
+  const { findAppId, listApplications, deleteApplicationById } = await import("./serveravatar")
+  const { pathExistsOnServer } = await import("./sa-control")
+  const { enqueueJob } = await import("./jobs")
+
+  for (const domain of cand) {
+    if (out.rebuilt.length >= APP_REBUILD_MAX_PER_TICK) break
+    if (isPipelineRunning(domain)) { out.skipped++; continue }
+    const d = getDomain(domain)
+    if (!d || !d.server_id) { out.skipped++; continue }
+    const srv = getServer(d.server_id)
+    if (!srv?.sa_server_id || !srv.ip) { out.skipped++; continue }
+    out.checked++
+
+    // Determine scaffold state authoritatively.
+    let state: AppScaffoldState = "unknown"
+    let appId: string | null = null
+    try {
+      appId = await findAppId(srv.sa_server_id, domain)
+      if (!appId) {
+        state = "no-sa-app"
+      } else {
+        const apps = await listApplications(srv.sa_server_id)
+        const app = apps.find((a) => String(a.id) === String(appId))
+        const docRoot = app ? extractDocRoot(app as Record<string, unknown>) : null
+        if (!docRoot) {
+          state = "unknown"
+        } else {
+          const appDir = docRoot.replace(/\/public_html$/, "")
+          const exists = await pathExistsOnServer(srv.ip, appDir)
+          state = exists === true ? "scaffolded"
+            : exists === false ? "sa-app-no-dir" : "unknown"
+        }
+      }
+    } catch {
+      state = "unknown"
+    }
+
+    const recent = one<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM audit_log
+        WHERE action = 'app_rebuild' AND target = ?
+          AND created_at >= datetime('now','-24 hours')`,
+      domain,
+    )?.n ?? 0
+    const inflight = all<{ id: number }>(
+      `SELECT id FROM jobs WHERE kind='pipeline.full'
+         AND status IN ('queued','running') AND payload_json LIKE ?`,
+      `%"domain":"${domain}"%`,
+    ).length > 0
+
+    const decision = decideAppRebuild({
+      state, recentRebuilds: recent, maxPerDay: APP_REBUILD_MAX_PER_DAY, inflight,
+    })
+    if (decision === "skip") { out.skipped++; continue }
+
+    if (decision === "giveup") {
+      out.gaveUp.push(domain)
+      logPipeline(domain, "app_rebuild", "warning",
+        `Unscaffolded app (${state}) STILL unfixed after ${recent} rebuild(s) ` +
+        `in 24h — giving up; SA itself likely can't create this app. Manual review.`)
+      try {
+        appendAudit("app_rebuild_giveup", domain, `state=${state} after=${recent}/24h`, null)
+      } catch { /* ignore */ }
+      try {
+        const { notify } = await import("./notify")
+        await notify(`SA app rebuild gave up (${domain})`,
+          `${domain} has an unscaffolded SA app (${state}) and ${recent} automatic ` +
+          `rebuilds in 24h did not fix it. SA may be unable to create this app — ` +
+          `manual investigation needed.`,
+          { severity: "error", dedupeKey: `app_rebuild_giveup:${domain}` })
+      } catch { /* best-effort */ }
+      continue
+    }
+
+    // decision === "rebuild"
+    if (rebuildNeedsSaDelete(state) && appId) {
+      try {
+        await deleteApplicationById(srv.sa_server_id, appId, domain)
+      } catch (e) {
+        logPipeline(domain, "app_rebuild", "warning",
+          `Stale SA app ${appId} delete threw (continuing to recreate): ${(e as Error).message.slice(0, 100)}`)
+      }
+    }
+    try {
+      appendAudit("app_rebuild", domain, `state=${state} server_id=${d.server_id}`, null)
+    } catch { /* ignore */ }
+    const jobId = enqueueJob("pipeline.full", {
+      domain,
+      skip_purchase: true,
+      server_id: d.server_id,
+      start_from: 6,        // recreate server-pick + SA app (scaffolds dir+pool+vhost) + ssl + upload
+      force_new_server: false,
+    }, 1)
+    out.rebuilt.push({ domain, jobId, state })
+    logPipeline(domain, "app_rebuild", "running",
+      `Unscaffolded app (${state}) — ${rebuildNeedsSaDelete(state) ? "deleted stale SA record + " : ""}` +
+      `enqueued clean rebuild pipeline.full from step 6 (job ${jobId}, ` +
+      `attempt ${recent + 1}/${APP_REBUILD_MAX_PER_DAY}).`)
+  }
+  return out
+}
+
 // Exported for tests
 export const _internal = {
   reconcileOrphanServers,
@@ -2413,6 +2572,7 @@ export const _internal = {
   autoFixBrokenApacheVhost,
   autoCleanupDuplicateSaApps,
   autoFixMissingEntryFile,
+  autoRebuildUnscaffoldedApp,
 }
 
 /** Reset auto-heal in-memory streak state — useful for tests. */

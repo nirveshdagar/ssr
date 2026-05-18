@@ -838,6 +838,34 @@ export async function quarantineBrokenVhosts(
   }
 }
 
+/**
+ * Read-only: does an absolute path exist (as a directory) on the server?
+ * Returns true/false, or null if SSH itself failed (caller treats null as
+ * "unknown" — never act on uncertainty). Path is allowlisted to SA's
+ * /home app-dir shape to keep the remote command injection-proof.
+ */
+export async function pathExistsOnServer(
+  ip: string, absPath: string,
+): Promise<boolean | null> {
+  if (!/^\/home\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+(\/public_html)?$/.test(absPath)) {
+    return null
+  }
+  let ssh: SshSession | null = null
+  try {
+    ssh = await openSsh(ip)
+    const r = await ssh.exec(
+      `[ -d ${JSON.stringify(absPath)} ] && echo YES || echo NO`,
+      { timeoutMs: 12_000 },
+    )
+    const out = r.stdout.trim()
+    return out === "YES" ? true : out === "NO" ? false : null
+  } catch {
+    return null
+  } finally {
+    ssh?.close()
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Duplicate SA-application cleanup. Repeated step-7 createApplication left
 // multiple SA app RECORDS for one domain. List apps via SA API, probe each
