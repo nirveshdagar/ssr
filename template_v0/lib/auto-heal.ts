@@ -553,10 +553,16 @@ export async function checkOriginCerts(): Promise<SslSweepResult> {
       // though it serves fine. Move the recoverable stuck states to
       // 'hosted'; the live-checker flips it to 'live' once it returns 2xx.
       // Never touch terminal_error / manual / success states.
+      // 'ssl_installed' included: it's normally a ~seconds-transient stage
+      // between step 8 and step 10, but a re-run that locked-skipped
+      // steps 9/10 (the migration pattern) strands a fully-healthy domain
+      // there FOREVER — step 8 done, SSL verified, serving 200, yet never
+      // promoted to live (live-checker only does hosted→live). That's the
+      // purepack/petalshelf "Running 8/10" wedge.
       const cur = one<{ status: string }>(
         "SELECT status FROM domains WHERE domain = ?", r.domain,
       )?.status
-      if (cur === "retryable_error" || cur === "error") {
+      if (cur === "retryable_error" || cur === "error" || cur === "ssl_installed") {
         updateDomain(r.domain, { status: "hosted" } as Parameters<typeof updateDomain>[1])
         logPipeline(r.domain, "ssl_verify", "completed",
           `SSL verified CF Origin BUT domain was stuck '${cur}' — promoted to ` +
