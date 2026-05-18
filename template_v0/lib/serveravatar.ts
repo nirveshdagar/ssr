@@ -1348,11 +1348,17 @@ export async function installCustomSsl(opts: InstallSslOpts): Promise<{ ok: bool
     opts.certificatePem, opts.privateKeyPem, opts.chainPem || "",
     { forceHttps: opts.forceHttps !== false },
   )
-  if (!ssh.ok) {
+  // Verify-gate the SA-agent tier too: like the API, it can report ok
+  // without the origin actually serving our cert — and that false-success
+  // was short-circuiting BEFORE the deterministic sshInstallSslFiles
+  // derive/synthesize tier (proven on-box to be the one that actually
+  // lands the CF-Origin :443 vhost). Run Tier 4 whenever the agent tier
+  // didn't land OR the origin still doesn't serve our cert.
+  if (!ssh.ok || !(await tierServesOurCert())) {
     logPipeline(opts.domain, "ssl_install", "info",
-      `SA agent path (port 43210 bypass) didn't land: ${ssh.message.slice(0, 200)} — ` +
-      `falling through to legacy SSH-tee.`)
-    // Tier 4: legacy SSH `tee` to /etc/ssl/... + manual apache reload.
+      `SA agent path didn't land or origin still wrong ` +
+      `(${ssh.message.slice(0, 160)}) — running deterministic SSH derive tier.`)
+    // Tier 4: derive/synthesize the :443 vhost + install our cert + reload.
     ssh = await sshInstallSslFiles(
       opts.serverIp, opts.domain, opts.certificatePem, opts.privateKeyPem,
       { forceHttps: opts.forceHttps !== false },
@@ -1404,15 +1410,18 @@ export async function installCustomSsl(opts: InstallSslOpts): Promise<{ ok: bool
     // no harm done.
     await pushSaUiTracker(sslPath, opts).catch(() => { /* logged inside */ })
   }
-  if (ssh.ok) {
+  // Final gate: only declare success if the origin ACTUALLY serves our
+  // CF-Origin cert. Never trust any tier's self-reported ok without the
+  // wire confirming it (that blind trust was the whole WRONG-ISSUER loop).
+  if (ssh.ok && await tierServesOurCert()) {
     return {
       ok: true,
       message: `Installed via SSH (API + UI fallbacks unavailable)`,
     }
   }
   throw new Error(
-    `All three SSL install paths failed. API: ${apiResult.message}  ` +
-    `UI: ${uiMsg}  SSH: ${ssh.message}`,
+    `All SSL install paths failed — origin not serving CF Origin after SSH. ` +
+    `API: ${apiResult.message}  UI: ${uiMsg}  SSH: ${ssh.message}`,
   )
 }
 
