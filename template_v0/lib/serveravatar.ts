@@ -28,6 +28,7 @@ import { getSetting } from "./repos/settings"
 import { logPipeline } from "./repos/logs"
 import { updateServer } from "./repos/servers"
 import { buildEntryProbeScript, classifyEntryVerify, type EntryVerdict } from "./entry-verify"
+import { synthesizeVhosts } from "./ssl-vhost"
 
 const SA_API = "https://api.serveravatar.com"
 
@@ -2246,7 +2247,7 @@ export async function sshInstallSslFiles(
     // SA always writes successfully). The transform mirrors the manual
     // recovery I ran in the 2026-05-14 session — see
     // `deriveSslVhostFromHttp` above.
-    let derived: "exists" | "created" | "create-failed" | "no-http-source" = "exists"
+    let derived: "exists" | "created" | "create-failed" | "no-http-source" | "synthesized" = "exists"
     const confProbe = await ssh.exec(
       `test -f ${confPath} && echo exists || echo missing`,
       { timeoutMs: 10_000 },
@@ -2259,10 +2260,40 @@ export async function sshInstallSslFiles(
         timeoutMs: 10_000,
       })
       if (httpRead.code !== 0 || !httpRead.stdout) {
-        derived = "no-http-source"
-        logPipeline(domain, "ssh_install_ssl", "warning",
-          `${confPath} missing AND ${httpConfPath} unreadable — ` +
-          `setup sed commands will no-op; apache will fall back to default cert.`)
+        // No SA conf at all (the partial-create domains). Don't give up +
+        // false-succeed — SYNTHESIZE both vhosts from first principles.
+        // Resolve the real docroot on the box (SA's existing-user reuse
+        // means the sysUser may not match sysUserFor()).
+        const drFind = await ssh.exec(
+          `ls -d /home/${sysUserFor(domain)}/${appName}/public_html 2>/dev/null || ` +
+          `find /home -maxdepth 4 -type d -name public_html -path '*${appName}*' 2>/dev/null | head -1`,
+          { timeoutMs: 15_000 },
+        )
+        const docRoot = drFind.stdout.split("\n").map((s) => s.trim()).filter(Boolean)[0]
+        if (!docRoot || !/^\/[A-Za-z0-9._\/-]+\/public_html$/.test(docRoot)) {
+          derived = "no-http-source"
+          logPipeline(domain, "ssh_install_ssl", "warning",
+            `${confPath} + ${httpConfPath} missing AND no app docroot found for ` +
+            `${appName} on box — app is not scaffolded; SSL cannot be wired ` +
+            `(needs SA app rebuild). NOT reporting success.`)
+        } else {
+          const v = synthesizeVhosts({ domain, appName, docRoot, crtPath, keyPath })
+          // logs dir MUST exist or configtest is fatal (blast-radius rule);
+          // docroot too so the vhost is valid (entry-heal fills index.php).
+          await ssh.exec(
+            `mkdir -p ${v.logsDir} ${docRoot} && ` +
+            `chown -R $(stat -c '%U' ${v.appDir} 2>/dev/null || echo root): ${v.appDir} 2>/dev/null || true`,
+            { timeoutMs: 15_000 },
+          )
+          await ssh.sftpWriteFile(confPath, v.sslConf)
+          await ssh.sftpWriteFile(httpConfPath, v.httpConf)
+          await ssh.exec(`chmod 644 ${confPath} ${httpConfPath}`, { timeoutMs: 10_000 })
+          derived = "synthesized"
+          logPipeline(domain, "ssh_install_ssl", "info",
+            `No SA conf existed — synthesized :80+:443 vhosts from scratch ` +
+            `(docroot=${docRoot}, CF Origin cert) so apache stops serving the ` +
+            `box default cert.`)
+        }
       } else {
         const body = deriveSslVhostFromHttp(
           httpRead.stdout, crtPath, keyPath,
@@ -2386,6 +2417,22 @@ export async function sshInstallSslFiles(
       await new Promise((res) => setTimeout(res, 1700))
       probe = await ssh.exec("systemctl is-active apache2", { timeoutMs: 10_000 })
       active = probe.stdout.trim()
+    }
+    // HONESTY GATE: apache being "active" does NOT mean we wired a :443
+    // vhost for this domain. If we could not establish the conf
+    // (no source to derive from AND no app docroot to synthesize against),
+    // apache silently falls through to 000-default-ssl (the box
+    // self-signed cert). Returning ok:true here was the exact bug that
+    // produced the endless "WRONG ISSUER" retry loop — report the truth.
+    if (derived === "no-http-source" || derived === "create-failed") {
+      return {
+        ok: false,
+        message:
+          `SSL vhost NOT established (ssl-conf=${derived}) — '${appName}' ` +
+          `app appears unscaffolded on ${serverIp}; apache keeps serving the ` +
+          `box default cert. Needs SA app rebuild (teardown+recreate), not an ` +
+          `SSL retry. apache=${active} configtest=${(configtest.stdout + configtest.stderr).trim().slice(0, 120)}`,
+      }
     }
     if (active === "active") {
       return {
