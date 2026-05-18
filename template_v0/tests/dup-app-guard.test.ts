@@ -14,11 +14,26 @@ describe("dup-app-guard — helpers", () => {
   it("appNameForDomain mirrors SA convention", () => {
     expect(appNameForDomain("conceptden.site")).toBe("conceptden-site")
   })
-  it("extractDocRoot reads loose SA objects, ignores junk", () => {
+  it("extractDocRoot prefers an explicit field when present", () => {
     expect(extractDocRoot({ document_root: "/home/u/x/public_html" })).toBe("/home/u/x/public_html")
     expect(extractDocRoot({ path: "/home/u/y" })).toBe("/home/u/y")
-    expect(extractDocRoot({ document_root: "not-abs" })).toBeNull()
+    expect(extractDocRoot({ document_root: "not-abs" })).toBeNull() // not absolute, no name/user
     expect(extractDocRoot({})).toBeNull()
+  })
+
+  it("extractDocRoot DERIVES /home/<system_user>/<name>/public_html (SA list has no doc_root)", () => {
+    // The real SA listApplications shape: system_user + name, no doc root.
+    expect(extractDocRoot({ name: "conceptden-site", system_user: "purepacksite" }))
+      .toBe("/home/purepacksite/conceptden-site/public_html")
+    // system_user can come back as an object
+    expect(extractDocRoot({ name: "purepack-site", system_user: { username: "purepacksite" } }))
+      .toBe("/home/purepacksite/purepack-site/public_html")
+    // missing either part → null (caller treats as ambiguous, skips)
+    expect(extractDocRoot({ name: "x-site" })).toBeNull()
+    expect(extractDocRoot({ system_user: "u" })).toBeNull()
+    // injection-safety: junk chars in either component → rejected → null
+    expect(extractDocRoot({ name: "a;rm -rf/", system_user: "u" })).toBeNull()
+    expect(extractDocRoot({ name: "ok-site", system_user: "../etc" })).toBeNull()
   })
   it("appDomain matches by primary_domain or app name", () => {
     expect(appDomain(app("1", "conceptden-site", "/x"), KNOWN)).toBe("conceptden.site")

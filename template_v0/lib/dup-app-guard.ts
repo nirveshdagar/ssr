@@ -41,13 +41,36 @@ export function appNameForDomain(domain: string): string {
   return domain.replace(/\./g, "-").replace(/_/g, "-")
 }
 
-/** Pull a document root out of a loose SA app object, defensively. */
+/** Sanitize a path component — only chars SA actually uses; else "". */
+function san(v: unknown): string {
+  const s = typeof v === "string" ? v : ""
+  return /^[A-Za-z0-9._-]+$/.test(s) ? s : ""
+}
+
+/**
+ * Resolve an SA app's public_html path. SA's `listApplications` does NOT
+ * return a document_root field (confirmed 2026-05-18) — but it DOES return
+ * `system_user` + `name`, and SA's on-disk convention (verified on the box:
+ * /home/purepacksite/conceptden-site/public_html) is
+ * `/home/<system_user>/<name>/public_html`. Derive that so the dup-cleanup
+ * can probe each record's existence per-record instead of giving up with
+ * "no resolvable document root". Still prefers an explicit field if a
+ * future SA version returns one.
+ */
 export function extractDocRoot(app: Record<string, unknown>): string | null {
-  for (const k of ["document_root", "app_path", "path", "public_path", "document_root_path"]) {
+  for (const k of ["document_root", "app_path", "path", "public_path", "document_root_path", "webroot"]) {
     const v = app[k]
     if (typeof v === "string" && v.trim().startsWith("/")) return v.trim()
   }
-  return null
+  const name = san(app["name"])
+  let user = ""
+  const su = app["system_user"]
+  if (typeof su === "string") user = san(su)
+  else if (su && typeof su === "object") {
+    const o = su as Record<string, unknown>
+    user = san(o["username"] ?? o["name"] ?? o["user"])
+  }
+  return user && name ? `/home/${user}/${name}/public_html` : null
 }
 
 /** Which domain (from the known set) does this app belong to? */
