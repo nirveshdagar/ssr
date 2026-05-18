@@ -72,7 +72,10 @@ describe("autoFixMissingEntryFile — standing entry-file presence heal", () => 
     await seed()
     const { run } = await import("@/lib/db")
     for (let i = 0; i < 3; i++) {
-      run("INSERT INTO audit_log(action,target,detail,created_at) VALUES('entry_file_missing','a.site','x',datetime('now'))")
+      // detail must carry the build-SHA marker — the cap is build-aware
+      // (recentHealFailsThisBuild filters detail LIKE %sha=<BUILD_SHA>%;
+      // BUILD_SHA = SSR_GIT_SHA||'dev', unset in tests → 'dev').
+      run("INSERT INTO audit_log(action,target,detail,created_at) VALUES('entry_file_missing','a.site','x sha=dev',datetime('now'))")
     }
     verifyEntryFileServed.mockImplementation(async (d: string) =>
       d === "a.site" ? { verdict: "missing", detail: "still missing" }
@@ -82,5 +85,25 @@ describe("autoFixMissingEntryFile — standing entry-file presence heal", () => 
     expect(r.gaveUp).toContain("a.site")
     expect(r.reuploaded).toHaveLength(0)
     expect(await jobsFor("a.site")).toHaveLength(0) // capped → no new enqueue
+  })
+
+  it("build-SHA reset: prior-BUILD failures do NOT cap the new build (the meta-fix)", async () => {
+    await seed()
+    const { run } = await import("@/lib/db")
+    // 5 failures, but all tagged with a DIFFERENT (old) build SHA — i.e.
+    // they happened under the buggy code, before a fix was deployed.
+    for (let i = 0; i < 5; i++) {
+      run("INSERT INTO audit_log(action,target,detail,created_at) VALUES('entry_file_missing','a.site','x sha=OLDBUILD9',datetime('now'))")
+    }
+    verifyEntryFileServed.mockImplementation(async (d: string) =>
+      d === "a.site" ? { verdict: "missing", detail: "still missing" }
+        : { verdict: "ok", detail: "fine" })
+    const { _internal } = await import("@/lib/auto-heal")
+    const r = await _internal.autoFixMissingEntryFile()
+    // Current build sees 0 of its own failures → cap released → it RE-FIRES
+    // (no manual kick). This is exactly the deploy-auto-resets-cap behavior.
+    expect(r.gaveUp).not.toContain("a.site")
+    expect(r.reuploaded.map((x) => x.domain)).toContain("a.site")
+    expect(await jobsFor("a.site")).toHaveLength(1)
   })
 })

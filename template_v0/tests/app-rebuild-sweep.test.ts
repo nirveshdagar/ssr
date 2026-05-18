@@ -28,7 +28,11 @@ beforeEach(async () => {
 
 async function seed(autoMigrate = true) {
   const { run, one } = await import("@/lib/db")
-  if (autoMigrate) run("INSERT INTO settings(key,value) VALUES('auto_migrate_enabled','1')")
+  if (autoMigrate) {
+    run("INSERT INTO settings(key,value) VALUES('auto_migrate_enabled','1')")
+    // destructive sweep now also requires its own explicit opt-in
+    run("INSERT INTO settings(key,value) VALUES('auto_destructive_sa_heal_enabled','1')")
+  }
   run("INSERT INTO servers (name, ip, status, sa_server_id) VALUES ('s','10.0.0.9','ready','SA9')")
   const sid = one<{ id: number }>("SELECT id FROM servers WHERE ip='10.0.0.9'")!.id
   const { addDomain, updateDomain } = await import("@/lib/repos/domains")

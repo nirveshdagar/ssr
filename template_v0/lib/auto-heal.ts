@@ -588,11 +588,10 @@ export async function checkOriginCerts(): Promise<SslSweepResult> {
     logPipeline(r.domain, "ssl_verify", "warning",
       `Origin cert MISMATCH on ${r.current_proxy_ip}: ${probe.message}.`)
     try {
-      appendAudit(
+      auditHealFail(
         "ssl_origin_mismatch", r.domain,
         `server_id=${r.server_id} ip=${r.current_proxy_ip} ` +
         `subject="${probe.subjectCN ?? "?"}" issuer="${probe.issuerCN ?? "?"}"`,
-        null,
       )
     } catch { /* ignore */ }
 
@@ -611,13 +610,7 @@ export async function checkOriginCerts(): Promise<SslSweepResult> {
       const MAX_REINSTALLS_PER_HOUR = Number.parseInt(
         process.env.SSR_SSL_MAX_AUTOFIX_PER_HOUR ?? "", 10,
       ) || 3
-      const recentMismatches = (one<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM audit_log
-          WHERE action = 'ssl_origin_mismatch'
-            AND target = ?
-            AND created_at >= datetime('now', '-60 minutes')`,
-        r.domain,
-      )?.n ?? 0)
+      const recentMismatches = recentHealFailsThisBuild("ssl_origin_mismatch", r.domain)
       if (recentMismatches >= MAX_REINSTALLS_PER_HOUR) {
         logPipeline(r.domain, "ssl_verify", "warning",
           `Persistent cert mismatch — ${recentMismatches} in last 60 min. ` +
@@ -762,11 +755,10 @@ export async function checkForceHttpsRedirects(): Promise<ForceHttpsSweepResult>
     logPipeline(r.domain, "force_https", "warning",
       `HTTP → HTTPS redirect MISSING on ${r.current_proxy_ip}: ${probe.message}`)
     try {
-      appendAudit(
+      auditHealFail(
         "force_https_missing", r.domain,
         `server_id=${r.server_id} ip=${r.current_proxy_ip} status=${probe.status ?? "?"} ` +
         `location="${probe.location ?? ""}"`,
-        null,
       )
     } catch { /* ignore */ }
 
@@ -774,13 +766,7 @@ export async function checkForceHttpsRedirects(): Promise<ForceHttpsSweepResult>
       const MAX_PER_HOUR = Number.parseInt(
         process.env.SSR_FORCE_HTTPS_MAX_AUTOFIX_PER_HOUR ?? "", 10,
       ) || 3
-      const recent = (one<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM audit_log
-          WHERE action = 'force_https_missing'
-            AND target = ?
-            AND created_at >= datetime('now', '-60 minutes')`,
-        r.domain,
-      )?.n ?? 0)
+      const recent = recentHealFailsThisBuild("force_https_missing", r.domain)
       if (recent >= MAX_PER_HOUR) {
         logPipeline(r.domain, "force_https", "warning",
           `Persistent force-HTTPS miss — ${recent} in last 60 min. Auto-fix DISABLED ` +
@@ -958,19 +944,13 @@ export async function checkSaTrackerDrift(): Promise<SaTrackerDriftResult> {
         // Audit always written — that's the per-tick row that feeds the
         // 60-minute cap counter below. Without it the cap rolls off and
         // re-fires perpetually, defeating the rate-limit guard.
-        appendAudit("sa_tracker_drift", r.domain,
-          `ssl=${a.ssl ?? "null"} force_ssl=${a.force_ssl ?? 0}`, null)
+        auditHealFail("sa_tracker_drift", r.domain,
+          `ssl=${a.ssl ?? "null"} force_ssl=${a.force_ssl ?? 0}`)
       } catch { /* ignore */ }
 
       if (!autoFixEnabled) continue
 
-      const recent = (one<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM audit_log
-          WHERE action = 'sa_tracker_drift'
-            AND target = ?
-            AND created_at >= datetime('now', '-60 minutes')`,
-        r.domain,
-      )?.n ?? 0)
+      const recent = recentHealFailsThisBuild("sa_tracker_drift", r.domain)
       if (recent >= MAX_PER_HOUR) {
         // Announce ONCE per quiet-mode entry — don't re-spam per tick.
         // After 30 min the recentDisabled check above will let us
@@ -1589,6 +1569,33 @@ function withSweepTimeout<T>(p: Promise<T>, label: string, ms = 90_000): Promise
     new Promise<T>((_, rej) =>
       setTimeout(() => rej(new Error(`sweep '${label}' exceeded ${ms}ms budget`)), ms)),
   ])
+}
+
+const BUILD_SHA = (process.env.SSR_GIT_SHA || "dev").trim()
+
+/**
+ * Build-aware giveup cap for the SAFE/idempotent heals (SSL reissue,
+ * force-HTTPS, SA-tracker, entry-file). The per-domain hourly cap used to
+ * count failures over a pure time window with NO awareness of which code
+ * produced them — so a deployed fix never reached capped domains until
+ * each was manually kicked (the whole-session whack-a-mole). Tag every
+ * failure audit with the running build SHA and count ONLY failures under
+ * the CURRENT SHA: a deploy (SHA change) auto-resets every domain's cap →
+ * the new code is exercised on the very next tick, zero manual kicks. The
+ * DESTRUCTIVE sweeps deliberately do NOT use this (they must not auto-un-
+ * cap on deploy — that could trigger an SA-app-deletion wave).
+ */
+function auditHealFail(action: string, target: string, detail: string): void {
+  try { appendAudit(action, target, `${detail} sha=${BUILD_SHA}`, null) } catch { /* ignore */ }
+}
+function recentHealFailsThisBuild(action: string, target: string): number {
+  return one<{ n: number }>(
+    `SELECT COUNT(*) AS n FROM audit_log
+       WHERE action = ? AND target = ?
+         AND created_at >= datetime('now', '-60 minutes')
+         AND detail LIKE ?`,
+    action, target, `%sha=${BUILD_SHA}%`,
+  )?.n ?? 0
 }
 
 export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
@@ -2309,7 +2316,12 @@ export async function autoCleanupDuplicateSaApps(): Promise<DupCleanupSweepResul
   const deleted: DupCleanupSweepResult["deleted"] = []
   const skipped: DupCleanupSweepResult["skipped"] = []
   let serversChecked = 0
-  if ((getSetting("auto_migrate_enabled") || "0") !== "1") {
+  // DESTRUCTIVE (deletes SA apps → SA reserves the name per-server →
+  // re-poison risk). Off by default: requires BOTH the destructive-auth
+  // switch AND its own explicit opt-in. Steady-state safe heals don't
+  // need this; only enable for a deliberate cleanup pass.
+  if ((getSetting("auto_migrate_enabled") || "0") !== "1" ||
+      (getSetting("auto_destructive_sa_heal_enabled") || "0") !== "1") {
     return { serversChecked, deleted, skipped }
   }
   const { cleanupDuplicateSaApps } = await import("./sa-control")
@@ -2405,12 +2417,7 @@ export async function autoFixMissingEntryFile(): Promise<EntryHealResult> {
     }
     if (v.verdict !== "missing") { out.skipped++; continue }
 
-    const recent = one<{ n: number }>(
-      `SELECT COUNT(*) AS n FROM audit_log
-        WHERE action = 'entry_file_missing' AND target = ?
-          AND created_at >= datetime('now', '-60 minutes')`,
-      r.domain,
-    )?.n ?? 0
+    const recent = recentHealFailsThisBuild("entry_file_missing", r.domain)
     const inflight = all<{ id: number }>(
       `SELECT id FROM jobs WHERE kind = 'pipeline.full'
          AND status IN ('queued','running') AND payload_json LIKE ?`,
@@ -2447,8 +2454,8 @@ export async function autoFixMissingEntryFile(): Promise<EntryHealResult> {
 
     // decision === "act"
     try {
-      appendAudit("entry_file_missing", r.domain,
-        `server_id=${r.server_id} ${v.detail}`, null)
+      auditHealFail("entry_file_missing", r.domain,
+        `server_id=${r.server_id} ${v.detail}`)
     } catch { /* ignore */ }
     const { enqueueJob } = await import("./jobs")
     const jobId = enqueueJob("pipeline.full", {
@@ -2490,7 +2497,12 @@ const APP_REBUILD_MAX_PER_DAY = Number(process.env.SSR_APP_REBUILD_MAX_PER_DAY) 
 
 export async function autoRebuildUnscaffoldedApp(): Promise<AppRebuildResult> {
   const out: AppRebuildResult = { checked: 0, rebuilt: [], gaveUp: [], skipped: 0 }
-  if ((getSetting("auto_migrate_enabled") || "0") !== "1") return out
+  // DESTRUCTIVE (deletes + recreates SA apps → per-server name reservation
+  // = re-poison risk). Off by default; needs the destructive-auth switch
+  // AND its own explicit opt-in (never auto-runs in steady state, never
+  // auto-un-caps on deploy).
+  if ((getSetting("auto_migrate_enabled") || "0") !== "1" ||
+      (getSetting("auto_destructive_sa_heal_enabled") || "0") !== "1") return out
 
   // Candidates: domains the cheaper heals ESCALATED — entry-heal gave up
   // in the last 6h, OR the pipeline explicitly flagged unscaffolded in the

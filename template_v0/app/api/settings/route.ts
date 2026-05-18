@@ -61,6 +61,11 @@ const CHECKBOX_FIELDS = [
   // Same class as auto_ssl_heal_enabled — safe idempotent re-upload of a
   // missing entry file. DEFAULT ON in code (contentHealEnabled()).
   "auto_content_heal_enabled",
+  // DESTRUCTIVE SA-app cleanup/rebuild (delete+recreate). DEFAULT OFF in
+  // code — SA reserves deleted app names per-server, so unattended
+  // delete waves can re-poison a server. Only flip ON for a deliberate,
+  // watched cleanup pass, then turn it back OFF.
+  "auto_destructive_sa_heal_enabled",
   "auto_cleanup_dead_servers",
   "do_use_backup_first",
   "notifications_enabled",
