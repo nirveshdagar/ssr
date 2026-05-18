@@ -546,6 +546,23 @@ export async function checkOriginCerts(): Promise<SslSweepResult> {
         ssl_origin_ok: 1,
         ssl_last_verified_at: nowIso,
       } as Parameters<typeof updateDomain>[1])
+      // THE missing transition (root of "nothing is sorting"): nothing
+      // promotes a genuinely-healthy domain OUT of a stuck error status.
+      // The live-checker only does hosted→live; a domain whose SSL is now
+      // verified-correct otherwise sits in retryable_error FOREVER even
+      // though it serves fine. Move the recoverable stuck states to
+      // 'hosted'; the live-checker flips it to 'live' once it returns 2xx.
+      // Never touch terminal_error / manual / success states.
+      const cur = one<{ status: string }>(
+        "SELECT status FROM domains WHERE domain = ?", r.domain,
+      )?.status
+      if (cur === "retryable_error" || cur === "error") {
+        updateDomain(r.domain, { status: "hosted" } as Parameters<typeof updateDomain>[1])
+        logPipeline(r.domain, "ssl_verify", "completed",
+          `SSL verified CF Origin BUT domain was stuck '${cur}' — promoted to ` +
+          `'hosted' (live-checker will take it to 'live' once it serves 2xx). ` +
+          `This is the de-stick that was missing.`)
+      }
       continue
     }
     if (probe.ok === null) {
