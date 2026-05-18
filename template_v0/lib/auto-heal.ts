@@ -470,11 +470,20 @@ export function contentHealEnabled(): boolean {
 }
 
 export async function checkOriginCerts(): Promise<SslSweepResult> {
+  // Include retryable_error: an SSL failure bounces a domain to
+  // retryable_error, which the old query excluded — so SSL-broken domains
+  // fell OUT of this fast 5-min self-heal into the slow 30-min/capped
+  // generic retry (the "nothing is happening" gap, 2026-05-18). Probing a
+  // retryable_error domain is harmless: verifyOriginCertIsCustom either
+  // finds the cert fine (sets ssl_origin_ok=1, no re-fire) or wrong (re-
+  // fires step 8 — exactly the wanted remediation; the per-hour cap +
+  // giveup already prevent loops). ssl_installed too (same rationale).
   const rows = all<{ domain: string; server_id: number; current_proxy_ip: string | null }>(
     `SELECT d.domain, d.server_id, s.ip AS current_proxy_ip
        FROM domains d
        JOIN servers s ON s.id = d.server_id
-      WHERE d.status IN ('hosted','live') AND s.ip IS NOT NULL`,
+      WHERE d.status IN ('hosted','live','ssl_installed','retryable_error')
+        AND s.ip IS NOT NULL`,
   )
   const result: SslSweepResult = { checked: 0, mismatched: [], enqueuedReinstalls: [] }
   if (rows.length === 0) return result
