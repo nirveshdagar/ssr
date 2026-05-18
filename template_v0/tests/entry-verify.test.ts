@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { buildEntryProbeScript, classifyEntryVerify } from "@/lib/entry-verify"
+import { buildEntryProbeScript, classifyEntryVerify, decideEntryHeal } from "@/lib/entry-verify"
 
 describe("entry-verify — probe script", () => {
   it("escapes the domain in the ServerName match (no regex injection)", () => {
@@ -35,5 +35,24 @@ describe("entry-verify — classify (asymmetric: only definitive misses fail)", 
   })
   it("unknown state → inconclusive", () => {
     expect(classifyEntryVerify("RESULT|WAT||").verdict).toBe("inconclusive")
+  })
+})
+
+describe("entry-verify — decideEntryHeal (auto-heal cap logic)", () => {
+  const base = { recentFailures: 0, maxPerHour: 3, inflight: false }
+  it("non-missing verdict never acts", () => {
+    expect(decideEntryHeal({ ...base, verdict: "ok" })).toBe("skip")
+    expect(decideEntryHeal({ ...base, verdict: "inconclusive" })).toBe("skip")
+  })
+  it("missing + under cap + no inflight → act", () => {
+    expect(decideEntryHeal({ ...base, verdict: "missing" })).toBe("act")
+    expect(decideEntryHeal({ ...base, verdict: "missing", recentFailures: 2 })).toBe("act")
+  })
+  it("missing + at/over cap → giveup (no infinite re-upload loop)", () => {
+    expect(decideEntryHeal({ ...base, verdict: "missing", recentFailures: 3 })).toBe("giveup")
+    expect(decideEntryHeal({ ...base, verdict: "missing", recentFailures: 9 })).toBe("giveup")
+  })
+  it("missing + inflight (job already queued) → skip (don't stack)", () => {
+    expect(decideEntryHeal({ ...base, verdict: "missing", inflight: true })).toBe("skip")
   })
 })

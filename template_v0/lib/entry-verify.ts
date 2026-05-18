@@ -60,3 +60,22 @@ export function classifyEntryVerify(raw: string): EntryVerdict {
       return { verdict: "inconclusive", detail: `unrecognized probe state '${state}'` }
   }
 }
+
+/**
+ * Standing auto-heal decision for a domain that's marked hosted/live but
+ * whose entry file we just verified. Mirrors checkOriginCerts' cap logic:
+ * only a DEFINITIVE miss acts; cap prevents infinite re-upload loops when
+ * the real cause is upstream (app dir never scaffolded → step 10 will
+ * fail retryable anyway); inflight avoids stacking jobs.
+ */
+export function decideEntryHeal(opts: {
+  verdict: EntryVerdict["verdict"]
+  recentFailures: number  // audit 'entry_file_missing' for this domain in last 60min
+  maxPerHour: number
+  inflight: boolean       // a pipeline.full already queued/running for this domain
+}): "act" | "skip" | "giveup" {
+  if (opts.verdict !== "missing") return "skip" // ok / inconclusive → never act
+  if (opts.recentFailures >= opts.maxPerHour) return "giveup"
+  if (opts.inflight) return "skip"
+  return "act"
+}

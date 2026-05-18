@@ -30,6 +30,7 @@ import { logPipeline } from "./repos/logs"
 import { appendAudit } from "./repos/audit"
 import { isRetryableError } from "./status-taxonomy"
 import { isPipelineRunning, runFullPipeline } from "./pipeline"
+import { decideEntryHeal } from "./entry-verify"
 import { getZoneStatus } from "./cloudflare"
 import { all, one } from "./db"
 
@@ -454,6 +455,18 @@ export interface SslSweepResult {
  */
 export function sslHealEnabled(): boolean {
   return ((getSetting("auto_ssl_heal_enabled") || "1").trim() || "1") !== "0"
+}
+
+/**
+ * Gate for the entry-file (index.php) presence self-heal. Re-uploading a
+ * cached entry file is SAFE + idempotent (same class as SSL reissue) — it
+ * must NOT be hostage to `auto_migrate_enabled`. Dedicated switch, DEFAULT
+ * ON; set `auto_content_heal_enabled=0` to opt out. Closes the gap where a
+ * domain is marked hosted/live but step 10 was skipped/locked so the entry
+ * file never actually landed at the served docroot.
+ */
+export function contentHealEnabled(): boolean {
+  return ((getSetting("auto_content_heal_enabled") || "1").trim() || "1") !== "0"
 }
 
 export async function checkOriginCerts(): Promise<SslSweepResult> {
@@ -1514,6 +1527,7 @@ export interface AutoHealTickResult {
   orphanArchives: OrphanArchiveResult | { error: string }
   vhostGuard: VhostGuardSweepResult | { error: string }
   dupCleanup: DupCleanupSweepResult | { error: string }
+  entryHeal: EntryHealResult | { error: string }
   ranAt: string
 }
 
@@ -1546,6 +1560,7 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
         orphanArchives: { error: "paused" },
         vhostGuard: { error: "paused" },
         dupCleanup: { error: "paused" },
+        entryHeal: { error: "paused" },
       }
     }
   } catch { /* if settings read fails, just proceed normally */ }
@@ -1672,6 +1687,16 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
     dupCleanup = { error: (e as Error).message }
   }
 
+  // Entry-file (index.php) presence self-heal — catches domains marked
+  // hosted/live whose entry file never landed at the served docroot
+  // (step 10 skipped/locked or wrote to a non-served path).
+  let entryHeal: EntryHealResult | { error: string }
+  try {
+    entryHeal = await autoFixMissingEntryFile()
+  } catch (e) {
+    entryHeal = { error: (e as Error).message }
+  }
+
   let orphanArchives: OrphanArchiveResult | { error: string }
   try {
     orphanArchives = await cleanOrphanArchives()
@@ -1706,7 +1731,8 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
   const orphanArchivesN = "removed" in orphanArchives ? orphanArchives.removed.length : 0
   const vhostGuardN = "fixed" in vhostGuard ? vhostGuard.fixed.length : 0
   const dupCleanupN = "deleted" in dupCleanup ? dupCleanup.deleted.length : 0
-  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN + stuckN + sslMismatchedN + downRepairsN + deadRetryN + destroyedN + orphanArchivesN + vhostGuardN + dupCleanupN > 0) {
+  const entryHealN = "reuploaded" in entryHeal ? entryHeal.reuploaded.length : 0
+  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN + stuckN + sslMismatchedN + downRepairsN + deadRetryN + destroyedN + orphanArchivesN + vhostGuardN + dupCleanupN + entryHealN > 0) {
     appendAudit(
       "auto_heal_tick", "",
       `claimed=${claimedN} resumed=${resumedN} ns_resumed=${nsResumedN} ` +
@@ -1714,12 +1740,13 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
       `stuck_recovered=${stuckN} ssl_mismatched=${sslMismatchedN} ` +
       `down_repairs=${downRepairsN} dead_retried=${deadRetryN} ` +
       `dead_droplets_destroyed=${destroyedN} orphan_archives_swept=${orphanArchivesN} ` +
-      `vhost_guard_fixed=${vhostGuardN} dup_apps_cleaned=${dupCleanupN}`,
+      `vhost_guard_fixed=${vhostGuardN} dup_apps_cleaned=${dupCleanupN} ` +
+      `entry_files_reuploaded=${entryHealN}`,
       null,
     )
   }
 
-  return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, sslSweep, forceHttpsSweep, saTrackerDrift, downAutoFix, deadRetry, destroyDead, orphanArchives, vhostGuard, dupCleanup, ranAt }
+  return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, sslSweep, forceHttpsSweep, saTrackerDrift, downAutoFix, deadRetry, destroyDead, orphanArchives, vhostGuard, dupCleanup, entryHeal, ranAt }
 }
 
 // ---------------------------------------------------------------------------
@@ -2259,6 +2286,114 @@ export async function autoCleanupDuplicateSaApps(): Promise<DupCleanupSweepResul
   return { serversChecked, deleted, skipped }
 }
 
+// ---------------------------------------------------------------------------
+// Entry-file (index.php) presence self-heal. Closes the gap behind
+// "domain marked hosted/live but no index.php served": step 10 may have
+// been skipped/locked on a re-run, or written to a non-served path. This
+// re-reads the served docroot for every should-be-serving domain and, on
+// a DEFINITIVE miss, re-fires step 10 (re-upload from cached site_html).
+// SAFE + idempotent → gated by contentHealEnabled() (default ON,
+// independent of auto_migrate_enabled), per-domain hourly cap + give-up.
+// ---------------------------------------------------------------------------
+
+export interface EntryHealResult {
+  checked: number
+  reuploaded: { domain: string; jobId: number }[]
+  gaveUp: string[]
+  skipped: number
+}
+
+const ENTRY_HEAL_MAX_PER_TICK = Number(process.env.SSR_ENTRY_HEAL_MAX_PER_TICK) || 10
+const ENTRY_HEAL_MAX_PER_HOUR = Number(process.env.SSR_ENTRY_HEAL_MAX_PER_HOUR) || 3
+
+export async function autoFixMissingEntryFile(): Promise<EntryHealResult> {
+  const out: EntryHealResult = { checked: 0, reuploaded: [], gaveUp: [], skipped: 0 }
+  if (!contentHealEnabled()) return out
+
+  const rows = all<{ domain: string; server_id: number; ip: string }>(
+    `SELECT d.domain, d.server_id, s.ip AS ip
+       FROM domains d JOIN servers s ON s.id = d.server_id
+      WHERE d.status IN ('hosted','live','ssl_installed') AND s.ip IS NOT NULL
+      ORDER BY d.updated_at ASC`,
+  )
+  if (rows.length === 0) return out
+
+  const { verifyEntryFileServed } = await import("./serveravatar")
+  for (const r of rows) {
+    if (out.checked >= ENTRY_HEAL_MAX_PER_TICK) break
+    if (isPipelineRunning(r.domain)) { out.skipped++; continue }
+    out.checked++
+    let v
+    try {
+      v = await verifyEntryFileServed(r.domain, r.ip)
+    } catch (e) {
+      logPipeline(r.domain, "entry_verify", "warning",
+        `entry-file probe threw (inconclusive): ${(e as Error).message.slice(0, 120)}`)
+      out.skipped++; continue
+    }
+    if (v.verdict !== "missing") { out.skipped++; continue }
+
+    const recent = one<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM audit_log
+        WHERE action = 'entry_file_missing' AND target = ?
+          AND created_at >= datetime('now', '-60 minutes')`,
+      r.domain,
+    )?.n ?? 0
+    const inflight = all<{ id: number }>(
+      `SELECT id FROM jobs WHERE kind = 'pipeline.full'
+         AND status IN ('queued','running') AND payload_json LIKE ?`,
+      `%"domain":"${r.domain}"%`,
+    ).length > 0
+
+    const decision = decideEntryHeal({
+      verdict: v.verdict, recentFailures: recent,
+      maxPerHour: ENTRY_HEAL_MAX_PER_HOUR, inflight,
+    })
+    if (decision === "skip") { out.skipped++; continue }
+
+    if (decision === "giveup") {
+      out.gaveUp.push(r.domain)
+      logPipeline(r.domain, "entry_verify", "warning",
+        `Entry file STILL missing after ${recent} re-upload(s) in 60 min — ` +
+        `auto-fix giving up (likely app dir never scaffolded on server ` +
+        `#${r.server_id}; needs SA app rebuild / manual). ${v.detail}`)
+      try {
+        appendAudit("entry_heal_giveup", r.domain,
+          `server_id=${r.server_id} after=${recent}/60min ${v.detail}`, null)
+      } catch { /* ignore */ }
+      try {
+        const { notify } = await import("./notify")
+        await notify(`Entry file missing — auto-fix gave up (${r.domain})`,
+          `${r.domain} is marked hosted/live but has NO index.php at the served ` +
+          `docroot on server #${r.server_id}, and ${recent} re-uploads in 60 min ` +
+          `did not fix it. Likely the SA app directory was never scaffolded — ` +
+          `needs an SA app rebuild. ${v.detail}`,
+          { severity: "error", dedupeKey: `entry_heal_giveup:${r.domain}` })
+      } catch { /* best-effort */ }
+      continue
+    }
+
+    // decision === "act"
+    try {
+      appendAudit("entry_file_missing", r.domain,
+        `server_id=${r.server_id} ${v.detail}`, null)
+    } catch { /* ignore */ }
+    const { enqueueJob } = await import("./jobs")
+    const jobId = enqueueJob("pipeline.full", {
+      domain: r.domain,
+      skip_purchase: true,
+      server_id: r.server_id,
+      start_from: 10,        // re-upload entry file from cached site_html
+      force_new_server: false,
+    }, 1)
+    out.reuploaded.push({ domain: r.domain, jobId })
+    logPipeline(r.domain, "entry_verify", "running",
+      `Entry file MISSING at served docroot — enqueued pipeline.full from ` +
+      `step 10 (job ${jobId}) to re-upload (attempt ${recent + 1}/${ENTRY_HEAL_MAX_PER_HOUR}). ${v.detail}`)
+  }
+  return out
+}
+
 // Exported for tests
 export const _internal = {
   reconcileOrphanServers,
@@ -2268,6 +2403,7 @@ export const _internal = {
   autoFixDownDomains,
   autoFixBrokenApacheVhost,
   autoCleanupDuplicateSaApps,
+  autoFixMissingEntryFile,
 }
 
 /** Reset auto-heal in-memory streak state — useful for tests. */

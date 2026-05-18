@@ -58,6 +58,9 @@ const CHECKBOX_FIELDS = [
   // (sslHealEnabled()) — present here so the operator can explicitly
   // turn it OFF; decoupled from auto_migrate_enabled on purpose.
   "auto_ssl_heal_enabled",
+  // Same class as auto_ssl_heal_enabled — safe idempotent re-upload of a
+  // missing entry file. DEFAULT ON in code (contentHealEnabled()).
+  "auto_content_heal_enabled",
   "auto_cleanup_dead_servers",
   "do_use_backup_first",
   "notifications_enabled",
