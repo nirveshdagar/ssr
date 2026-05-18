@@ -1513,6 +1513,7 @@ export interface AutoHealTickResult {
   destroyDead: DestroyDeadDropletsResult | { error: string }
   orphanArchives: OrphanArchiveResult | { error: string }
   vhostGuard: VhostGuardSweepResult | { error: string }
+  dupCleanup: DupCleanupSweepResult | { error: string }
   ranAt: string
 }
 
@@ -1544,6 +1545,7 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
         destroyDead: { error: "paused" },
         orphanArchives: { error: "paused" },
         vhostGuard: { error: "paused" },
+        dupCleanup: { error: "paused" },
       }
     }
   } catch { /* if settings read fails, just proceed normally */ }
@@ -1661,6 +1663,15 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
     vhostGuard = { error: (e as Error).message }
   }
 
+  // Duplicate SA-app cleanup (destructive — gated by auto_migrate_enabled,
+  // conservative core, capped). Deletes only dead empty dup records.
+  let dupCleanup: DupCleanupSweepResult | { error: string }
+  try {
+    dupCleanup = await autoCleanupDuplicateSaApps()
+  } catch (e) {
+    dupCleanup = { error: (e as Error).message }
+  }
+
   let orphanArchives: OrphanArchiveResult | { error: string }
   try {
     orphanArchives = await cleanOrphanArchives()
@@ -1694,7 +1705,8 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
   const destroyedN = "destroyed" in destroyDead ? destroyDead.destroyed.length : 0
   const orphanArchivesN = "removed" in orphanArchives ? orphanArchives.removed.length : 0
   const vhostGuardN = "fixed" in vhostGuard ? vhostGuard.fixed.length : 0
-  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN + stuckN + sslMismatchedN + downRepairsN + deadRetryN + destroyedN + orphanArchivesN + vhostGuardN > 0) {
+  const dupCleanupN = "deleted" in dupCleanup ? dupCleanup.deleted.length : 0
+  if (claimedN + resumedN + nsResumedN + retriedN + sslReissuedN + degradedN + stuckN + sslMismatchedN + downRepairsN + deadRetryN + destroyedN + orphanArchivesN + vhostGuardN + dupCleanupN > 0) {
     appendAudit(
       "auto_heal_tick", "",
       `claimed=${claimedN} resumed=${resumedN} ns_resumed=${nsResumedN} ` +
@@ -1702,12 +1714,12 @@ export async function autoHealTickOnce(): Promise<AutoHealTickResult> {
       `stuck_recovered=${stuckN} ssl_mismatched=${sslMismatchedN} ` +
       `down_repairs=${downRepairsN} dead_retried=${deadRetryN} ` +
       `dead_droplets_destroyed=${destroyedN} orphan_archives_swept=${orphanArchivesN} ` +
-      `vhost_guard_fixed=${vhostGuardN}`,
+      `vhost_guard_fixed=${vhostGuardN} dup_apps_cleaned=${dupCleanupN}`,
       null,
     )
   }
 
-  return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, sslSweep, forceHttpsSweep, saTrackerDrift, downAutoFix, deadRetry, destroyDead, orphanArchives, vhostGuard, ranAt }
+  return { reconcile, resume, ns, retry, brokenSsl, saHealth, stuckCreating, sslSweep, forceHttpsSweep, saTrackerDrift, downAutoFix, deadRetry, destroyDead, orphanArchives, vhostGuard, dupCleanup, ranAt }
 }
 
 // ---------------------------------------------------------------------------
@@ -2172,6 +2184,81 @@ export async function autoFixBrokenApacheVhost(): Promise<VhostGuardSweepResult>
   return { fixed, skipped }
 }
 
+// ---------------------------------------------------------------------------
+// Duplicate SA-application cleanup sweep. Repeated step-7 createApplication
+// (before the proactive dup-guard) left multiple SA app RECORDS for one
+// domain. This deletes ONLY records the unit-tested dup-app-guard core
+// proves are dead (no files) while a single real serving install exists.
+//
+// DESTRUCTIVE (deletes SA apps) → gated behind `auto_migrate_enabled`
+// (the codebase's existing "I authorize destructive auto-ops" switch,
+// same as autoRetryDeadServers / autoDestroyDeadDroplets), NOT the
+// always-on SSL/vhost gates. Capped; skips domains with a running
+// pipeline; the cleanup core itself refuses on any ambiguity.
+// ---------------------------------------------------------------------------
+
+export interface DupCleanupSweepResult {
+  serversChecked: number
+  deleted: { domain: string; appId: string; server_id: number }[]
+  skipped: { domain: string; reason: string }[]
+}
+
+const DUP_CLEANUP_MAX_SERVERS = Number(process.env.SSR_DUP_CLEANUP_MAX_SERVERS) || 3
+const DUP_CLEANUP_MAX_DELETES = Number(process.env.SSR_DUP_CLEANUP_MAX_DELETES) || 5
+
+export async function autoCleanupDuplicateSaApps(): Promise<DupCleanupSweepResult> {
+  const deleted: DupCleanupSweepResult["deleted"] = []
+  const skipped: DupCleanupSweepResult["skipped"] = []
+  let serversChecked = 0
+  if ((getSetting("auto_migrate_enabled") || "0") !== "1") {
+    return { serversChecked, deleted, skipped }
+  }
+  const { cleanupDuplicateSaApps } = await import("./sa-control")
+  const knownDomains = listDomains().map((d) => d.domain)
+  const servers = listDbServers().filter(
+    (s) => s.status === "ready" && s.ip && s.sa_server_id,
+  )
+  for (const s of servers) {
+    if (serversChecked >= DUP_CLEANUP_MAX_SERVERS) break
+    serversChecked++
+    let r
+    try {
+      r = await cleanupDuplicateSaApps({
+        saServerId: s.sa_server_id as string,
+        ip: s.ip as string,
+        knownDomains,
+        dryRun: false,
+        maxDeletes: DUP_CLEANUP_MAX_DELETES,
+        skipDomain: (d) => isPipelineRunning(d),
+      })
+    } catch (e) {
+      skipped.push({ domain: `(server-${s.id})`, reason: (e as Error).message })
+      continue
+    }
+    for (const x of r.deleted) {
+      if (x.ok && !x.message.startsWith("DRY")) {
+        deleted.push({ domain: x.domain, appId: x.appId, server_id: s.id })
+      }
+    }
+    for (const sk of r.skipped) skipped.push(sk)
+    if (r.deleted.some((x) => x.ok && !x.message.startsWith("DRY"))) {
+      try {
+        const { notify } = await import("./notify")
+        const n = r.deleted.filter((x) => x.ok).length
+        await notify(`Duplicate SA apps cleaned on server #${s.id}`,
+          `Deleted ${n} dead duplicate SA application record(s) (kept the serving ` +
+          `install). Domains: ${[...new Set(r.deleted.map((x) => x.domain))].join(", ")}.`,
+          { severity: "warning", dedupeKey: `dup_cleanup:${s.id}:${n}` })
+      } catch { /* best-effort */ }
+      try {
+        appendAudit("dup_sa_app_cleanup", `server-${s.id}`,
+          r.deleted.filter((x) => x.ok).map((x) => `${x.domain}#${x.appId}`).join(" "), null)
+      } catch { /* ignore */ }
+    }
+  }
+  return { serversChecked, deleted, skipped }
+}
+
 // Exported for tests
 export const _internal = {
   reconcileOrphanServers,
@@ -2180,6 +2267,7 @@ export const _internal = {
   autoHealTickOnce,
   autoFixDownDomains,
   autoFixBrokenApacheVhost,
+  autoCleanupDuplicateSaApps,
 }
 
 /** Reset auto-heal in-memory streak state — useful for tests. */

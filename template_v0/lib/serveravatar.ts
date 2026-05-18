@@ -699,6 +699,41 @@ export async function createApplication(saServerId: string, domain: string): Pro
   return appId
 }
 
+/**
+ * Delete ONE specific SA application by its exact app id (NOT via
+ * findAppId — which returns an arbitrary match when duplicates exist).
+ * Used only by the duplicate-app cleanup, which has already proven this
+ * id is a redundant record with no files. Mirrors deleteApplication's
+ * SSL-preclear (SA 500s on delete when ssl is non-null).
+ */
+export async function deleteApplicationById(
+  saServerId: string,
+  appId: string,
+  logName = `app-${appId}`,
+): Promise<{ ok: boolean; message: string }> {
+  logPipeline(logName, "sa_delete_app", "running",
+    `Deleting duplicate SA app ${appId} from server ${saServerId}...`)
+  try {
+    await disableAutoSsl(saServerId, appId).catch(() => { /* best-effort, idempotent */ })
+    const { res } = await saRequest(
+      `/organizations/{ORG_ID}/servers/${saServerId}/applications/${appId}`,
+      { method: "DELETE" },
+    )
+    if (!res.ok) {
+      const body = await safeJson(res)
+      const msg = saErrorMessage(body, `HTTP ${res.status}`)
+      logPipeline(logName, "sa_delete_app", "failed", `app ${appId}: ${msg}`)
+      return { ok: false, message: msg }
+    }
+    logPipeline(logName, "sa_delete_app", "completed", `Duplicate app ${appId} deleted`)
+    return { ok: true, message: `Deleted app ${appId}` }
+  } catch (e) {
+    const msg = (e as Error).message
+    logPipeline(logName, "sa_delete_app", "failed", `app ${appId}: ${msg}`)
+    return { ok: false, message: msg }
+  }
+}
+
 export async function deleteApplication(
   saServerId: string,
   domain: string,

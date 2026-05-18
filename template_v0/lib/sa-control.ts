@@ -29,6 +29,9 @@ import { listServers as listDbServers } from "./repos/servers"
 import { listDomains } from "./repos/domains"
 import { parseVhostProbe, decideQuarantine, type QuarantineDecision } from "./vhost-guard"
 import {
+  decideDuplicateCleanup, extractDocRoot, type DupApp, type DupGroupDecision,
+} from "./dup-app-guard"
+import {
   SshSession,
   listServers as listSaServers,
   getServerInfo,
@@ -829,6 +832,117 @@ export async function quarantineBrokenVhosts(
       ok: false, acted: false, decision: null, quarantined: [],
       configtestOkAfter: null, reloaded: false,
       message: `vhost-guard SSH failed for ${serverIp}: ${(e as Error).message}`,
+    }
+  } finally {
+    ssh?.close()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate SA-application cleanup. Repeated step-7 createApplication left
+// multiple SA app RECORDS for one domain. List apps via SA API, probe each
+// app's document root over read-only SSH, and (only when the unit-tested
+// dup-app-guard core says it's provably safe) delete the dead empty
+// record(s) by EXACT id, keeping the one real serving install.
+// DESTRUCTIVE — dryRun defaults true; the sweep passes false only when
+// gated on. Conservative by construction (see dup-app-guard.ts).
+// ---------------------------------------------------------------------------
+
+export interface DupCleanupResult {
+  ok: boolean
+  decisions: DupGroupDecision[]
+  deleted: { domain: string; appId: string; ok: boolean; message: string }[]
+  skipped: { domain: string; reason: string }[]
+  message: string
+}
+
+export async function cleanupDuplicateSaApps(opts: {
+  saServerId: string
+  ip: string
+  knownDomains: string[]
+  dryRun?: boolean
+  maxDeletes?: number
+  /** return true to skip deleting any record for this domain (race-guard) */
+  skipDomain?: (domain: string) => boolean
+}): Promise<DupCleanupResult> {
+  const dryRun = opts.dryRun !== false
+  const maxDeletes = opts.maxDeletes ?? 5
+  const deleted: DupCleanupResult["deleted"] = []
+  const skipped: DupCleanupResult["skipped"] = []
+  let ssh: SshSession | null = null
+  try {
+    const { listApplications, deleteApplicationById } = await import("./serveravatar")
+    const raw = await listApplications(opts.saServerId)
+    const apps: DupApp[] = raw.map((a) => ({
+      id: String(a.id),
+      name: typeof a.name === "string" ? a.name : undefined,
+      primaryDomain: typeof a.primary_domain === "string" ? a.primary_domain : undefined,
+      docRoot: extractDocRoot(a as Record<string, unknown>),
+    }))
+
+    // Probe every distinct doc root once, read-only: REAL = exists &
+    // non-empty, ABSENT = does not exist, OTHER = exists-but-empty / file
+    // → mapped to "unknown" so the core SKIPS the group (never deletes).
+    const roots = [...new Set(apps.map((a) => a.docRoot).filter((x): x is string => !!x))]
+    const stateMap = new Map<string, boolean | undefined>()
+    if (roots.length > 0) {
+      ssh = await openSsh(opts.ip)
+      const list = roots.map((r) => JSON.stringify(r)).join(" ")
+      const script =
+        `for dr in ${list}; do ` +
+        `if [ -d "$dr" ] && [ -n "$(ls -A "$dr" 2>/dev/null | head -1)" ]; then echo "REAL|$dr"; ` +
+        `elif [ ! -e "$dr" ]; then echo "ABSENT|$dr"; ` +
+        `else echo "OTHER|$dr"; fi; done`
+      const out = (await ssh.exec(script, { timeoutMs: 25_000 })).stdout
+      for (const ln of out.split(/\r?\n/)) {
+        const m = ln.match(/^(REAL|ABSENT|OTHER)\|(.+)$/)
+        if (!m) continue
+        stateMap.set(m[2], m[1] === "REAL" ? true : m[1] === "ABSENT" ? false : undefined)
+      }
+    }
+    const dirState = (dr: string) => stateMap.get(dr)
+
+    const decisions = decideDuplicateCleanup(apps, opts.knownDomains, dirState)
+    for (const d of decisions) {
+      if (!d.act) {
+        if (d.delete.length === 0 && d.keep === null) {
+          skipped.push({ domain: d.domain, reason: d.reason })
+          logPipeline(d.domain, "dup_cleanup", "warning",
+            `Duplicate SA apps on ${opts.ip} — ${d.reason}`)
+        }
+        continue
+      }
+      if (opts.skipDomain?.(d.domain)) {
+        skipped.push({ domain: d.domain, reason: "pipeline running on this domain — deferring delete" })
+        continue
+      }
+      for (const appId of d.delete) {
+        if (deleted.filter((x) => x.ok).length >= maxDeletes) {
+          skipped.push({ domain: d.domain, reason: `per-run delete cap (${maxDeletes}) reached` })
+          break
+        }
+        if (dryRun) {
+          deleted.push({ domain: d.domain, appId, ok: true, message: "DRY-RUN (would delete)" })
+          continue
+        }
+        const r = await deleteApplicationById(opts.saServerId, appId, d.domain)
+        deleted.push({ domain: d.domain, appId, ok: r.ok, message: r.message })
+        logPipeline(d.domain, "dup_cleanup", r.ok ? "completed" : "warning",
+          `Duplicate SA app ${appId} for ${d.domain}: ${r.ok ? "deleted" : "delete FAILED"} ` +
+          `(kept serving app ${d.keep}) — ${r.message}`)
+      }
+    }
+    const realDeletes = deleted.filter((x) => x.ok && !x.message.startsWith("DRY")).length
+    return {
+      ok: true, decisions, deleted, skipped,
+      message: dryRun
+        ? `DRY-RUN: ${deleted.length} deletion(s) proposed across ${decisions.filter((d) => d.act).length} domain(s)`
+        : `Deleted ${realDeletes} duplicate SA app record(s); ${skipped.length} group(s) left for a human`,
+    }
+  } catch (e) {
+    return {
+      ok: false, decisions: [], deleted, skipped,
+      message: `dup-cleanup failed for ${opts.ip}: ${(e as Error).message}`,
     }
   } finally {
     ssh?.close()
