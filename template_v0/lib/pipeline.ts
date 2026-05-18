@@ -1486,6 +1486,27 @@ async function step10UploadIndexPhp(
       await uploadIndexPhp(server.sa_server_id!, domain, php, server.ip ?? undefined)
     }
 
+    // POST-UPLOAD VERIFICATION. The upload helpers return "success" on an
+    // SA-API 2xx OR an SFTP write that didn't throw — neither proves the
+    // bytes landed in the docroot Apache actually serves (app dir never
+    // scaffolded; SFTP wrote to a non-served public_html). Read the file
+    // back at the served DocumentRoot. A DEFINITIVE missing/empty file
+    // fails step 10 (→ retryable_error) instead of a silent false
+    // 'hosted'. Inconclusive (no served vhost / SSH down) → warn +
+    // proceed, so a genuinely-uploaded site is never regressed.
+    {
+      const { verifyEntryFileServed } = await import("./serveravatar")
+      const v = await verifyEntryFileServed(domain, server.ip ?? undefined)
+      if (v.verdict === "missing") {
+        throw new Error(`post-upload verification FAILED — ${v.detail}`)
+      }
+      logPipeline(domain, "upload_index_php",
+        v.verdict === "ok" ? "completed" : "warning",
+        v.verdict === "ok"
+          ? `Verified entry file on origin — ${v.detail}`
+          : `Entry-file verification inconclusive (proceeding): ${v.detail}`)
+    }
+
     // Archive the entry-point file locally so dead-server migration can
     // re-upload it without paying the LLM or waiting on regeneration.
     // For multi-file sites, only the index is archived — siblings will be

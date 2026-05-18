@@ -27,6 +27,7 @@ import { one } from "./db"
 import { getSetting } from "./repos/settings"
 import { logPipeline } from "./repos/logs"
 import { updateServer } from "./repos/servers"
+import { buildEntryProbeScript, classifyEntryVerify, type EntryVerdict } from "./entry-verify"
 
 const SA_API = "https://api.serveravatar.com"
 
@@ -2714,6 +2715,35 @@ function lookupServerIp(domain: string): string | null {
     domain,
   )
   return row?.ip ?? null
+}
+
+/**
+ * Step-10 post-upload verification. SSHes to the server, resolves the
+ * DocumentRoot Apache *actually serves* for this domain (from the enabled
+ * vhost), and confirms index.php exists & is non-empty there. Read-only.
+ * Asymmetric on purpose (see entry-verify.ts): only a definitive
+ * missing/empty file fails; "no served vhost" / SSH failure → inconclusive
+ * so a genuinely-uploaded site is never regressed.
+ */
+export async function verifyEntryFileServed(
+  domain: string, serverIp?: string,
+): Promise<EntryVerdict> {
+  const ip = serverIp ?? lookupServerIp(domain)
+  if (!ip) return { verdict: "inconclusive", detail: "no server IP for verification" }
+  const rootPass = getSetting("server_root_password") || ""
+  if (!rootPass) return { verdict: "inconclusive", detail: "server_root_password not set" }
+  let ssh: SshSession | null = null
+  try {
+    ssh = await SshSession.connect({
+      host: ip, username: "root", password: rootPass, port: 22, readyTimeout: 15_000,
+    })
+    const r = await ssh.exec(buildEntryProbeScript(domain), { timeoutMs: 15_000 })
+    return classifyEntryVerify(r.stdout)
+  } catch (e) {
+    return { verdict: "inconclusive", detail: `verify SSH failed: ${(e as Error).message.slice(0, 120)}` }
+  } finally {
+    ssh?.close()
+  }
 }
 
 export async function deleteIndexHtmlViaSsh(domain: string, serverIp?: string): Promise<void> {
